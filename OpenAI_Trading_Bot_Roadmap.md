@@ -58,10 +58,10 @@ trading-bot/
 
 ## Checklist
 
-- [ ] Create GitHub repository
-- [ ] Create virtual environment
-- [ ] Install dependencies
-- [ ] Commit initial project structure
+- [Done] Create GitHub repository
+- [Done] Create virtual environment
+- [Done] Install dependencies
+- [Done] Commit initial project structure
 
 ---
 

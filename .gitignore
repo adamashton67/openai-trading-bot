@@ -1,18 +1,27 @@
-# Virtual Environment
-.venv/
-
-# Environment Variables
-.env
-
-# Python Cache
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Logs
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime output
 logs/
+data/
+*.log
 
-# macOS
+# OS/editor files
 .DS_Store
-
-# VS Code
+.idea/
 .vscode/
