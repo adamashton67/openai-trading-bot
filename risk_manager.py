@@ -23,6 +23,9 @@ class RiskManager:
         if not self.settings.paper_trading:
             return False, "Live trading is disabled in this starter project."
 
+        if self.settings.dry_run:
+            return False, "DRY_RUN is true."
+
         action = str(decision.get("action", "")).lower()
         if action in {"hold", "none", "skip"}:
             return False, "AI decision requested no trade."

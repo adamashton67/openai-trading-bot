@@ -25,10 +25,12 @@ Lumibot executes.
 ├── notifications/
 │   ├── notifier.py
 │   └── discord_notifier.py
+├── tests/
 ├── prompts/
 │   ├── system_prompt.md
 │   └── user_prompt_template.md
 ├── requirements.txt
+├── requirements-dev.txt
 ├── .env.example
 └── README.md
 ```
@@ -37,8 +39,9 @@ Lumibot executes.
 
 - `BOT_ENABLED=false` by default.
 - `PAPER_TRADING=true` by default.
+- `DRY_RUN=true` by default.
 - The broker execution method is a placeholder and does not place orders yet.
-- The AI decision method is a placeholder and returns `hold`.
+- The AI decision layer validates OpenAI JSON before risk checks.
 - The bot avoids OpenAI calls when the US market is closed.
 - Discord daily summaries are disabled by default.
 
@@ -53,6 +56,13 @@ python main.py
 ```
 
 Fill in `.env` with your Alpaca Paper Trading and OpenAI keys before enabling the bot.
+
+For local tests:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
 
 ## Railway Deployment
 
@@ -70,6 +80,7 @@ Add the same environment variables from `.env.example` in the Railway project se
 | --- | --- | --- |
 | `BOT_ENABLED` | `false` | Kill switch. Trading cycles are skipped unless this is true. |
 | `PAPER_TRADING` | `true` | Keeps the bot in paper-trading mode. |
+| `DRY_RUN` | `true` | Extra safety gate. Risk manager rejects trades unless this is false. |
 | `TRADING_INTERVAL_MINUTES` | `15` | How often to run a cycle during regular US market hours. |
 | `MARKET_TIMEZONE` | `America/New_York` | Timezone used for market checks. |
 | `OPENAI_API_KEY` | empty | OpenAI API key. |
@@ -92,7 +103,7 @@ Add the same environment variables from `.env.example` in the Railway project se
 5. If the market is closed, sleep and do not call OpenAI.
 6. If the market is open, run a trading cycle every 15 minutes.
 7. Collect broker/account/position/market data.
-8. Call the placeholder AI decision function.
+8. Call the AI decision function.
 9. Pass the AI decision through the risk manager.
 10. If approved, execute through Lumibot.
 11. Log the result.

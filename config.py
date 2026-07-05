@@ -36,6 +36,7 @@ class Settings:
 
     bot_enabled: bool
     paper_trading: bool
+    dry_run: bool
     trading_interval_minutes: int
     market_timezone: str
     openai_api_key: str
@@ -64,6 +65,7 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
     return Settings(
         bot_enabled=_parse_bool(os.getenv("BOT_ENABLED"), default=False),
         paper_trading=_parse_bool(os.getenv("PAPER_TRADING"), default=True),
+        dry_run=_parse_bool(os.getenv("DRY_RUN"), default=True),
         trading_interval_minutes=int(os.getenv("TRADING_INTERVAL_MINUTES", "15")),
         market_timezone=os.getenv("MARKET_TIMEZONE", "America/New_York"),
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),

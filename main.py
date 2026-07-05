@@ -37,6 +37,7 @@ def main() -> None:
 
     logger.info("Starting OpenAI Trading Bot.")
     logger.info("Paper trading mode: %s", settings.paper_trading)
+    logger.info("Dry-run mode: %s", settings.dry_run)
 
     journal = TradingJournal(settings.data_dir)
     discord_notifier = (

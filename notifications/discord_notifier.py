@@ -29,7 +29,9 @@ class DiscordNotifier:
                 json={"content": content},
                 timeout=self.timeout_seconds,
             )
-            response.raise_for_status()
+            if not response.ok:
+                logger.warning("Discord send failure: HTTP %s.", response.status_code)
+                return False
         except ImportError:
             logger.warning(
                 "Discord send failure: requests is not installed. "
@@ -37,7 +39,7 @@ class DiscordNotifier:
             )
             return False
         except Exception as exc:
-            logger.warning("Discord send failure: %s", exc)
+            logger.warning("Discord send failure: %s.", exc.__class__.__name__)
             return False
 
         logger.info("Discord summary sent successfully.")
