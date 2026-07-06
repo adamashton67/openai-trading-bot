@@ -202,6 +202,8 @@ def test_database_market_snapshot_insert_succeeds(tmp_path):
             "EMA20": 120.1,
             "EMA50": 118.4,
             "VWAP": 121.8,
+            "5m_change_percent": 0.25,
+            "relative_volume": 1.4,
         },
         timestamp=datetime(2026, 7, 6, 10, 0),
     )
@@ -215,7 +217,10 @@ def test_database_market_snapshot_insert_succeeds(tmp_path):
         ).fetchone()
 
     assert row[:7] == ("AAPL", 123.45, 100000.0, 55.2, 120.1, 118.4, 121.8)
-    assert json.loads(row[7])["current_price"] == 123.45
+    raw_snapshot = json.loads(row[7])
+    assert raw_snapshot["current_price"] == 123.45
+    assert raw_snapshot["5m_change_percent"] == 0.25
+    assert raw_snapshot["relative_volume"] == 1.4
 
 
 def test_database_initialisation_failure_does_not_crash(tmp_path):
@@ -281,6 +286,57 @@ def test_prompt_files_are_loaded_and_rendered_at_runtime(tmp_path):
     rendered = client._render_user_prompt(context)
     assert "2026-07-06" in rendered
     assert "AAPL" in rendered
+
+
+def test_user_prompt_includes_structured_market_intelligence():
+    client = object.__new__(OpenAIDecisionClient)
+    client.prompts_dir = Path("prompts")
+    context = TradingContext(
+        current_datetime=datetime(2026, 7, 6, 10, 0, tzinfo=ZoneInfo("America/New_York")),
+        market_status="open",
+        current_positions=[{"symbol": "AAPL", "quantity": 3}],
+        watchlist_symbols=["AAPL", "MSFT"],
+        recent_price_data={
+            "market_intelligence": {
+                "AAPL": {
+                    "current_price": 214.33,
+                    "5m_change_percent": None,
+                    "15m_change_percent": 0.4,
+                    "1h_change_percent": 1.2,
+                    "day_change_percent": 0.8,
+                    "5d_change_percent": 2.1,
+                    "20d_change_percent": 4.3,
+                    "volume": 123456,
+                    "average_20d_volume": 100000,
+                    "relative_volume": 1.23,
+                    "EMA20": 210.5,
+                    "EMA50": 205.2,
+                    "RSI14": 58.4,
+                    "VWAP": 212.1,
+                }
+            }
+        },
+    )
+
+    rendered = client._render_user_prompt(context)
+
+    assert "Market Intelligence:" in rendered
+    assert "AAPL:" in rendered
+    assert "MSFT:" in rendered
+    assert '"current_position": {' in rendered
+    assert '"quantity": 3' in rendered
+    assert '"current_price": 214.33' in rendered
+    assert '"5m_change_percent": null' in rendered
+    assert '"RSI14": 58.4' in rendered
+
+
+def test_user_prompt_instructs_null_indicators_are_unavailable():
+    template = Path("prompts/user_prompt_template.md").read_text(encoding="utf-8")
+
+    assert "Treat null as unavailable" in template
+    assert "Use only these provided indicator values" in template
+    assert "multiple supplied indicators support the decision" in template
+    assert "Consider current portfolio exposure" in template
 
 
 def test_ai_response_validation_accepts_supported_decision():
@@ -830,6 +886,103 @@ def test_strategy_context_includes_populated_broker_data():
     assert context.current_positions == [{"symbol": "MSFT", "quantity": 2}]
     assert context.recent_price_data["prices"]["AAPL"]["last_price"] == 214.33
     assert context.recent_price_data["market_intelligence"]["AAPL"]["RSI14"] == 55.2
+
+
+def test_strategy_writes_one_market_snapshot_per_symbol_per_cycle(tmp_path):
+    database_path = tmp_path / "trading_bot.db"
+    database.init_database(database_path)
+    snapshot = BrokerSnapshot(
+        account={"cash": 25000, "buying_power": 25000, "portfolio_value": 100000},
+        positions=[],
+        market_data={
+            "market_intelligence": {
+                "AAPL": {
+                    "current_price": 214.33,
+                    "volume": 1000,
+                    "RSI14": 55.2,
+                    "EMA20": 210.0,
+                    "EMA50": 205.0,
+                    "VWAP": 212.0,
+                },
+                "aapl": {
+                    "current_price": 215.0,
+                    "volume": 1100,
+                    "RSI14": 56.0,
+                    "EMA20": 211.0,
+                    "EMA50": 206.0,
+                    "VWAP": 213.0,
+                },
+                "MSFT": {
+                    "current_price": 434.8,
+                    "volume": 2000,
+                    "RSI14": 48.1,
+                    "EMA20": 430.0,
+                    "EMA50": 426.0,
+                    "VWAP": 432.0,
+                },
+            }
+        },
+    )
+    strategy = TradingStrategy(
+        settings=make_settings(allowed_symbols=["AAPL", "MSFT"]),
+        broker=None,
+        risk_manager=RiskManager(make_settings()),
+    )
+
+    strategy._record_market_snapshots(snapshot, datetime(2026, 7, 6, 10, 0))
+
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(
+            "SELECT symbol, raw_snapshot FROM market_snapshots ORDER BY symbol"
+        ).fetchall()
+
+    assert [row[0] for row in rows] == ["AAPL", "MSFT"]
+    assert json.loads(rows[0][1])["current_price"] == 214.33
+    assert json.loads(rows[1][1])["RSI14"] == 48.1
+
+
+def test_market_snapshot_insert_failure_does_not_crash_trading_cycle(monkeypatch, tmp_path):
+    database.init_database(tmp_path / "trading_bot.db")
+
+    def failing_insert(*args, **kwargs):
+        raise sqlite3.OperationalError("database unavailable")
+
+    monkeypatch.setattr(database, "insert_market_snapshot", failing_insert)
+    snapshot = BrokerSnapshot(
+        account={"cash": 25000, "buying_power": 25000, "portfolio_value": 100000},
+        positions=[],
+        market_data={
+            "market_intelligence": {
+                "AAPL": {
+                    "current_price": 214.33,
+                    "volume": 1000,
+                    "RSI14": 55.2,
+                    "EMA20": 210.0,
+                    "EMA50": 205.0,
+                    "VWAP": 212.0,
+                }
+            }
+        },
+    )
+    strategy = TradingStrategy(
+        settings=make_settings(allowed_symbols=["AAPL"]),
+        broker=types.SimpleNamespace(collect_snapshot=lambda: snapshot),
+        risk_manager=RiskManager(make_settings(dry_run=True)),
+    )
+    strategy.ai_client = types.SimpleNamespace(
+        last_raw_response='{"symbol":"AAPL","action":"HOLD"}',
+        get_decision=lambda context: types.SimpleNamespace(
+            to_risk_manager_dict=lambda: {
+                "symbol": "AAPL",
+                "action": "HOLD",
+                "confidence": 0.8,
+                "suggested_allocation_percent": 0,
+                "reason": "Test hold.",
+            }
+        ),
+    )
+
+    strategy.run_cycle()
 
 
 def test_broker_dry_run_blocks_execution():

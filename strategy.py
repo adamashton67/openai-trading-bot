@@ -145,13 +145,24 @@ class TradingStrategy:
         if not isinstance(market_intelligence, dict):
             return
 
+        recorded_symbols = set()
         for symbol, indicators in market_intelligence.items():
+            normalized_symbol = str(symbol).upper()
+            if not normalized_symbol or normalized_symbol in recorded_symbols:
+                continue
             if isinstance(indicators, dict):
-                database.insert_market_snapshot(
-                    symbol=symbol,
-                    snapshot=indicators,
-                    timestamp=timestamp,
-                )
+                try:
+                    database.insert_market_snapshot(
+                        symbol=normalized_symbol,
+                        snapshot=indicators,
+                        timestamp=timestamp,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Database market snapshot insert failed safely: %s.",
+                        exc.__class__.__name__,
+                    )
+                recorded_symbols.add(normalized_symbol)
 
     def _get_ai_client(self) -> OpenAIDecisionClient:
         """Create the OpenAI client only when a trading cycle needs it."""

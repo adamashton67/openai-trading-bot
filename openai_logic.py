@@ -18,6 +18,22 @@ logger = logging.getLogger(__name__)
 
 
 Action = Literal["BUY", "SELL", "HOLD"]
+MARKET_INTELLIGENCE_FIELDS = (
+    "current_price",
+    "5m_change_percent",
+    "15m_change_percent",
+    "1h_change_percent",
+    "day_change_percent",
+    "5d_change_percent",
+    "20d_change_percent",
+    "volume",
+    "average_20d_volume",
+    "relative_volume",
+    "EMA20",
+    "EMA50",
+    "RSI14",
+    "VWAP",
+)
 
 
 class AIDecisionError(Exception):
@@ -178,6 +194,7 @@ class OpenAIDecisionClient:
                 context_dict["recent_price_data"],
                 indent=2,
             ),
+            "market_intelligence": self._format_market_intelligence(context_dict),
             "risk_rules": json.dumps(context_dict["risk_rules"], indent=2),
             "previous_trades": context.previous_trade_summary or "None",
             "context": context_json,
@@ -187,6 +204,57 @@ class OpenAIDecisionClient:
         for placeholder, value in replacements.items():
             rendered = rendered.replace(f"{{{{{placeholder}}}}}", str(value))
         return rendered
+
+    def _format_market_intelligence(self, context_dict: dict[str, Any]) -> str:
+        """Render indicators per symbol with current position context."""
+        recent_price_data = context_dict.get("recent_price_data") or {}
+        market_intelligence = self._market_intelligence_by_symbol(
+            recent_price_data.get("market_intelligence") or {}
+        )
+        positions = self._positions_by_symbol(context_dict.get("current_positions") or [])
+        lines = []
+
+        for symbol in context_dict.get("watchlist_symbols") or []:
+            normalized_symbol = str(symbol).upper()
+            indicators = market_intelligence.get(normalized_symbol) or {}
+            payload = {
+                "symbol": normalized_symbol,
+                "current_position": positions.get(normalized_symbol),
+                "indicators": {
+                    field_name: indicators.get(field_name)
+                    for field_name in MARKET_INTELLIGENCE_FIELDS
+                },
+            }
+            lines.append(
+                f"{normalized_symbol}:\n"
+                f"{json.dumps(payload, indent=2, sort_keys=True)}"
+            )
+
+        if not lines:
+            return "No market intelligence supplied."
+
+        return "\n\n".join(lines)
+
+    def _market_intelligence_by_symbol(self, market_intelligence: Any) -> dict[str, dict[str, Any]]:
+        """Index market intelligence by uppercase symbol."""
+        if not isinstance(market_intelligence, dict):
+            return {}
+
+        indexed = {}
+        for symbol, indicators in market_intelligence.items():
+            normalized_symbol = str(symbol).upper()
+            if normalized_symbol and isinstance(indicators, dict):
+                indexed[normalized_symbol] = indicators
+        return indexed
+
+    def _positions_by_symbol(self, positions: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        """Index current positions by uppercase symbol for prompt rendering."""
+        indexed = {}
+        for position in positions:
+            symbol = str(position.get("symbol", "")).upper()
+            if symbol:
+                indexed[symbol] = position
+        return indexed
 
     def _parse_decision(self, raw_content: str) -> AIDecision:
         """Parse JSON and validate the response against the decision schema."""
