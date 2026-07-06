@@ -11,7 +11,7 @@ import pytest
 import config
 import main
 from config import Settings, load_settings
-from broker import BrokerSnapshot
+from broker import BrokerClient, BrokerSnapshot
 from notifications.discord_notifier import DiscordNotifier
 from notifications.notifier import DailySummaryNotifier
 from openai_logic import AIDecision, AIDecisionError, OpenAIDecisionClient, TradingContext
@@ -292,6 +292,17 @@ def test_test_openai_route_exists():
     assert args.test_openai is True
 
 
+def test_test_execution_route_exists():
+    parser_args = ["main.py", "--test-execution", "--dry-run"]
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("sys.argv", parser_args)
+        args = main.parse_args()
+
+    assert args.test_execution is True
+    assert args.dry_run is True
+
+
 def test_mock_openai_context_generation_uses_safe_fake_data():
     context = build_mock_trading_context(
         make_settings(allowed_symbols=["AAPL", "MSFT", "SPY"])
@@ -408,6 +419,218 @@ def test_risk_manager_rejects_allocation_above_max_limit():
 
     assert approved is False
     assert "exceeds maximum" in reason
+
+
+def broker_with_snapshot(settings, price=100, fake_broker=None):
+    broker = BrokerClient(
+        settings,
+        broker_factory=lambda config: fake_broker,
+        order_factory=lambda **kwargs: types.SimpleNamespace(**kwargs),
+    )
+    broker._last_snapshot = BrokerSnapshot(
+        account={"portfolio_value": 100000, "cash": 25000, "buying_power": 25000},
+        positions=[],
+        market_data={"prices": {"AAPL": {"last_price": price}, "MSFT": {"last_price": price}}},
+    )
+    return broker
+
+
+def approved_decision(**overrides):
+    decision = {
+        "symbol": "AAPL",
+        "action": "BUY",
+        "confidence": 0.9,
+        "suggested_allocation_percent": 5,
+        "reason": "Approved test decision.",
+    }
+    decision.update(overrides)
+    return decision
+
+
+class MockLumibotBroker:
+    def __init__(self, should_raise=False):
+        self.submitted_orders = []
+        self.should_raise = should_raise
+
+    def submit_order(self, order):
+        self.submitted_orders.append(order)
+        if self.should_raise:
+            raise RuntimeError("broker failed")
+        return types.SimpleNamespace(identifier="paper-123", status="submitted")
+
+
+def test_broker_dry_run_blocks_execution():
+    fake_broker = MockLumibotBroker()
+    broker = broker_with_snapshot(make_settings(dry_run=True), fake_broker=fake_broker)
+
+    result = broker.execute_order(approved_decision())
+
+    assert result["executed"] is False
+    assert "DRY_RUN" in result["reason"]
+    assert fake_broker.submitted_orders == []
+
+
+def test_broker_paper_trading_false_blocks_execution():
+    fake_broker = MockLumibotBroker()
+    broker = broker_with_snapshot(make_settings(paper_trading=False), fake_broker=fake_broker)
+
+    result = broker.execute_order(approved_decision())
+
+    assert result["executed"] is False
+    assert "PAPER_TRADING" in result["reason"]
+    assert fake_broker.submitted_orders == []
+
+
+def test_broker_bot_disabled_blocks_execution():
+    fake_broker = MockLumibotBroker()
+    broker = broker_with_snapshot(make_settings(bot_enabled=False), fake_broker=fake_broker)
+
+    result = broker.execute_order(approved_decision())
+
+    assert result["executed"] is False
+    assert "BOT_ENABLED" in result["reason"]
+    assert fake_broker.submitted_orders == []
+
+
+def test_broker_connect_failure_is_caught_safely():
+    def failing_broker_factory(config):
+        raise RuntimeError("bad credentials")
+
+    broker = BrokerClient(make_settings(), broker_factory=failing_broker_factory)
+
+    broker.connect()
+
+    assert broker._broker_available is False
+    assert broker._broker is None
+
+
+def test_broker_unavailable_blocks_execution_after_failed_connect():
+    def failing_broker_factory(config):
+        raise RuntimeError("bad credentials")
+
+    broker = broker_with_snapshot(make_settings(), fake_broker=None)
+    broker._broker_factory = failing_broker_factory
+    broker.connect()
+
+    result = broker.execute_order(approved_decision())
+
+    assert result["executed"] is False
+    assert result["reason"] == "Broker unavailable"
+
+
+def test_lazy_broker_initialisation_failure_returns_broker_unavailable():
+    def failing_broker_factory(config):
+        raise RuntimeError("network down")
+
+    broker = broker_with_snapshot(make_settings(), fake_broker=None)
+    broker._broker_factory = failing_broker_factory
+
+    result = broker.execute_order(approved_decision())
+
+    assert result["executed"] is False
+    assert result["reason"] == "Broker unavailable"
+
+
+def test_broker_hold_does_not_call_lumibot():
+    fake_broker = MockLumibotBroker()
+    broker = broker_with_snapshot(make_settings(), fake_broker=fake_broker)
+
+    result = broker.execute_order(approved_decision(action="HOLD", suggested_allocation_percent=0))
+
+    assert result["executed"] is False
+    assert result["reason"] == "HOLD decision. No order placed."
+    assert fake_broker.submitted_orders == []
+
+
+def test_broker_unsupported_symbol_does_not_call_lumibot():
+    fake_broker = MockLumibotBroker()
+    broker = broker_with_snapshot(make_settings(allowed_symbols=["AAPL"]), fake_broker=fake_broker)
+
+    result = broker.execute_order(approved_decision(symbol="TSLA"))
+
+    assert result["executed"] is False
+    assert "ALLOWED_SYMBOLS" in result["reason"]
+    assert fake_broker.submitted_orders == []
+
+
+def test_broker_allocation_above_max_does_not_call_lumibot():
+    fake_broker = MockLumibotBroker()
+    broker = broker_with_snapshot(make_settings(max_position_allocation_percent=5), fake_broker=fake_broker)
+
+    result = broker.execute_order(approved_decision(suggested_allocation_percent=10))
+
+    assert result["executed"] is False
+    assert "exceeds maximum" in result["reason"]
+    assert fake_broker.submitted_orders == []
+
+
+def test_broker_quantity_calculation_works():
+    broker = broker_with_snapshot(make_settings(), price=100)
+
+    quantity = broker._calculate_quantity(approved_decision(suggested_allocation_percent=5), 100)
+
+    assert quantity == 50
+
+
+def test_broker_zero_quantity_is_rejected():
+    fake_broker = MockLumibotBroker()
+    broker = broker_with_snapshot(make_settings(), price=1000000, fake_broker=fake_broker)
+
+    result = broker.execute_order(approved_decision(suggested_allocation_percent=1))
+
+    assert result["executed"] is False
+    assert "quantity is 0" in result["reason"]
+    assert fake_broker.submitted_orders == []
+
+
+def test_broker_missing_price_is_rejected():
+    fake_broker = MockLumibotBroker()
+    broker = broker_with_snapshot(make_settings(), fake_broker=fake_broker)
+    broker._last_snapshot = BrokerSnapshot(
+        account={"portfolio_value": 100000},
+        positions=[],
+        market_data={"prices": {}},
+    )
+
+    result = broker.execute_order(approved_decision())
+
+    assert result["executed"] is False
+    assert "price" in result["reason"]
+    assert fake_broker.submitted_orders == []
+
+
+def test_broker_buy_calls_mocked_lumibot_execution():
+    fake_broker = MockLumibotBroker()
+    broker = broker_with_snapshot(make_settings(), price=100, fake_broker=fake_broker)
+
+    result = broker.execute_order(approved_decision(action="BUY"))
+
+    assert result["executed"] is True
+    assert result["broker_order_id"] == "paper-123"
+    assert result["quantity"] == 50
+    assert fake_broker.submitted_orders[0].action == "BUY"
+
+
+def test_broker_sell_calls_mocked_lumibot_execution():
+    fake_broker = MockLumibotBroker()
+    broker = broker_with_snapshot(make_settings(), price=100, fake_broker=fake_broker)
+
+    result = broker.execute_order(approved_decision(action="SELL"))
+
+    assert result["executed"] is True
+    assert result["broker_order_id"] == "paper-123"
+    assert fake_broker.submitted_orders[0].action == "SELL"
+
+
+def test_broker_lumibot_exception_is_caught_safely():
+    fake_broker = MockLumibotBroker(should_raise=True)
+    broker = broker_with_snapshot(make_settings(), price=100, fake_broker=fake_broker)
+
+    result = broker.execute_order(approved_decision())
+
+    assert result["executed"] is False
+    assert result["reason"] == "Broker order submission failed."
+    assert result["raw_status"] == "RuntimeError"
 
 
 def test_invalid_or_missing_openai_decision_falls_back_to_hold():

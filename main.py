@@ -31,6 +31,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Call OpenAI with mock trading context, validate the response, and exit.",
     )
+    parser.add_argument(
+        "--test-execution",
+        action="store_true",
+        help="Run a safe dry-run execution-path test and exit.",
+    )
     return parser.parse_args()
 
 
@@ -69,6 +74,11 @@ def main() -> None:
         from openai_test import run_openai_integration_test
 
         raise SystemExit(run_openai_integration_test(settings))
+
+    if args.test_execution:
+        from execution_test import run_execution_test
+
+        raise SystemExit(run_execution_test(settings))
 
     if not settings.bot_enabled:
         logger.warning("BOT_ENABLED is false. Bot will monitor market hours but skip trading.")

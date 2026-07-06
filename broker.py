@@ -2,6 +2,7 @@
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from config import Settings
@@ -22,28 +23,63 @@ class BrokerSnapshot:
 class BrokerClient:
     """Small broker facade that can later be swapped from Alpaca to IBKR."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        broker_factory: Any | None = None,
+        order_factory: Any | None = None,
+    ) -> None:
         self.settings = settings
+        self._broker_factory = broker_factory
+        self._order_factory = order_factory
         self._broker = None
+        self._last_snapshot: BrokerSnapshot | None = None
+        self._broker_available = True
+        self._broker_unavailable_reason: str | None = None
 
     def connect(self) -> None:
         """Initialize the broker connection.
 
-        TODO: Wire Lumibot's Alpaca broker implementation here once execution
-        behaviour is ready to be tested.
         TODO: Replace or extend broker implementation when moving from Alpaca to IBKR.
         """
         if not self.settings.paper_trading:
             logger.warning("PAPER_TRADING is false. Live trading is not implemented.")
+            self._mark_broker_unavailable("PAPER_TRADING is false.")
             return
 
-        logger.info("Broker configured for Alpaca Paper Trading.")
+        if self.settings.dry_run:
+            logger.info("DRY_RUN is true. Alpaca broker connection will be deferred.")
+            return
+
+        if not self.settings.alpaca_api_key or not self.settings.alpaca_secret_key:
+            logger.warning("Alpaca broker connection skipped because credentials are missing.")
+            self._mark_broker_unavailable("Alpaca credentials are missing.")
+            return
+
+        try:
+            self._broker = self._create_alpaca_broker()
+        except Exception as exc:
+            logger.error("Broker initialisation failed safely: %s.", exc.__class__.__name__)
+            self._mark_broker_unavailable("Broker unavailable")
+            return
+
+        self._broker_available = True
+        self._broker_unavailable_reason = None
+        logger.info("Broker connected for Alpaca Paper Trading.")
 
     def collect_snapshot(self) -> BrokerSnapshot:
         """Collect account, position, and market data for the trading cycle."""
         logger.info("Collecting broker/account/position/market data.")
 
-        # TODO: Pull real account data from Lumibot/Alpaca.
+        account = self._collect_account_data()
+        positions = self._collect_positions()
+        market_data = self._collect_market_data()
+
+        snapshot = BrokerSnapshot(account=account, positions=positions, market_data=market_data)
+        self._last_snapshot = snapshot
+        return snapshot
+
+    def _collect_account_data(self) -> dict[str, Any]:
         account = {
             "broker": "alpaca",
             "paper_trading": self.settings.paper_trading,
@@ -52,30 +88,291 @@ class BrokerClient:
             "portfolio_value": None,
         }
 
-        # TODO: Pull current positions from Lumibot/Alpaca.
-        positions: list[dict[str, Any]] = []
+        if self._broker is None:
+            return account
 
-        # TODO: Pull market data for allowed symbols.
+        try:
+            alpaca_account = self._broker.api.get_account()
+            account.update(
+                {
+                    "cash": self._to_float(getattr(alpaca_account, "cash", None)),
+                    "buying_power": self._to_float(getattr(alpaca_account, "buying_power", None)),
+                    "portfolio_value": self._to_float(getattr(alpaca_account, "portfolio_value", None)),
+                }
+            )
+        except Exception as exc:
+            logger.warning("Could not collect Alpaca account data: %s.", exc.__class__.__name__)
+        return account
+
+    def _collect_positions(self) -> list[dict[str, Any]]:
+        if self._broker is None:
+            return []
+
+        try:
+            broker_positions = self._broker.api.get_all_positions()
+        except Exception as exc:
+            logger.warning("Could not collect Alpaca positions: %s.", exc.__class__.__name__)
+            return []
+
+        positions = []
+        for position in broker_positions:
+            positions.append(
+                {
+                    "symbol": str(getattr(position, "symbol", "")).upper(),
+                    "quantity": self._to_float(getattr(position, "qty", None)),
+                    "market_value": self._to_float(getattr(position, "market_value", None)),
+                    "average_price": self._to_float(getattr(position, "avg_entry_price", None)),
+                }
+            )
+        return positions
+
+    def _collect_market_data(self) -> dict[str, Any]:
         market_data = {
             "symbols": self.settings.allowed_symbols,
             "prices": {},
         }
 
-        return BrokerSnapshot(account=account, positions=positions, market_data=market_data)
+        if self._broker is None:
+            return market_data
+
+        for symbol in self.settings.allowed_symbols:
+            try:
+                market_data["prices"][symbol] = {"last_price": self._get_last_price(symbol)}
+            except Exception as exc:
+                logger.warning(
+                    "Could not collect latest price for %s: %s.",
+                    symbol,
+                    exc.__class__.__name__,
+                )
+        return market_data
+
+    def _get_last_price(self, symbol: str) -> float | None:
+        from lumibot.entities import Asset
+
+        return self._to_float(self._broker.get_last_price(Asset(symbol=symbol, asset_type="stock")))
 
     def execute_order(self, approved_decision: dict[str, Any]) -> dict[str, Any]:
         """Execute an approved trade through Lumibot.
 
-        The safe starter default records the intended action without placing a
-        real order. Remove this guard only after paper-trading execution is
-        explicitly implemented and tested.
+        Execution remains paper-trading only and is guarded independently from
+        the risk manager so direct calls also fail safely.
         """
         logger.info("Approved decision received for execution: %s", approved_decision)
-        logger.warning("Order execution is disabled in the base project scaffold.")
 
-        # TODO: Execute paper trades through Lumibot after risk rules are complete.
+        guard_failure = self._execution_guard_failure(approved_decision)
+        if guard_failure:
+            logger.info("Order execution rejected: %s", guard_failure)
+            return self._build_execution_result(approved_decision, False, guard_failure)
+
+        if not self._broker_available:
+            logger.info("Order execution rejected: Broker unavailable.")
+            return self._build_execution_result(
+                approved_decision,
+                False,
+                "Broker unavailable",
+            )
+
+        symbol = str(approved_decision.get("symbol", "")).upper()
+        action = str(approved_decision.get("action", "")).upper()
+        price = self._latest_price(symbol)
+        if price is None or price <= 0:
+            reason = f"Missing or invalid latest price for {symbol}."
+            logger.info("Order execution rejected: %s", reason)
+            return self._build_execution_result(approved_decision, False, reason)
+
+        quantity = self._calculate_quantity(approved_decision, price)
+        if quantity <= 0:
+            reason = "Calculated quantity is 0. No order placed."
+            logger.info("Order execution rejected: %s", reason)
+            return self._build_execution_result(
+                approved_decision,
+                False,
+                reason,
+                quantity=quantity,
+            )
+
+        try:
+            broker = self._get_broker()
+            order = self._create_market_order(symbol=symbol, action=action, quantity=quantity)
+            logger.info("Submitting Alpaca paper market order: %s %s %s shares.", action, symbol, quantity)
+            broker_order = broker.submit_order(order)
+        except Exception as exc:
+            if not self._broker_available:
+                logger.info("Order execution rejected: Broker unavailable.")
+                return self._build_execution_result(
+                    approved_decision,
+                    False,
+                    "Broker unavailable",
+                    quantity=quantity,
+                    raw_status=exc.__class__.__name__,
+                )
+
+            logger.warning("Broker order submission failed safely: %s.", exc.__class__.__name__)
+            return self._build_execution_result(
+                approved_decision,
+                False,
+                "Broker order submission failed.",
+                quantity=quantity,
+                raw_status=exc.__class__.__name__,
+            )
+
+        logger.info("Alpaca paper order submitted for %s %s.", action, symbol)
+        return self._build_execution_result(
+            approved_decision,
+            True,
+            "Order submitted to Alpaca Paper Trading.",
+            quantity=quantity,
+            broker_order_id=self._broker_order_id(broker_order),
+            raw_status=self._broker_order_status(broker_order),
+        )
+
+    def _execution_guard_failure(self, decision: dict[str, Any]) -> str | None:
+        if not self.settings.bot_enabled:
+            return "BOT_ENABLED is false."
+
+        if not self.settings.paper_trading:
+            return "PAPER_TRADING is false. Live trading is not implemented."
+
+        if self.settings.dry_run:
+            return "DRY_RUN is true. No order placed."
+
+        action = str(decision.get("action", "")).upper()
+        if action == "HOLD":
+            return "HOLD decision. No order placed."
+
+        if action not in {"BUY", "SELL"}:
+            return f"Unsupported action {action or 'UNKNOWN'}."
+
+        symbol = str(decision.get("symbol", "")).upper()
+        if self.settings.allowed_symbols and symbol not in self.settings.allowed_symbols:
+            return f"{symbol or 'Missing symbol'} is not in ALLOWED_SYMBOLS."
+
+        allocation = self._to_float(decision.get("suggested_allocation_percent"))
+        if allocation is None or allocation <= 0:
+            return "Suggested allocation must be greater than 0."
+
+        if allocation > self.settings.max_position_allocation_percent:
+            return (
+                f"Suggested allocation {allocation:.2f}% exceeds maximum "
+                f"{self.settings.max_position_allocation_percent:.2f}%."
+            )
+
+        return None
+
+    def _calculate_quantity(self, decision: dict[str, Any], latest_price: float) -> int:
+        snapshot = self._last_snapshot
+        portfolio_value = self._to_float(snapshot.account.get("portfolio_value")) if snapshot else None
+        allocation = self._to_float(decision.get("suggested_allocation_percent"))
+        if portfolio_value is None or portfolio_value <= 0 or allocation is None:
+            return 0
+
+        notional = portfolio_value * (allocation / 100)
+        return int(notional // latest_price)
+
+    def _latest_price(self, symbol: str) -> float | None:
+        if self._last_snapshot is None:
+            return None
+
+        market_data = self._last_snapshot.market_data or {}
+        prices = market_data.get("prices", {})
+
+        value = prices.get(symbol)
+        if isinstance(value, dict):
+            value = value.get("last_price") or value.get("price") or value.get("close")
+
+        if value is None and symbol in market_data:
+            symbol_data = market_data[symbol]
+            if isinstance(symbol_data, dict):
+                value = symbol_data.get("last_price") or symbol_data.get("price") or symbol_data.get("close")
+
+        return self._to_float(value)
+
+    def _get_broker(self) -> Any:
+        if self._broker is None:
+            try:
+                self._broker = self._create_alpaca_broker()
+            except Exception as exc:
+                logger.error("Broker initialisation failed safely: %s.", exc.__class__.__name__)
+                self._mark_broker_unavailable("Broker unavailable")
+                raise
+        return self._broker
+
+    def _mark_broker_unavailable(self, reason: str) -> None:
+        self._broker = None
+        self._broker_available = False
+        self._broker_unavailable_reason = reason
+
+    def _create_alpaca_broker(self) -> Any:
+        if self._broker_factory is not None:
+            return self._broker_factory(self._alpaca_config())
+
+        from lumibot.brokers import Alpaca
+
+        return Alpaca(self._alpaca_config())
+
+    def _alpaca_config(self) -> dict[str, Any]:
         return {
-            "executed": False,
-            "reason": "Execution placeholder only. No order was placed.",
-            "decision": approved_decision,
+            "API_KEY": self.settings.alpaca_api_key,
+            "API_SECRET": self.settings.alpaca_secret_key,
+            "PAPER": True,
+            "ENDPOINT": self.settings.alpaca_paper_base_url,
         }
+
+    def _create_market_order(self, symbol: str, action: str, quantity: int) -> Any:
+        if self._order_factory is not None:
+            return self._order_factory(symbol=symbol, action=action, quantity=quantity)
+
+        from lumibot.entities import Order
+
+        return Order(
+            strategy=None,
+            asset=symbol,
+            quantity=quantity,
+            side=action.lower(),
+            order_type="market",
+            time_in_force="day",
+        )
+
+    def _build_execution_result(
+        self,
+        decision: dict[str, Any],
+        executed: bool,
+        reason: str,
+        quantity: int | None = None,
+        broker_order_id: str | None = None,
+        raw_status: str | None = None,
+    ) -> dict[str, Any]:
+        action = str(decision.get("action", "")).upper()
+        symbol = str(decision.get("symbol", "")).upper()
+        return {
+            "executed": executed,
+            "reason": reason,
+            "symbol": symbol,
+            "action": action,
+            "quantity": quantity,
+            "order_type": "market",
+            "broker_order_id": broker_order_id,
+            "submitted_at": datetime.now().isoformat(),
+            "raw_status": raw_status,
+            "decision": decision,
+        }
+
+    def _broker_order_id(self, broker_order: Any) -> str | None:
+        value = (
+            getattr(broker_order, "identifier", None)
+            or getattr(broker_order, "id", None)
+            or getattr(broker_order, "order_id", None)
+        )
+        return str(value) if value else None
+
+    def _broker_order_status(self, broker_order: Any) -> str | None:
+        value = getattr(broker_order, "status", None)
+        return str(value) if value else None
+
+    def _to_float(self, value: Any) -> float | None:
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None

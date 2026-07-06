@@ -123,6 +123,8 @@ risk_manager_input = decision.to_risk_manager_dict()
 
 The AI layer never executes trades and never bypasses the risk manager.
 
+Real Alpaca paper order submission is isolated in `broker.py` and remains blocked unless `BOT_ENABLED=true`, `PAPER_TRADING=true`, `DRY_RUN=false`, market data includes a valid latest price, and the risk manager approves the decision.
+
 To test OpenAI with fake paper-trading context:
 
 ```bash
@@ -130,6 +132,14 @@ python main.py --test-openai
 ```
 
 This loads both prompt files, sends mock account/position/watchlist/market data to OpenAI, validates the JSON response, runs the decision through the risk manager in `DRY_RUN` mode, and exits. It does not call Lumibot, does not use a real broker account, and does not place trades.
+
+To test the execution path without placing an order:
+
+```bash
+python main.py --test-execution --dry-run
+```
+
+This builds a fake approved BUY decision and fake market snapshot, then runs the broker execution path with `DRY_RUN=true`. It confirms the execution guard blocks submission and does not call Alpaca or Lumibot.
 
 ## Discord Daily Summaries
 

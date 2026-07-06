@@ -75,6 +75,13 @@ class TradingStrategy:
                 result=result,
                 timestamp=current_time,
             )
+            if not result.get("executed"):
+                self.journal.record_rejected_trade(
+                    trading_day=current_time.date(),
+                    decision=decision,
+                    reason=result.get("reason", "Execution rejected."),
+                    timestamp=current_time,
+                )
 
     def get_ai_decision(self, snapshot: BrokerSnapshot) -> dict[str, Any]:
         """Ask OpenAI for a validated suggestion and return it for risk checks."""
@@ -85,7 +92,7 @@ class TradingStrategy:
         except AIDecisionError as exc:
             logger.warning("AI decision unavailable. Falling back to HOLD: %s", exc)
             return {
-                "symbol": "CASH",
+                "symbol": self._fallback_hold_symbol(),
                 "action": "HOLD",
                 "confidence": 0,
                 "suggested_allocation_percent": 0,
@@ -128,3 +135,11 @@ class TradingStrategy:
             },
             previous_trade_summary=None,
         )
+
+    def _fallback_hold_symbol(self) -> str:
+        """Return a watchlist-backed symbol for HOLD fallbacks."""
+        if "SPY" in self.settings.allowed_symbols:
+            return "SPY"
+        if self.settings.allowed_symbols:
+            return self.settings.allowed_symbols[0]
+        return "SPY"
