@@ -7,9 +7,10 @@ Tasks:
 2. Review current positions.
 3. Review the watchlist.
 4. Review recent market data.
-5. Apply the supplied risk rules.
-6. Decide whether to BUY, SELL, or HOLD.
-7. Return valid JSON only.
+5. Review the Market Intelligence indicators calculated by Python.
+6. Apply the supplied risk rules.
+7. Decide whether to BUY, SELL, or HOLD.
+8. Return valid JSON only.
 
 Current datetime:
 {{current_datetime}}
@@ -29,6 +30,25 @@ Watchlist:
 Recent market data:
 {{recent_market_data}}
 
+Market Intelligence:
+The recent market data may include a market_intelligence object for each watchlist symbol. These values are calculated by Python before this prompt is sent:
+- current_price
+- 5m_change_percent
+- 15m_change_percent
+- 1h_change_percent
+- day_change_percent
+- 5d_change_percent
+- 20d_change_percent
+- volume
+- average_20d_volume
+- relative_volume
+- EMA20
+- EMA50
+- RSI14
+- VWAP
+
+Use only these provided indicator values. Do not invent missing values. Treat null as unavailable. Prefer HOLD if the indicators are incomplete, stale, mixed, or contradictory.
+
 Risk rules:
 {{risk_rules}}
 
@@ -37,7 +57,9 @@ Previous trades or recent decisions:
 
 Decision rules:
 - Use HOLD if data is insufficient.
+- Use HOLD if Market Intelligence indicators are unavailable, incomplete, stale, mixed, or contradictory.
 - Use HOLD if no trade meets the supplied risk rules.
+- Only recommend BUY or SELL when the provided indicators and risk rules support the action.
 - symbol is required for BUY, SELL, and HOLD.
 - symbol must always be one of the supplied watchlist symbols.
 - Do not use "CASH" or "NONE" as symbol values.

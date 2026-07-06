@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 
 from config import Settings
+from market_indicators import calculate_market_indicators
 
 
 logger = logging.getLogger(__name__)
@@ -133,6 +134,7 @@ class BrokerClient:
         market_data = {
             "symbols": self.settings.allowed_symbols,
             "prices": {},
+            "market_intelligence": {},
         }
 
         if self._broker is None:
@@ -151,12 +153,49 @@ class BrokerClient:
                     symbol,
                     exc.__class__.__name__,
                 )
+
+            try:
+                minute_bars = self._get_historical_bars(symbol, length=120, timestep="minute")
+                daily_bars = self._get_historical_bars(symbol, length=60, timestep="day")
+                indicators = calculate_market_indicators(symbol, minute_bars, daily_bars)
+                if indicators.get("current_price") is None:
+                    indicators["current_price"] = market_data["prices"].get(symbol, {}).get("last_price")
+                market_data["market_intelligence"][symbol] = indicators
+            except Exception as exc:
+                logger.warning(
+                    "Could not calculate market indicators for %s: %s.",
+                    symbol,
+                    exc.__class__.__name__,
+                )
         return market_data
 
     def _get_last_price(self, symbol: str) -> float | None:
         from lumibot.entities import Asset
 
         return self._to_float(self._broker.get_last_price(Asset(symbol=symbol, asset_type="stock")))
+
+    def _get_historical_bars(self, symbol: str, length: int, timestep: str) -> Any:
+        from lumibot.entities import Asset
+
+        asset = Asset(symbol=symbol, asset_type="stock")
+        data_source = getattr(self._broker, "data_source", None)
+        if data_source is not None and hasattr(data_source, "get_historical_prices"):
+            return data_source.get_historical_prices(
+                asset,
+                length=length,
+                timestep=timestep,
+                include_after_hours=False,
+            )
+
+        if hasattr(self._broker, "get_historical_prices"):
+            return self._broker.get_historical_prices(
+                asset,
+                length=length,
+                timestep=timestep,
+                include_after_hours=False,
+            )
+
+        raise AttributeError("Broker does not expose historical bar data.")
 
     def _log_snapshot_gaps(self, snapshot: BrokerSnapshot) -> None:
         missing_account_fields = [
@@ -174,17 +213,27 @@ class BrokerClient:
             logger.info("Broker snapshot returned no open positions.")
 
         missing_price_symbols = []
+        missing_indicator_symbols = []
         prices = snapshot.market_data.get("prices", {})
+        market_intelligence = snapshot.market_data.get("market_intelligence", {})
         for symbol in self.settings.allowed_symbols:
             price_data = prices.get(symbol)
             latest_price = price_data.get("last_price") if isinstance(price_data, dict) else None
             if latest_price is None:
                 missing_price_symbols.append(symbol)
+            if not market_intelligence.get(symbol):
+                missing_indicator_symbols.append(symbol)
 
         if missing_price_symbols:
             logger.warning(
                 "Broker snapshot missing latest prices for: %s.",
                 ", ".join(missing_price_symbols),
+            )
+
+        if missing_indicator_symbols:
+            logger.warning(
+                "Broker snapshot missing market intelligence for: %s.",
+                ", ".join(missing_indicator_symbols),
             )
 
     def execute_order(self, approved_decision: dict[str, Any]) -> dict[str, Any]:

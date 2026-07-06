@@ -39,6 +39,7 @@ class TradingStrategy:
 
         snapshot = self.broker.collect_snapshot()
         current_time = datetime.now(ZoneInfo(self.settings.market_timezone))
+        self._record_market_snapshots(snapshot, current_time)
         if self.journal is not None:
             self.journal.record_balance_snapshot(
                 trading_day=current_time.date(),
@@ -137,6 +138,20 @@ class TradingStrategy:
             executed=executed,
             timestamp=timestamp,
         )
+
+    def _record_market_snapshots(self, snapshot: BrokerSnapshot, timestamp: datetime) -> None:
+        """Persist enriched market indicators without affecting trading flow."""
+        market_intelligence = snapshot.market_data.get("market_intelligence", {})
+        if not isinstance(market_intelligence, dict):
+            return
+
+        for symbol, indicators in market_intelligence.items():
+            if isinstance(indicators, dict):
+                database.insert_market_snapshot(
+                    symbol=symbol,
+                    snapshot=indicators,
+                    timestamp=timestamp,
+                )
 
     def _get_ai_client(self) -> OpenAIDecisionClient:
         """Create the OpenAI client only when a trading cycle needs it."""

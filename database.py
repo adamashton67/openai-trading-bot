@@ -94,6 +94,50 @@ def insert_decision(
         return None
 
 
+def insert_market_snapshot(
+    symbol: str,
+    snapshot: dict[str, Any],
+    timestamp: datetime | None = None,
+) -> int | None:
+    """Persist one market indicator snapshot without interrupting the bot."""
+    if not _ensure_database_available():
+        return None
+
+    try:
+        with _connect(_database_path) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO market_snapshots (
+                    timestamp,
+                    symbol,
+                    price,
+                    volume,
+                    rsi,
+                    ema20,
+                    ema50,
+                    vwap,
+                    raw_snapshot
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    (timestamp or datetime.now()).isoformat(),
+                    symbol.upper(),
+                    _to_float(snapshot.get("current_price")),
+                    _to_float(snapshot.get("volume")),
+                    _to_float(snapshot.get("RSI14")),
+                    _to_float(snapshot.get("EMA20")),
+                    _to_float(snapshot.get("EMA50")),
+                    _to_float(snapshot.get("VWAP")),
+                    _json_text(snapshot),
+                ),
+            )
+            return int(cursor.lastrowid)
+    except Exception as exc:
+        logger.error("Database market snapshot insert failed safely: %s.", exc.__class__.__name__)
+        return None
+
+
 def _ensure_database_available() -> bool:
     if _database_available and _database_path is not None:
         return True

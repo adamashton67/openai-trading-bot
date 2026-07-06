@@ -9,6 +9,7 @@ import types
 from zoneinfo import ZoneInfo
 
 import pytest
+import pandas as pd
 
 import config
 import database
@@ -19,6 +20,7 @@ from notifications.discord_notifier import DiscordNotifier
 from notifications.notifier import DailySummaryNotifier
 from openai_logic import AIDecision, AIDecisionError, OpenAIDecisionClient, TradingContext
 from openai_test import build_mock_trading_context
+from market_indicators import calculate_market_indicators
 from risk_manager import RiskManager
 from scheduler import MarketScheduler
 from storage import TradingJournal
@@ -184,6 +186,36 @@ def test_database_raw_response_is_stored_as_json_text(tmp_path):
         ).fetchone()[0]
 
     assert json.loads(stored) == {"action": "HOLD", "symbol": "SPY"}
+
+
+def test_database_market_snapshot_insert_succeeds(tmp_path):
+    database_path = tmp_path / "trading_bot.db"
+    database.init_database(database_path)
+
+    snapshot_id = database.insert_market_snapshot(
+        symbol="AAPL",
+        snapshot={
+            "symbol": "AAPL",
+            "current_price": 123.45,
+            "volume": 100000,
+            "RSI14": 55.2,
+            "EMA20": 120.1,
+            "EMA50": 118.4,
+            "VWAP": 121.8,
+        },
+        timestamp=datetime(2026, 7, 6, 10, 0),
+    )
+
+    assert snapshot_id == 1
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT symbol, price, volume, rsi, ema20, ema50, vwap, raw_snapshot "
+            "FROM market_snapshots WHERE id = ?",
+            (snapshot_id,),
+        ).fetchone()
+
+    assert row[:7] == ("AAPL", 123.45, 100000.0, 55.2, 120.1, 118.4, 121.8)
+    assert json.loads(row[7])["current_price"] == 123.45
 
 
 def test_database_initialisation_failure_does_not_crash(tmp_path):
@@ -589,6 +621,68 @@ def approved_decision(**overrides):
     return decision
 
 
+def make_mock_bars(length=80, start_price=100, volume=1000):
+    rows = []
+    for index in range(length):
+        close = start_price + index
+        rows.append(
+            {
+                "open": close - 0.5,
+                "high": close + 1,
+                "low": close - 1,
+                "close": close,
+                "volume": volume + index,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def test_market_indicators_calculate_from_mocked_data():
+    minute_bars = make_mock_bars(length=80, start_price=100, volume=1000)
+    daily_bars = make_mock_bars(length=60, start_price=90, volume=10000)
+
+    indicators = calculate_market_indicators("AAPL", minute_bars, daily_bars)
+
+    assert indicators["symbol"] == "AAPL"
+    assert indicators["current_price"] == 179
+    assert indicators["5m_change_percent"] == pytest.approx(((179 - 174) / 174) * 100)
+    assert indicators["15m_change_percent"] == pytest.approx(((179 - 164) / 164) * 100)
+    assert indicators["1h_change_percent"] == pytest.approx(((179 - 119) / 119) * 100)
+    assert indicators["5d_change_percent"] == pytest.approx(((149 - 144) / 144) * 100)
+    assert indicators["20d_change_percent"] == pytest.approx(((149 - 129) / 129) * 100)
+    assert indicators["volume"] == pytest.approx(minute_bars["volume"].sum())
+    assert indicators["average_20d_volume"] == pytest.approx(daily_bars["volume"].tail(20).mean())
+    assert indicators["relative_volume"] == pytest.approx(
+        minute_bars["volume"].sum() / daily_bars["volume"].tail(20).mean()
+    )
+
+
+def test_market_indicators_calculate_ema_rsi_and_vwap():
+    minute_bars = make_mock_bars(length=80, start_price=100, volume=1000)
+    daily_bars = make_mock_bars(length=60, start_price=90, volume=10000)
+
+    indicators = calculate_market_indicators("AAPL", minute_bars, daily_bars)
+    typical_price = (minute_bars["high"] + minute_bars["low"] + minute_bars["close"]) / 3
+    expected_vwap = (typical_price * minute_bars["volume"]).sum() / minute_bars["volume"].sum()
+
+    assert indicators["EMA20"] == pytest.approx(
+        minute_bars["close"].ewm(span=20, adjust=False).mean().iloc[-1]
+    )
+    assert indicators["EMA50"] == pytest.approx(
+        minute_bars["close"].ewm(span=50, adjust=False).mean().iloc[-1]
+    )
+    assert indicators["RSI14"] == 100
+    assert indicators["VWAP"] == pytest.approx(expected_vwap)
+
+
+def test_missing_bars_do_not_crash_indicator_calculation():
+    indicators = calculate_market_indicators("AAPL", None, None)
+
+    assert indicators["symbol"] == "AAPL"
+    assert indicators["current_price"] is None
+    assert indicators["RSI14"] is None
+
+
 class MockLumibotBroker:
     def __init__(self, should_raise=False):
         self.submitted_orders = []
@@ -620,9 +714,28 @@ class MockAlpacaApi:
         ]
 
 
+class MockDataSource:
+    def __init__(self, failing_symbols=None):
+        self.failing_symbols = set(failing_symbols or [])
+
+    def get_historical_prices(
+        self,
+        asset,
+        length,
+        timestep="",
+        include_after_hours=False,
+    ):
+        if asset.symbol in self.failing_symbols:
+            raise RuntimeError("bar data unavailable")
+        if timestep == "minute":
+            return types.SimpleNamespace(df=make_mock_bars(length=length, start_price=100, volume=1000))
+        return types.SimpleNamespace(df=make_mock_bars(length=length, start_price=90, volume=10000))
+
+
 class MockDataBroker:
-    def __init__(self):
+    def __init__(self, failing_symbols=None):
         self.api = MockAlpacaApi()
+        self.data_source = MockDataSource(failing_symbols=failing_symbols)
 
     def get_last_price(self, asset):
         prices = {
@@ -656,6 +769,23 @@ def test_dry_run_still_allows_broker_data_collection():
     assert snapshot.market_data["prices"]["AAPL"]["last_price"] == 214.33
     assert snapshot.market_data["prices"]["MSFT"]["last_price"] == 434.8
     assert snapshot.market_data["prices"]["SPY"]["last_price"] == 550.25
+    assert snapshot.market_data["market_intelligence"]["AAPL"]["RSI14"] == 100
+    assert snapshot.market_data["market_intelligence"]["MSFT"]["EMA20"] is not None
+    assert snapshot.market_data["market_intelligence"]["SPY"]["VWAP"] is not None
+
+
+def test_failed_symbol_does_not_crash_whole_market_collection():
+    broker = BrokerClient(
+        make_settings(dry_run=True, allowed_symbols=["AAPL", "MSFT", "SPY"]),
+        broker_factory=lambda config: MockDataBroker(failing_symbols={"MSFT"}),
+    )
+
+    broker.connect()
+    snapshot = broker.collect_snapshot()
+
+    assert "AAPL" in snapshot.market_data["market_intelligence"]
+    assert "SPY" in snapshot.market_data["market_intelligence"]
+    assert "MSFT" not in snapshot.market_data["market_intelligence"]
 
 
 def test_alpaca_config_uses_paper_without_deprecated_endpoint():
@@ -673,7 +803,18 @@ def test_strategy_context_includes_populated_broker_data():
     snapshot = BrokerSnapshot(
         account={"cash": 25000, "buying_power": 25000, "portfolio_value": 100000},
         positions=[{"symbol": "MSFT", "quantity": 2}],
-        market_data={"prices": {"AAPL": {"last_price": 214.33}}},
+        market_data={
+            "prices": {"AAPL": {"last_price": 214.33}},
+            "market_intelligence": {
+                "AAPL": {
+                    "current_price": 214.33,
+                    "RSI14": 55.2,
+                    "EMA20": 210.0,
+                    "EMA50": 205.0,
+                    "VWAP": 212.0,
+                }
+            },
+        },
     )
     strategy = TradingStrategy(
         settings=make_settings(allowed_symbols=["AAPL", "MSFT"]),
@@ -687,7 +828,8 @@ def test_strategy_context_includes_populated_broker_data():
     assert context.buying_power == 25000
     assert context.portfolio_value == 100000
     assert context.current_positions == [{"symbol": "MSFT", "quantity": 2}]
-    assert context.recent_price_data == {"prices": {"AAPL": {"last_price": 214.33}}}
+    assert context.recent_price_data["prices"]["AAPL"]["last_price"] == 214.33
+    assert context.recent_price_data["market_intelligence"]["AAPL"]["RSI14"] == 55.2
 
 
 def test_broker_dry_run_blocks_execution():
