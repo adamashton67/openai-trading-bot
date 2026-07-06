@@ -516,6 +516,17 @@ def test_dry_run_still_allows_broker_data_collection():
     assert snapshot.market_data["prices"]["SPY"]["last_price"] == 550.25
 
 
+def test_alpaca_config_uses_paper_without_deprecated_endpoint():
+    broker = BrokerClient(make_settings())
+
+    alpaca_config = broker._alpaca_config()
+
+    assert alpaca_config["PAPER"] is True
+    assert "ENDPOINT" not in alpaca_config
+    assert alpaca_config["API_KEY"] == "test-alpaca-key"
+    assert alpaca_config["API_SECRET"] == "test-alpaca-secret"
+
+
 def test_strategy_context_includes_populated_broker_data():
     snapshot = BrokerSnapshot(
         account={"cash": 25000, "buying_power": 25000, "portfolio_value": 100000},

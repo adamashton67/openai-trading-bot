@@ -351,7 +351,6 @@ class BrokerClient:
             "API_KEY": self.settings.alpaca_api_key,
             "API_SECRET": self.settings.alpaca_secret_key,
             "PAPER": True,
-            "ENDPOINT": self.settings.alpaca_paper_base_url,
         }
 
     def _create_market_order(self, symbol: str, action: str, quantity: int) -> Any:
