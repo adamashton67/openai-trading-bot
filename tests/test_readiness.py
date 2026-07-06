@@ -2,16 +2,20 @@
 
 from datetime import date, datetime
 from pathlib import Path
+import sys
+import types
 from zoneinfo import ZoneInfo
 
 import pytest
 
 import config
+import main
 from config import Settings, load_settings
 from broker import BrokerSnapshot
 from notifications.discord_notifier import DiscordNotifier
 from notifications.notifier import DailySummaryNotifier
 from openai_logic import AIDecision, AIDecisionError, OpenAIDecisionClient, TradingContext
+from openai_test import build_mock_trading_context
 from risk_manager import RiskManager
 from scheduler import MarketScheduler
 from storage import TradingJournal
@@ -121,6 +125,124 @@ def test_ai_response_validation_accepts_supported_decision():
     assert decision.action == "BUY"
 
 
+def test_hold_with_null_exit_percentages_validates():
+    decision = AIDecision.model_validate(
+        {
+            "symbol": "SPY",
+            "action": "HOLD",
+            "confidence": 0.42,
+            "suggested_allocation_percent": 0,
+            "reason": "Insufficient data.",
+            "stop_loss_percent": None,
+            "take_profit_percent": None,
+        }
+    )
+
+    assert decision.action == "HOLD"
+    assert decision.stop_loss_percent is None
+    assert decision.take_profit_percent is None
+
+
+def test_hold_confidence_must_be_numeric():
+    decision = AIDecision.model_validate(
+        {
+            "symbol": "SPY",
+            "action": "HOLD",
+            "confidence": 0.3,
+            "suggested_allocation_percent": 0,
+            "reason": "Insufficient data.",
+            "stop_loss_percent": None,
+            "take_profit_percent": None,
+        }
+    )
+
+    assert decision.action == "HOLD"
+    assert decision.confidence == 0.3
+
+
+def test_null_confidence_is_rejected_safely():
+    client = object.__new__(OpenAIDecisionClient)
+
+    with pytest.raises(AIDecisionError):
+        client._parse_decision(
+            '{"symbol":"SPY","action":"HOLD","confidence":null,'
+            '"suggested_allocation_percent":0,"reason":"Insufficient data.",'
+            '"stop_loss_percent":null,"take_profit_percent":null}'
+        )
+
+
+def test_missing_reason_is_rejected_safely():
+    client = object.__new__(OpenAIDecisionClient)
+
+    with pytest.raises(AIDecisionError):
+        client._parse_decision(
+            '{"symbol":"SPY","action":"HOLD","confidence":0.3,'
+            '"suggested_allocation_percent":0,'
+            '"stop_loss_percent":null,"take_profit_percent":null}'
+        )
+
+
+def test_cash_symbol_is_rejected_safely():
+    client = object.__new__(OpenAIDecisionClient)
+
+    with pytest.raises(AIDecisionError):
+        client._parse_decision(
+            '{"symbol":"CASH","action":"HOLD","confidence":0.3,'
+            '"suggested_allocation_percent":0,"reason":"Insufficient data.",'
+            '"stop_loss_percent":null,"take_profit_percent":null}'
+        )
+
+
+def test_valid_hold_uses_watchlist_symbol_with_reason():
+    decision = AIDecision.model_validate(
+        {
+            "symbol": "SPY",
+            "action": "HOLD",
+            "confidence": 0.3,
+            "suggested_allocation_percent": 0,
+            "reason": "Insufficient signal strength across the watchlist.",
+            "stop_loss_percent": None,
+            "take_profit_percent": None,
+        }
+    )
+
+    assert decision.symbol == "SPY"
+    assert decision.action == "HOLD"
+    assert decision.reason
+
+
+def test_hold_with_zero_exit_percentages_is_normalized_to_null():
+    client = object.__new__(OpenAIDecisionClient)
+
+    decision = client._parse_decision(
+        '{"symbol":"SPY","action":"HOLD","confidence":0.42,'
+        '"suggested_allocation_percent":0,"reason":"Insufficient data.",'
+        '"stop_loss_percent":0,"take_profit_percent":0}'
+    )
+
+    assert decision.action == "HOLD"
+    assert decision.stop_loss_percent is None
+    assert decision.take_profit_percent is None
+
+
+def test_buy_with_positive_exit_percentages_validates():
+    decision = AIDecision.model_validate(
+        {
+            "symbol": "AAPL",
+            "action": "BUY",
+            "confidence": 0.81,
+            "suggested_allocation_percent": 5,
+            "reason": "Test setup.",
+            "stop_loss_percent": 3,
+            "take_profit_percent": 6,
+        }
+    )
+
+    assert decision.action == "BUY"
+    assert decision.stop_loss_percent == 3
+    assert decision.take_profit_percent == 6
+
+
 def test_invalid_ai_json_is_rejected():
     client = object.__new__(OpenAIDecisionClient)
 
@@ -136,6 +258,54 @@ def test_invalid_ai_response_schema_is_rejected():
             '{"symbol":"AAPL","action":"WAIT","confidence":1.2,'
             '"suggested_allocation_percent":5,"reason":"Invalid."}'
         )
+
+
+def test_test_openai_route_exists():
+    parser_args = ["main.py", "--test-openai"]
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("sys.argv", parser_args)
+        args = main.parse_args()
+
+    assert args.test_openai is True
+
+
+def test_mock_openai_context_generation_uses_safe_fake_data():
+    context = build_mock_trading_context(
+        make_settings(allowed_symbols=["AAPL", "MSFT", "SPY"])
+    )
+
+    assert context.market_status == "TEST_MODE_MARKET_OPEN"
+    assert context.portfolio_value == 100000
+    assert context.account_cash == 25000
+    assert context.buying_power == 25000
+    assert context.watchlist_symbols == ["AAPL", "MSFT", "SPY"]
+    assert context.risk_rules["dry_run_enabled"] is True
+    assert context.current_positions[0]["symbol"] == "MSFT"
+    assert "AAPL" in context.recent_price_data
+
+
+def test_test_openai_command_exits_without_broker_execution(monkeypatch):
+    called = {"openai_test": False}
+
+    fake_openai_test = types.ModuleType("openai_test")
+
+    def fake_run(settings):
+        called["openai_test"] = True
+        return 0
+
+    fake_openai_test.run_openai_integration_test = fake_run
+    monkeypatch.setitem(sys.modules, "openai_test", fake_openai_test)
+    monkeypatch.setitem(sys.modules, "broker", None)
+    monkeypatch.setattr(sys, "argv", ["main.py", "--test-openai"])
+    monkeypatch.setattr(config, "load_dotenv", lambda dotenv_path=None: False)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    with pytest.raises(SystemExit) as exc:
+        main.main()
+
+    assert exc.value.code == 0
+    assert called["openai_test"] is True
 
 
 def test_risk_manager_rejects_when_bot_disabled():

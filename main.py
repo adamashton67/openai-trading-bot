@@ -26,6 +26,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print the summary instead of sending it to Discord.",
     )
+    parser.add_argument(
+        "--test-openai",
+        action="store_true",
+        help="Call OpenAI with mock trading context, validate the response, and exit.",
+    )
     return parser.parse_args()
 
 
@@ -59,6 +64,11 @@ def main() -> None:
     if args.send_test_summary:
         summary_notifier.send_test_summary()
         return
+
+    if args.test_openai:
+        from openai_test import run_openai_integration_test
+
+        raise SystemExit(run_openai_integration_test(settings))
 
     if not settings.bot_enabled:
         logger.warning("BOT_ENABLED is false. Bot will monitor market hours but skip trading.")

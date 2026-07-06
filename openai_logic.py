@@ -64,7 +64,10 @@ class AIDecision(BaseModel):
     @classmethod
     def normalize_symbol(cls, symbol: str) -> str:
         """Normalize ticker symbols for downstream risk checks."""
-        return symbol.strip().upper()
+        normalized_symbol = symbol.strip().upper()
+        if normalized_symbol in {"CASH", "NONE"}:
+            raise ValueError("symbol must be a tradable watchlist symbol")
+        return normalized_symbol
 
     @field_validator("action", mode="before")
     @classmethod
@@ -173,6 +176,8 @@ class OpenAIDecisionClient:
             logger.warning("OpenAI returned invalid JSON: %s", exc)
             raise AIDecisionError("OpenAI returned invalid JSON.") from exc
 
+        parsed = self._normalize_optional_exit_percentages(parsed)
+
         try:
             decision = AIDecision.model_validate(parsed)
         except ValidationError as exc:
@@ -186,3 +191,13 @@ class OpenAIDecisionClient:
             decision.confidence,
         )
         return decision
+
+    def _normalize_optional_exit_percentages(self, parsed: Any) -> Any:
+        """Treat model-supplied zero optional exit percentages as absent values."""
+        if not isinstance(parsed, dict):
+            return parsed
+
+        for field_name in ("stop_loss_percent", "take_profit_percent"):
+            if parsed.get(field_name) == 0:
+                parsed[field_name] = None
+        return parsed

@@ -123,6 +123,14 @@ risk_manager_input = decision.to_risk_manager_dict()
 
 The AI layer never executes trades and never bypasses the risk manager.
 
+To test OpenAI with fake paper-trading context:
+
+```bash
+python main.py --test-openai
+```
+
+This loads both prompt files, sends mock account/position/watchlist/market data to OpenAI, validates the JSON response, runs the decision through the risk manager in `DRY_RUN` mode, and exits. It does not call Lumibot, does not use a real broker account, and does not place trades.
+
 ## Discord Daily Summaries
 
 Daily summaries are generated after regular US market close and sent once per trading day. The bot stores simple local JSON journal files under `data/` so app restarts do not resend the same day's summary.
