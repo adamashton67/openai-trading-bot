@@ -114,13 +114,7 @@ class OpenAIDecisionClient:
         logger.info("Requesting AI decision from OpenAI model %s.", self.model)
 
         response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.2,
+            **self._build_chat_completion_request(system_prompt, user_prompt)
         )
 
         raw_content = response.choices[0].message.content
@@ -129,6 +123,30 @@ class OpenAIDecisionClient:
 
         logger.debug("Raw OpenAI decision content: %s", raw_content)
         return self._parse_decision(raw_content)
+
+    def _build_chat_completion_request(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> dict[str, Any]:
+        """Build model-aware Chat Completions request parameters."""
+        request_params: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "response_format": {"type": "json_object"},
+        }
+
+        if self._model_supports_temperature():
+            request_params["temperature"] = 0.2
+
+        return request_params
+
+    def _model_supports_temperature(self) -> bool:
+        """Return whether the configured model accepts temperature."""
+        return not self.model.lower().startswith("gpt-5")
 
     def _load_prompt(self, file_name: str) -> str:
         """Load a prompt file from the configured prompts directory."""

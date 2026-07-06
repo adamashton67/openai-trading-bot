@@ -260,6 +260,28 @@ def test_invalid_ai_response_schema_is_rejected():
         )
 
 
+def test_gpt_5_family_request_omits_temperature():
+    client = object.__new__(OpenAIDecisionClient)
+    client.model = "gpt-5-mini"
+
+    request = client._build_chat_completion_request("system", "user")
+
+    assert request["model"] == "gpt-5-mini"
+    assert "temperature" not in request
+    assert request["response_format"] == {"type": "json_object"}
+
+
+def test_gpt_4o_family_request_includes_temperature():
+    client = object.__new__(OpenAIDecisionClient)
+    client.model = "gpt-4o-mini"
+
+    request = client._build_chat_completion_request("system", "user")
+
+    assert request["model"] == "gpt-4o-mini"
+    assert request["temperature"] == 0.2
+    assert request["response_format"] == {"type": "json_object"}
+
+
 def test_test_openai_route_exists():
     parser_args = ["main.py", "--test-openai"]
 
