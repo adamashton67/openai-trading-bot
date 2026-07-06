@@ -4,6 +4,7 @@ import argparse
 import logging
 
 from config import load_settings, missing_required_values
+from database import init_database
 from logger_config import configure_logging
 from notifications.discord_notifier import DiscordNotifier
 from notifications.notifier import DailySummaryNotifier
@@ -48,6 +49,7 @@ def main() -> None:
     logger.info("Starting OpenAI Trading Bot.")
     logger.info("Paper trading mode: %s", settings.paper_trading)
     logger.info("Dry-run mode: %s", settings.dry_run)
+    init_database()
 
     journal = TradingJournal(settings.data_dir)
     discord_notifier = (

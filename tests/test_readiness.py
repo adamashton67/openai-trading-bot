@@ -1,5 +1,7 @@
 """Pre-deployment readiness coverage for safety-critical bot behavior."""
 
+import json
+import sqlite3
 from datetime import date, datetime
 from pathlib import Path
 import sys
@@ -9,6 +11,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 import config
+import database
 import main
 from config import Settings, load_settings
 from broker import BrokerClient, BrokerSnapshot
@@ -85,6 +88,144 @@ def test_config_loading_reads_environment(monkeypatch):
     assert settings.dry_run is False
     assert settings.discord_daily_summary_enabled is True
     assert settings.allowed_symbols == ["AAPL", "MSFT"]
+
+
+def test_database_path_defaults_to_local_file(monkeypatch):
+    monkeypatch.delenv("DATABASE_PATH", raising=False)
+
+    assert database.get_database_path() == Path("trading_bot.db")
+
+
+def test_database_path_override_works(monkeypatch, tmp_path):
+    database_path = tmp_path / "trading_bot.db"
+    monkeypatch.setenv("DATABASE_PATH", str(database_path))
+
+    assert database.get_database_path() == database_path
+
+
+def test_database_file_is_created(tmp_path):
+    database_path = tmp_path / "nested" / "trading_bot.db"
+
+    assert database.init_database(database_path) is True
+    assert database_path.exists()
+
+
+def test_database_initialises_all_tables(tmp_path):
+    database_path = tmp_path / "trading_bot.db"
+
+    assert database.init_database(database_path) is True
+
+    with sqlite3.connect(database_path) as connection:
+        table_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+
+    assert {
+        "decisions",
+        "executions",
+        "portfolio_snapshots",
+        "market_snapshots",
+        "watchlists",
+    }.issubset(table_names)
+
+
+def test_database_decision_insert_succeeds(tmp_path):
+    database_path = tmp_path / "trading_bot.db"
+    database.init_database(database_path)
+
+    decision_id = database.insert_decision(
+        decision={
+            "symbol": "AAPL",
+            "action": "BUY",
+            "confidence": 0.8,
+            "suggested_allocation_percent": 5,
+            "reason": "Test decision.",
+        },
+        raw_response={"symbol": "AAPL", "action": "BUY"},
+        approved=True,
+        approval_reason="Approved.",
+        executed=False,
+        timestamp=datetime(2026, 7, 6, 10, 0),
+    )
+
+    assert decision_id == 1
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT symbol, action, confidence, allocation_percent, approved, executed "
+            "FROM decisions WHERE id = ?",
+            (decision_id,),
+        ).fetchone()
+
+    assert row == ("AAPL", "BUY", 0.8, 5.0, 1, 0)
+
+
+def test_database_raw_response_is_stored_as_json_text(tmp_path):
+    database_path = tmp_path / "trading_bot.db"
+    database.init_database(database_path)
+
+    decision_id = database.insert_decision(
+        decision={
+            "symbol": "SPY",
+            "action": "HOLD",
+            "confidence": 0.3,
+            "suggested_allocation_percent": 0,
+            "reason": "No valid setup.",
+        },
+        raw_response='{"action":"HOLD","symbol":"SPY"}',
+    )
+
+    with sqlite3.connect(database_path) as connection:
+        stored = connection.execute(
+            "SELECT raw_response FROM decisions WHERE id = ?",
+            (decision_id,),
+        ).fetchone()[0]
+
+    assert json.loads(stored) == {"action": "HOLD", "symbol": "SPY"}
+
+
+def test_database_initialisation_failure_does_not_crash(tmp_path):
+    blocked_parent = tmp_path / "not_a_directory"
+    blocked_parent.write_text("blocked", encoding="utf-8")
+
+    assert database.init_database(blocked_parent / "trading_bot.db") is False
+
+
+def test_database_decision_insert_failure_does_not_crash_trading_flow(monkeypatch, tmp_path):
+    database.init_database(tmp_path / "trading_bot.db")
+
+    def failing_connect(path):
+        raise sqlite3.OperationalError("database unavailable")
+
+    monkeypatch.setattr(database, "_connect", failing_connect)
+
+    strategy = TradingStrategy(
+        settings=make_settings(dry_run=True),
+        broker=types.SimpleNamespace(
+            collect_snapshot=lambda: BrokerSnapshot(
+                account={"cash": 25000, "buying_power": 25000, "portfolio_value": 100000},
+                positions=[],
+                market_data={"prices": {"AAPL": {"last_price": 100}}},
+            )
+        ),
+        risk_manager=RiskManager(make_settings(dry_run=True)),
+    )
+    strategy.ai_client = types.SimpleNamespace(
+        last_raw_response='{"symbol":"AAPL","action":"BUY"}',
+        get_decision=lambda context: types.SimpleNamespace(
+            to_risk_manager_dict=lambda: {
+                "symbol": "AAPL",
+                "action": "BUY",
+                "confidence": 0.9,
+                "suggested_allocation_percent": 1,
+                "reason": "Test decision.",
+            }
+        ),
+    )
+
+    strategy.run_cycle()
 
 
 def test_prompt_files_are_loaded_and_rendered_at_runtime(tmp_path):
@@ -318,7 +459,7 @@ def test_mock_openai_context_generation_uses_safe_fake_data():
     assert "AAPL" in context.recent_price_data
 
 
-def test_test_openai_command_exits_without_broker_execution(monkeypatch):
+def test_test_openai_command_exits_without_broker_execution(monkeypatch, tmp_path):
     called = {"openai_test": False}
 
     fake_openai_test = types.ModuleType("openai_test")
@@ -333,6 +474,7 @@ def test_test_openai_command_exits_without_broker_execution(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["main.py", "--test-openai"])
     monkeypatch.setattr(config, "load_dotenv", lambda dotenv_path=None: False)
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "trading_bot.db"))
 
     with pytest.raises(SystemExit) as exc:
         main.main()

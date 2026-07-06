@@ -105,6 +105,7 @@ class OpenAIDecisionClient:
         self.model = model
         self.prompts_dir = prompts_dir
         self.client = OpenAI(api_key=api_key)
+        self.last_raw_response: str | None = None
 
     def get_decision(self, context: TradingContext) -> AIDecision:
         """Request and validate one structured trade decision from OpenAI."""
@@ -121,6 +122,7 @@ class OpenAIDecisionClient:
         if not raw_content:
             raise AIDecisionError("OpenAI returned an empty decision.")
 
+        self.last_raw_response = raw_content
         logger.debug("Raw OpenAI decision content: %s", raw_content)
         return self._parse_decision(raw_content)
 

@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import database
 from broker import BrokerClient, BrokerSnapshot
 from config import Settings
 from openai_logic import AIDecisionError, OpenAIDecisionClient, TradingContext
@@ -30,6 +31,7 @@ class TradingStrategy:
         self.risk_manager = risk_manager
         self.journal = journal
         self.ai_client: OpenAIDecisionClient | None = None
+        self._last_ai_raw_response: str | None = None
 
     def run_cycle(self) -> None:
         """Run one complete trading cycle."""
@@ -64,6 +66,13 @@ class TradingStrategy:
                     reason=reason,
                     timestamp=current_time,
                 )
+            self._record_database_decision(
+                decision=decision,
+                approved=False,
+                approval_reason=reason,
+                executed=False,
+                timestamp=current_time,
+            )
             return
 
         result = self.broker.execute_order(decision)
@@ -82,13 +91,23 @@ class TradingStrategy:
                     reason=result.get("reason", "Execution rejected."),
                     timestamp=current_time,
                 )
+        self._record_database_decision(
+            decision=decision,
+            approved=True,
+            approval_reason=reason,
+            executed=bool(result.get("executed")),
+            timestamp=current_time,
+        )
 
     def get_ai_decision(self, snapshot: BrokerSnapshot) -> dict[str, Any]:
         """Ask OpenAI for a validated suggestion and return it for risk checks."""
         context = self._build_ai_context(snapshot)
+        self._last_ai_raw_response = None
 
         try:
-            decision = self._get_ai_client().get_decision(context)
+            ai_client = self._get_ai_client()
+            decision = ai_client.get_decision(context)
+            self._last_ai_raw_response = ai_client.last_raw_response
         except AIDecisionError as exc:
             logger.warning("AI decision unavailable. Falling back to HOLD: %s", exc)
             return {
@@ -100,6 +119,24 @@ class TradingStrategy:
             }
 
         return decision.to_risk_manager_dict()
+
+    def _record_database_decision(
+        self,
+        decision: dict[str, Any],
+        approved: bool | None,
+        approval_reason: str | None,
+        executed: bool | None,
+        timestamp: datetime,
+    ) -> None:
+        """Persist decision metadata without affecting the trading cycle."""
+        database.insert_decision(
+            decision=decision,
+            raw_response=self._last_ai_raw_response or decision,
+            approved=approved,
+            approval_reason=approval_reason,
+            executed=executed,
+            timestamp=timestamp,
+        )
 
     def _get_ai_client(self) -> OpenAIDecisionClient:
         """Create the OpenAI client only when a trading cycle needs it."""

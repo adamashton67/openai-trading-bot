@@ -22,6 +22,7 @@ Lumibot executes.
 ├── scheduler.py
 ├── logger_config.py
 ├── storage.py
+├── database.py
 ├── notifications/
 │   ├── notifier.py
 │   └── discord_notifier.py
@@ -74,6 +75,12 @@ python main.py
 
 Add the same environment variables from `.env.example` in the Railway project settings.
 
+For persistent SQLite storage on Railway, mount a Railway volume at `/data` and set:
+
+```env
+DATABASE_PATH=/data/trading_bot.db
+```
+
 ## Environment Variables
 
 | Variable | Default | Purpose |
@@ -93,6 +100,7 @@ Add the same environment variables from `.env.example` in the Railway project se
 | `ALLOWED_SYMBOLS` | sample symbols | Optional comma-separated symbol allowlist. |
 | `DISCORD_WEBHOOK_URL` | empty | Discord incoming webhook URL for summaries. |
 | `DISCORD_DAILY_SUMMARY_ENABLED` | `false` | Enables one daily summary after regular US market close. |
+| `DATABASE_PATH` | `trading_bot.db` | SQLite database path. Use `/data/trading_bot.db` on Railway with a mounted volume. |
 
 ## Trading Flow
 
@@ -124,6 +132,12 @@ risk_manager_input = decision.to_risk_manager_dict()
 The AI layer never executes trades and never bypasses the risk manager.
 
 Real Alpaca paper order submission is isolated in `broker.py` and remains blocked unless `BOT_ENABLED=true`, `PAPER_TRADING=true`, `DRY_RUN=false`, market data includes a valid latest price, and the risk manager approves the decision.
+
+## Persistent Storage
+
+`database.py` uses Python's built-in SQLite support to persist finalized AI decisions. Local development defaults to `trading_bot.db` in the project folder. Railway should use `DATABASE_PATH=/data/trading_bot.db` so records survive deploys and restarts.
+
+The database initializes automatically on startup and creates these tables for current and future analytics: `decisions`, `executions`, `portfolio_snapshots`, `market_snapshots`, and `watchlists`. If SQLite is unavailable, the bot logs the failure class and continues without database writes.
 
 To test OpenAI with fake paper-trading context:
 
