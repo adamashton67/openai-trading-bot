@@ -459,6 +459,84 @@ class MockLumibotBroker:
         return types.SimpleNamespace(identifier="paper-123", status="submitted")
 
 
+class MockAlpacaApi:
+    def get_account(self):
+        return types.SimpleNamespace(
+            cash="25000",
+            buying_power="25000",
+            portfolio_value="100000",
+        )
+
+    def get_all_positions(self):
+        return [
+            types.SimpleNamespace(
+                symbol="MSFT",
+                qty="2",
+                market_value="869.60",
+                avg_entry_price="431.21",
+            )
+        ]
+
+
+class MockDataBroker:
+    def __init__(self):
+        self.api = MockAlpacaApi()
+
+    def get_last_price(self, asset):
+        prices = {
+            "AAPL": 214.33,
+            "MSFT": 434.80,
+            "SPY": 550.25,
+        }
+        return prices.get(asset.symbol)
+
+
+def test_dry_run_still_allows_broker_data_collection():
+    broker = BrokerClient(
+        make_settings(dry_run=True, allowed_symbols=["AAPL", "MSFT", "SPY"]),
+        broker_factory=lambda config: MockDataBroker(),
+    )
+
+    broker.connect()
+    snapshot = broker.collect_snapshot()
+
+    assert snapshot.account["cash"] == 25000
+    assert snapshot.account["buying_power"] == 25000
+    assert snapshot.account["portfolio_value"] == 100000
+    assert snapshot.positions == [
+        {
+            "symbol": "MSFT",
+            "quantity": 2,
+            "market_value": 869.6,
+            "average_price": 431.21,
+        }
+    ]
+    assert snapshot.market_data["prices"]["AAPL"]["last_price"] == 214.33
+    assert snapshot.market_data["prices"]["MSFT"]["last_price"] == 434.8
+    assert snapshot.market_data["prices"]["SPY"]["last_price"] == 550.25
+
+
+def test_strategy_context_includes_populated_broker_data():
+    snapshot = BrokerSnapshot(
+        account={"cash": 25000, "buying_power": 25000, "portfolio_value": 100000},
+        positions=[{"symbol": "MSFT", "quantity": 2}],
+        market_data={"prices": {"AAPL": {"last_price": 214.33}}},
+    )
+    strategy = TradingStrategy(
+        settings=make_settings(allowed_symbols=["AAPL", "MSFT"]),
+        broker=None,
+        risk_manager=RiskManager(make_settings()),
+    )
+
+    context = strategy._build_ai_context(snapshot)
+
+    assert context.account_cash == 25000
+    assert context.buying_power == 25000
+    assert context.portfolio_value == 100000
+    assert context.current_positions == [{"symbol": "MSFT", "quantity": 2}]
+    assert context.recent_price_data == {"prices": {"AAPL": {"last_price": 214.33}}}
+
+
 def test_broker_dry_run_blocks_execution():
     fake_broker = MockLumibotBroker()
     broker = broker_with_snapshot(make_settings(dry_run=True), fake_broker=fake_broker)

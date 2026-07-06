@@ -47,10 +47,6 @@ class BrokerClient:
             self._mark_broker_unavailable("PAPER_TRADING is false.")
             return
 
-        if self.settings.dry_run:
-            logger.info("DRY_RUN is true. Alpaca broker connection will be deferred.")
-            return
-
         if not self.settings.alpaca_api_key or not self.settings.alpaca_secret_key:
             logger.warning("Alpaca broker connection skipped because credentials are missing.")
             self._mark_broker_unavailable("Alpaca credentials are missing.")
@@ -65,6 +61,10 @@ class BrokerClient:
 
         self._broker_available = True
         self._broker_unavailable_reason = None
+        if self.settings.dry_run:
+            logger.info("Broker connected for Alpaca Paper Trading data collection. DRY_RUN still blocks orders.")
+            return
+
         logger.info("Broker connected for Alpaca Paper Trading.")
 
     def collect_snapshot(self) -> BrokerSnapshot:
@@ -77,6 +77,7 @@ class BrokerClient:
 
         snapshot = BrokerSnapshot(account=account, positions=positions, market_data=market_data)
         self._last_snapshot = snapshot
+        self._log_snapshot_gaps(snapshot)
         return snapshot
 
     def _collect_account_data(self) -> dict[str, Any]:
@@ -89,6 +90,7 @@ class BrokerClient:
         }
 
         if self._broker is None:
+            logger.warning("Broker unavailable; account data was not collected.")
             return account
 
         try:
@@ -106,6 +108,7 @@ class BrokerClient:
 
     def _collect_positions(self) -> list[dict[str, Any]]:
         if self._broker is None:
+            logger.warning("Broker unavailable; positions were not collected.")
             return []
 
         try:
@@ -133,11 +136,15 @@ class BrokerClient:
         }
 
         if self._broker is None:
+            logger.warning("Broker unavailable; latest prices were not collected.")
             return market_data
 
         for symbol in self.settings.allowed_symbols:
             try:
-                market_data["prices"][symbol] = {"last_price": self._get_last_price(symbol)}
+                latest_price = self._get_last_price(symbol)
+                market_data["prices"][symbol] = {"last_price": latest_price}
+                if latest_price is None:
+                    logger.warning("Latest price for %s is missing.", symbol)
             except Exception as exc:
                 logger.warning(
                     "Could not collect latest price for %s: %s.",
@@ -150,6 +157,35 @@ class BrokerClient:
         from lumibot.entities import Asset
 
         return self._to_float(self._broker.get_last_price(Asset(symbol=symbol, asset_type="stock")))
+
+    def _log_snapshot_gaps(self, snapshot: BrokerSnapshot) -> None:
+        missing_account_fields = [
+            field_name
+            for field_name in ("cash", "buying_power", "portfolio_value")
+            if snapshot.account.get(field_name) is None
+        ]
+        if missing_account_fields:
+            logger.warning(
+                "Broker snapshot missing account fields: %s.",
+                ", ".join(missing_account_fields),
+            )
+
+        if not snapshot.positions:
+            logger.info("Broker snapshot returned no open positions.")
+
+        missing_price_symbols = []
+        prices = snapshot.market_data.get("prices", {})
+        for symbol in self.settings.allowed_symbols:
+            price_data = prices.get(symbol)
+            latest_price = price_data.get("last_price") if isinstance(price_data, dict) else None
+            if latest_price is None:
+                missing_price_symbols.append(symbol)
+
+        if missing_price_symbols:
+            logger.warning(
+                "Broker snapshot missing latest prices for: %s.",
+                ", ".join(missing_price_symbols),
+            )
 
     def execute_order(self, approved_decision: dict[str, Any]) -> dict[str, Any]:
         """Execute an approved trade through Lumibot.
