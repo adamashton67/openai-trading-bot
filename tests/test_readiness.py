@@ -223,6 +223,65 @@ def test_database_market_snapshot_insert_succeeds(tmp_path):
     assert raw_snapshot["relative_volume"] == 1.4
 
 
+def test_database_portfolio_snapshot_insert_succeeds(tmp_path):
+    database_path = tmp_path / "trading_bot.db"
+    database.init_database(database_path)
+
+    snapshot_id = database.insert_portfolio_snapshot(
+        snapshot={
+            "account": {
+                "cash": 25000,
+                "buying_power": 30000,
+                "equity": 100500,
+                "portfolio_value": 100500,
+            },
+            "positions": [
+                {"symbol": "AAPL", "quantity": 2},
+                {"symbol": "MSFT", "quantity": 1},
+            ],
+            "market_data": {"prices": {"AAPL": {"last_price": 214.33}}},
+        },
+        timestamp=datetime(2026, 7, 6, 10, 0),
+    )
+
+    assert snapshot_id == 1
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT cash, buying_power, equity, portfolio_value, positions_count, raw_snapshot "
+            "FROM portfolio_snapshots WHERE id = ?",
+            (snapshot_id,),
+        ).fetchone()
+
+    assert row[:5] == (25000.0, 30000.0, 100500.0, 100500.0, 2)
+    raw_snapshot = json.loads(row[5])
+    assert raw_snapshot["account"]["cash"] == 25000
+    assert raw_snapshot["positions"][0]["symbol"] == "AAPL"
+    assert raw_snapshot["market_data"]["prices"]["AAPL"]["last_price"] == 214.33
+
+
+def test_database_portfolio_snapshot_missing_fields_are_null(tmp_path):
+    database_path = tmp_path / "trading_bot.db"
+    database.init_database(database_path)
+
+    snapshot_id = database.insert_portfolio_snapshot(
+        snapshot={
+            "account": {"cash": None},
+            "positions": None,
+        },
+        timestamp=datetime(2026, 7, 6, 10, 0),
+    )
+
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT cash, buying_power, equity, portfolio_value, positions_count, raw_snapshot "
+            "FROM portfolio_snapshots WHERE id = ?",
+            (snapshot_id,),
+        ).fetchone()
+
+    assert row[:5] == (None, None, None, None, None)
+    assert json.loads(row[5])["account"]["cash"] is None
+
+
 def test_database_initialisation_failure_does_not_crash(tmp_path):
     blocked_parent = tmp_path / "not_a_directory"
     blocked_parent.write_text("blocked", encoding="utf-8")
@@ -941,6 +1000,84 @@ def test_strategy_writes_one_market_snapshot_per_symbol_per_cycle(tmp_path):
     assert json.loads(rows[1][1])["RSI14"] == 48.1
 
 
+def test_strategy_writes_one_portfolio_snapshot_per_cycle(tmp_path):
+    database_path = tmp_path / "trading_bot.db"
+    database.init_database(database_path)
+    snapshot = BrokerSnapshot(
+        account={
+            "cash": 25000,
+            "buying_power": 30000,
+            "equity": 100500,
+            "portfolio_value": 100500,
+        },
+        positions=[{"symbol": "AAPL", "quantity": 2}],
+        market_data={"prices": {"AAPL": {"last_price": 214.33}}},
+    )
+    strategy = TradingStrategy(
+        settings=make_settings(allowed_symbols=["AAPL"]),
+        broker=types.SimpleNamespace(collect_snapshot=lambda: snapshot),
+        risk_manager=RiskManager(make_settings(dry_run=True)),
+    )
+    strategy.ai_client = types.SimpleNamespace(
+        last_raw_response='{"symbol":"AAPL","action":"HOLD"}',
+        get_decision=lambda context: types.SimpleNamespace(
+            to_risk_manager_dict=lambda: {
+                "symbol": "AAPL",
+                "action": "HOLD",
+                "confidence": 0.8,
+                "suggested_allocation_percent": 0,
+                "reason": "Test hold.",
+            }
+        ),
+    )
+
+    strategy.run_cycle()
+
+    with sqlite3.connect(database_path) as connection:
+        portfolio_count = connection.execute(
+            "SELECT COUNT(*) FROM portfolio_snapshots"
+        ).fetchone()[0]
+        raw_snapshot = connection.execute(
+            "SELECT raw_snapshot FROM portfolio_snapshots"
+        ).fetchone()[0]
+
+    assert portfolio_count == 1
+    assert json.loads(raw_snapshot)["account"]["portfolio_value"] == 100500
+
+
+def test_portfolio_snapshot_insert_failure_does_not_crash_trading_cycle(monkeypatch, tmp_path):
+    database.init_database(tmp_path / "trading_bot.db")
+
+    def failing_insert(*args, **kwargs):
+        raise sqlite3.OperationalError("database unavailable")
+
+    monkeypatch.setattr(database, "insert_portfolio_snapshot", failing_insert)
+    snapshot = BrokerSnapshot(
+        account={"cash": 25000, "buying_power": 25000, "portfolio_value": 100000},
+        positions=[],
+        market_data={},
+    )
+    strategy = TradingStrategy(
+        settings=make_settings(allowed_symbols=["AAPL"]),
+        broker=types.SimpleNamespace(collect_snapshot=lambda: snapshot),
+        risk_manager=RiskManager(make_settings(dry_run=True)),
+    )
+    strategy.ai_client = types.SimpleNamespace(
+        last_raw_response='{"symbol":"AAPL","action":"HOLD"}',
+        get_decision=lambda context: types.SimpleNamespace(
+            to_risk_manager_dict=lambda: {
+                "symbol": "AAPL",
+                "action": "HOLD",
+                "confidence": 0.8,
+                "suggested_allocation_percent": 0,
+                "reason": "Test hold.",
+            }
+        ),
+    )
+
+    strategy.run_cycle()
+
+
 def test_market_snapshot_insert_failure_does_not_crash_trading_cycle(monkeypatch, tmp_path):
     database.init_database(tmp_path / "trading_bot.db")
 
@@ -1182,7 +1319,9 @@ def test_invalid_or_missing_openai_decision_falls_back_to_hold():
     assert decision["suggested_allocation_percent"] == 0
 
 
-def test_rejected_ai_decision_does_not_reach_broker_execution():
+def test_rejected_ai_decision_does_not_reach_broker_execution(tmp_path):
+    database.init_database(tmp_path / "trading_bot.db")
+
     class StubBroker:
         def __init__(self):
             self.execute_called = False

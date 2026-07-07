@@ -138,6 +138,50 @@ def insert_market_snapshot(
         return None
 
 
+def insert_portfolio_snapshot(
+    snapshot: dict[str, Any],
+    timestamp: datetime | None = None,
+) -> int | None:
+    """Persist one portfolio/account snapshot without interrupting the bot."""
+    if not _ensure_database_available():
+        return None
+
+    account = snapshot.get("account") if isinstance(snapshot, dict) else {}
+    positions = snapshot.get("positions") if isinstance(snapshot, dict) else None
+    if not isinstance(account, dict):
+        account = {}
+
+    try:
+        with _connect(_database_path) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO portfolio_snapshots (
+                    timestamp,
+                    cash,
+                    buying_power,
+                    equity,
+                    portfolio_value,
+                    positions_count,
+                    raw_snapshot
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    (timestamp or datetime.now()).isoformat(),
+                    _to_float(account.get("cash")),
+                    _to_float(account.get("buying_power")),
+                    _to_float(account.get("equity")),
+                    _to_float(account.get("portfolio_value")),
+                    len(positions) if isinstance(positions, list) else None,
+                    _json_text(snapshot),
+                ),
+            )
+            return int(cursor.lastrowid)
+    except Exception as exc:
+        logger.error("Database portfolio snapshot insert failed safely: %s.", exc.__class__.__name__)
+        return None
+
+
 def _ensure_database_available() -> bool:
     if _database_available and _database_path is not None:
         return True

@@ -87,6 +87,7 @@ class BrokerClient:
             "paper_trading": self.settings.paper_trading,
             "cash": None,
             "buying_power": None,
+            "equity": None,
             "portfolio_value": None,
         }
 
@@ -100,6 +101,7 @@ class BrokerClient:
                 {
                     "cash": self._to_float(getattr(alpaca_account, "cash", None)),
                     "buying_power": self._to_float(getattr(alpaca_account, "buying_power", None)),
+                    "equity": self._to_float(getattr(alpaca_account, "equity", None)),
                     "portfolio_value": self._to_float(getattr(alpaca_account, "portfolio_value", None)),
                 }
             )
