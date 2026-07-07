@@ -1639,6 +1639,83 @@ def test_broker_allocation_above_max_does_not_call_lumibot():
     assert fake_broker.submitted_orders == []
 
 
+def test_broker_rejects_buy_that_would_exceed_position_allocation():
+    fake_broker = MockLumibotBroker()
+    broker = broker_with_snapshot(
+        make_settings(max_position_allocation_percent=5),
+        price=100,
+        fake_broker=fake_broker,
+    )
+    broker._last_snapshot = BrokerSnapshot(
+        account={"portfolio_value": 100000, "cash": 25000, "buying_power": 25000},
+        positions=[{"symbol": "AAPL", "quantity": 30, "market_value": 3000}],
+        market_data={"prices": {"AAPL": {"last_price": 100}}},
+    )
+
+    result = broker.execute_order(approved_decision(suggested_allocation_percent=3))
+
+    assert result["executed"] is False
+    assert "Projected AAPL allocation exceeds maximum" in result["reason"]
+    assert fake_broker.submitted_orders == []
+
+
+def test_broker_allows_buy_within_remaining_position_allocation():
+    fake_broker = MockLumibotBroker()
+    broker = broker_with_snapshot(
+        make_settings(max_position_allocation_percent=5),
+        price=100,
+        fake_broker=fake_broker,
+    )
+    broker._last_snapshot = BrokerSnapshot(
+        account={"portfolio_value": 100000, "cash": 25000, "buying_power": 25000},
+        positions=[{"symbol": "AAPL", "quantity": 20, "market_value": 2000}],
+        market_data={"prices": {"AAPL": {"last_price": 100}}},
+    )
+
+    result = broker.execute_order(approved_decision(suggested_allocation_percent=3))
+
+    assert result["executed"] is True
+    assert result["quantity"] == 30
+    assert fake_broker.submitted_orders[0].symbol == "AAPL"
+
+
+def test_broker_rejects_sell_without_existing_position():
+    fake_broker = MockLumibotBroker()
+    broker = broker_with_snapshot(make_settings(), price=100, fake_broker=fake_broker)
+
+    result = broker.execute_order(approved_decision(action="SELL"))
+
+    assert result["executed"] is False
+    assert "No existing AAPL position to sell" in result["reason"]
+    assert fake_broker.submitted_orders == []
+
+
+def test_broker_allows_sell_with_existing_position():
+    fake_broker = MockLumibotBroker()
+    broker = broker_with_snapshot(make_settings(), price=100, fake_broker=fake_broker)
+    broker._last_snapshot = BrokerSnapshot(
+        account={"portfolio_value": 100000, "cash": 25000, "buying_power": 25000},
+        positions=[{"symbol": "AAPL", "quantity": 50, "market_value": 5000}],
+        market_data={"prices": {"AAPL": {"last_price": 100}}},
+    )
+
+    result = broker.execute_order(approved_decision(action="SELL"))
+
+    assert result["executed"] is True
+    assert fake_broker.submitted_orders[0].action == "SELL"
+
+
+def test_dry_run_blocks_before_position_guard():
+    fake_broker = MockLumibotBroker()
+    broker = broker_with_snapshot(make_settings(dry_run=True), price=100, fake_broker=fake_broker)
+
+    result = broker.execute_order(approved_decision(action="SELL"))
+
+    assert result["executed"] is False
+    assert "DRY_RUN" in result["reason"]
+    assert fake_broker.submitted_orders == []
+
+
 def test_broker_quantity_calculation_works():
     broker = broker_with_snapshot(make_settings(), price=100)
 
@@ -1715,6 +1792,11 @@ def test_broker_sell_calls_mocked_lumibot_execution():
         price=100,
         fake_broker=fake_broker,
         execution_strategy_factory=strategy_factory,
+    )
+    broker._last_snapshot = BrokerSnapshot(
+        account={"portfolio_value": 100000, "cash": 25000, "buying_power": 25000},
+        positions=[{"symbol": "AAPL", "quantity": 50, "market_value": 5000}],
+        market_data={"prices": {"AAPL": {"last_price": 100}}},
     )
 
     result = broker.execute_order(approved_decision(action="SELL"))

@@ -372,6 +372,14 @@ class BrokerClient:
             logger.info("Order execution rejected: %s", reason)
             return self._build_execution_result(approved_decision, False, reason)
 
+        position_failure = self._position_guard_failure(
+            approved_decision,
+            price,
+        )
+        if position_failure:
+            logger.info("Order execution rejected: %s", position_failure)
+            return self._build_execution_result(approved_decision, False, position_failure)
+
         quantity = self._calculate_quantity(approved_decision, price)
         if quantity <= 0:
             reason = "Calculated quantity is 0. No order placed."
@@ -466,6 +474,58 @@ class BrokerClient:
 
         notional = portfolio_value * (allocation / 100)
         return int(notional // latest_price)
+
+    def _position_guard_failure(self, decision: dict[str, Any], latest_price: float) -> str | None:
+        action = str(decision.get("action", "")).upper()
+        symbol = str(decision.get("symbol", "")).upper()
+        current_market_value = self._current_position_market_value(symbol, latest_price)
+
+        if action == "SELL" and current_market_value <= 0:
+            return f"No existing {symbol} position to sell."
+
+        if action != "BUY":
+            return None
+
+        snapshot = self._last_snapshot
+        portfolio_value = self._to_float(snapshot.account.get("portfolio_value")) if snapshot else None
+        allocation = self._to_float(decision.get("suggested_allocation_percent"))
+        if portfolio_value is None or portfolio_value <= 0 or allocation is None:
+            return "Portfolio value or allocation unavailable for position limit check."
+
+        requested_notional = portfolio_value * (allocation / 100)
+        projected_market_value = current_market_value + requested_notional
+        max_market_value = portfolio_value * (self.settings.max_position_allocation_percent / 100)
+
+        if projected_market_value > max_market_value:
+            return (
+                f"Projected {symbol} allocation exceeds maximum "
+                f"{self.settings.max_position_allocation_percent:.2f}%."
+            )
+
+        return None
+
+    def _current_position_market_value(self, symbol: str, latest_price: float) -> float:
+        snapshot = self._last_snapshot
+        if snapshot is None:
+            return 0.0
+
+        for position in snapshot.positions or []:
+            if str(position.get("symbol", "")).upper() != symbol:
+                continue
+
+            market_value = self._to_float(position.get("market_value"))
+            if market_value is not None:
+                return abs(market_value)
+
+            quantity = self._to_float(
+                position.get("quantity")
+                or position.get("qty")
+                or position.get("shares")
+            )
+            if quantity is not None:
+                return abs(quantity * latest_price)
+
+        return 0.0
 
     def _latest_price(self, symbol: str) -> float | None:
         if self._last_snapshot is None:
