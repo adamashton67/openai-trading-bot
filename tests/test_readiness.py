@@ -51,6 +51,8 @@ def make_settings(**overrides):
         "broad_market_scan_enabled": False,
         "broad_market_max_symbols": 1000,
         "max_scanner_candidates_after_filters": 1000,
+        "broad_scan_batch_size": 100,
+        "broad_scan_max_requests_per_cycle": 20,
         "min_stock_price": 5,
         "min_average_volume": 500000,
         "exclude_etfs": True,
@@ -126,6 +128,8 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
         "BROAD_MARKET_SCAN_ENABLED",
         "BROAD_MARKET_MAX_SYMBOLS",
         "MAX_SCANNER_CANDIDATES_AFTER_FILTERS",
+        "BROAD_SCAN_BATCH_SIZE",
+        "BROAD_SCAN_MAX_REQUESTS_PER_CYCLE",
         "MIN_STOCK_PRICE",
         "MIN_AVERAGE_VOLUME",
         "EXCLUDE_ETFS",
@@ -149,6 +153,8 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
     assert settings.broad_market_scan_enabled is False
     assert settings.broad_market_max_symbols == 1000
     assert settings.max_scanner_candidates_after_filters == 1000
+    assert settings.broad_scan_batch_size == 100
+    assert settings.broad_scan_max_requests_per_cycle == 20
     assert settings.min_stock_price == 5
     assert settings.min_average_volume == 500000
     assert settings.exclude_etfs is True
@@ -169,6 +175,8 @@ def test_config_loading_reads_environment(monkeypatch):
     monkeypatch.setenv("BROAD_MARKET_SCAN_ENABLED", "true")
     monkeypatch.setenv("BROAD_MARKET_MAX_SYMBOLS", "50")
     monkeypatch.setenv("MAX_SCANNER_CANDIDATES_AFTER_FILTERS", "25")
+    monkeypatch.setenv("BROAD_SCAN_BATCH_SIZE", "12")
+    monkeypatch.setenv("BROAD_SCAN_MAX_REQUESTS_PER_CYCLE", "3")
     monkeypatch.setenv("MIN_STOCK_PRICE", "10")
     monkeypatch.setenv("MIN_AVERAGE_VOLUME", "750000")
     monkeypatch.setenv("EXCLUDE_ETFS", "false")
@@ -190,6 +198,8 @@ def test_config_loading_reads_environment(monkeypatch):
     assert settings.broad_market_scan_enabled is True
     assert settings.broad_market_max_symbols == 50
     assert settings.max_scanner_candidates_after_filters == 25
+    assert settings.broad_scan_batch_size == 12
+    assert settings.broad_scan_max_requests_per_cycle == 3
     assert settings.min_stock_price == 10
     assert settings.min_average_volume == 750000
     assert settings.exclude_etfs is False
@@ -929,6 +939,27 @@ def test_test_execution_route_exists():
     assert args.dry_run is True
 
 
+def test_single_cycle_route_exists():
+    parser_args = ["main.py", "--single-cycle"]
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("sys.argv", parser_args)
+        args = main.parse_args()
+
+    assert args.single_cycle is True
+
+
+def test_test_scanner_route_and_cap_exist():
+    parser_args = ["main.py", "--test-scanner", "--scanner-max-symbols", "100"]
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("sys.argv", parser_args)
+        args = main.parse_args()
+
+    assert args.test_scanner is True
+    assert args.scanner_max_symbols == 100
+
+
 def test_mock_openai_context_generation_uses_safe_fake_data():
     context = build_mock_trading_context(
         make_settings(allowed_symbols=["AAPL", "MSFT", "SPY"])
@@ -966,6 +997,134 @@ def test_test_openai_command_exits_without_broker_execution(monkeypatch, tmp_pat
 
     assert exc.value.code == 0
     assert called["openai_test"] is True
+
+
+def test_single_cycle_command_runs_one_cycle(monkeypatch, tmp_path):
+    calls = {
+        "broker_connected": 0,
+        "strategy_cycles": 0,
+        "risk_manager_created": 0,
+        "scheduler_created": 0,
+    }
+
+    fake_broker_module = types.ModuleType("broker")
+
+    class FakeBrokerClient:
+        def __init__(self, settings):
+            self.settings = settings
+
+        def connect(self):
+            calls["broker_connected"] += 1
+
+    fake_broker_module.BrokerClient = FakeBrokerClient
+    fake_risk_module = types.ModuleType("risk_manager")
+
+    class FakeRiskManager:
+        def __init__(self, settings):
+            calls["risk_manager_created"] += 1
+
+    fake_risk_module.RiskManager = FakeRiskManager
+    fake_scheduler_module = types.ModuleType("scheduler")
+
+    class FakeMarketScheduler:
+        def __init__(self, settings):
+            calls["scheduler_created"] += 1
+
+    fake_scheduler_module.MarketScheduler = FakeMarketScheduler
+    fake_strategy_module = types.ModuleType("strategy")
+
+    class FakeTradingStrategy:
+        def __init__(self, settings, broker, risk_manager, journal=None):
+            pass
+
+        def run_cycle(self):
+            calls["strategy_cycles"] += 1
+
+    fake_strategy_module.TradingStrategy = FakeTradingStrategy
+    settings = make_settings(data_dir=tmp_path, dry_run=True)
+
+    monkeypatch.setitem(sys.modules, "broker", fake_broker_module)
+    monkeypatch.setitem(sys.modules, "risk_manager", fake_risk_module)
+    monkeypatch.setitem(sys.modules, "scheduler", fake_scheduler_module)
+    monkeypatch.setitem(sys.modules, "strategy", fake_strategy_module)
+    monkeypatch.setattr(main, "load_settings", lambda: settings)
+    monkeypatch.setattr(main, "init_database", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["main.py", "--single-cycle"])
+
+    main.main()
+
+    assert calls["broker_connected"] == 1
+    assert calls["risk_manager_created"] == 1
+    assert calls["scheduler_created"] == 1
+    assert calls["strategy_cycles"] == 1
+
+
+def test_test_scanner_command_does_not_construct_risk_or_strategy(monkeypatch, tmp_path):
+    calls = {
+        "broker_connected": 0,
+        "scanner_ran": 0,
+        "risk_manager_created": 0,
+        "strategy_created": 0,
+    }
+
+    fake_broker_module = types.ModuleType("broker")
+
+    class FakeBrokerClient:
+        def __init__(self, settings):
+            self.settings = settings
+
+        def connect(self):
+            calls["broker_connected"] += 1
+
+    fake_broker_module.BrokerClient = FakeBrokerClient
+    fake_scanner_module = types.ModuleType("scanner_test")
+
+    def fake_run_scanner_test(settings, broker):
+        calls["scanner_ran"] += 1
+        assert settings.dynamic_watchlist_enabled is True
+        assert settings.max_scanner_candidates_after_filters == 100
+        assert settings.broad_market_max_symbols == 100
+        return 0
+
+    fake_scanner_module.run_scanner_test = fake_run_scanner_test
+    fake_risk_module = types.ModuleType("risk_manager")
+
+    class FakeRiskManager:
+        def __init__(self, settings):
+            calls["risk_manager_created"] += 1
+
+    fake_risk_module.RiskManager = FakeRiskManager
+    fake_strategy_module = types.ModuleType("strategy")
+
+    class FakeTradingStrategy:
+        def __init__(self, *args, **kwargs):
+            calls["strategy_created"] += 1
+
+    fake_strategy_module.TradingStrategy = FakeTradingStrategy
+
+    settings = make_settings(
+        data_dir=tmp_path,
+        dynamic_watchlist_enabled=False,
+        broad_market_max_symbols=1000,
+        max_scanner_candidates_after_filters=1000,
+    )
+
+    monkeypatch.setitem(sys.modules, "broker", fake_broker_module)
+    monkeypatch.setitem(sys.modules, "scanner_test", fake_scanner_module)
+    monkeypatch.setitem(sys.modules, "risk_manager", fake_risk_module)
+    monkeypatch.setitem(sys.modules, "strategy", fake_strategy_module)
+    monkeypatch.setattr(main, "load_settings", lambda: settings)
+    monkeypatch.setattr(main, "init_database", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["main.py", "--test-scanner", "--scanner-max-symbols", "100"])
+
+    with pytest.raises(SystemExit) as exc:
+        main.main()
+
+    assert exc.value.code == 0
+    assert calls["broker_connected"] == 1
+    assert calls["scanner_ran"] == 1
+    assert calls["risk_manager_created"] == 0
+    assert calls["strategy_created"] == 0
 
 
 def test_risk_manager_rejects_when_bot_disabled():
@@ -1463,15 +1622,27 @@ class MockDataSource:
 
 
 class MockDataBroker:
-    def __init__(self, failing_symbols=None, assets=None, raise_assets=False, daily_volumes=None, start_prices=None):
+    def __init__(
+        self,
+        failing_symbols=None,
+        assets=None,
+        raise_assets=False,
+        daily_volumes=None,
+        start_prices=None,
+        rate_limit_batches=False,
+    ):
         self.api = MockAlpacaApi(assets=assets, raise_assets=raise_assets)
         self.data_source = MockDataSource(
             failing_symbols=failing_symbols,
             daily_volumes=daily_volumes,
             start_prices=start_prices,
         )
+        self.last_price_calls = []
+        self.last_prices_batches = []
+        self.rate_limit_batches = rate_limit_batches
 
     def get_last_price(self, asset):
+        self.last_price_calls.append(asset.symbol)
         prices = {
             "AAPL": 214.33,
             "MSFT": 434.80,
@@ -1484,6 +1655,23 @@ class MockDataBroker:
             "LOWV": 85.25,
         }
         return prices.get(asset.symbol)
+
+    def get_last_prices(self, symbols):
+        self.last_prices_batches.append(list(symbols))
+        if self.rate_limit_batches:
+            raise RuntimeError("429 Client Error: Too Many Requests")
+        prices = {
+            "AAPL": 214.33,
+            "MSFT": 434.80,
+            "SPY": 550.25,
+            "TSLA": 250.25,
+            "NVDA": 180.10,
+            "AMD": 160.50,
+            "PLTR": 24.50,
+            "LOWP": 3.50,
+            "LOWV": 85.25,
+        }
+        return {symbol: prices.get(symbol) for symbol in symbols if prices.get(symbol) is not None}
 
 
 def test_dry_run_still_allows_broker_data_collection():
@@ -1775,6 +1963,97 @@ def test_broad_market_scan_applies_candidate_cap_before_indicators():
     assert snapshot.market_data["broad_capped_candidate_count"] == 2
     assert snapshot.market_data["broad_candidate_count"] == 2
     assert len(snapshot.market_data["symbols"]) == 2
+
+
+def test_broad_market_scan_uses_batched_prices_instead_of_per_symbol_latest_price():
+    fake_broker = MockDataBroker(
+        assets=[
+            types.SimpleNamespace(symbol="AAPL", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+            types.SimpleNamespace(symbol="MSFT", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+            types.SimpleNamespace(symbol="NVDA", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+        ],
+        daily_volumes={"AAPL": 900000, "MSFT": 800000, "NVDA": 700000},
+    )
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            broad_market_scan_enabled=True,
+            broad_scan_batch_size=2,
+            min_average_volume=10000,
+            watchlist_size=2,
+            allowed_symbols=["AAPL", "MSFT", "NVDA"],
+        ),
+        broker_factory=lambda config: fake_broker,
+    )
+
+    broker.connect()
+    snapshot = broker.collect_snapshot()
+
+    assert snapshot.market_data["scanner_status"] == "broad_generated"
+    assert fake_broker.last_prices_batches == [["AAPL", "MSFT"], ["NVDA"]]
+    assert fake_broker.last_price_calls == []
+    assert snapshot.market_data["broad_batch_request_count"] == 2
+
+
+def test_broad_market_scan_respects_max_batch_request_cap():
+    fake_broker = MockDataBroker(
+        assets=[
+            types.SimpleNamespace(symbol="AAPL", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+            types.SimpleNamespace(symbol="MSFT", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+            types.SimpleNamespace(symbol="NVDA", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+            types.SimpleNamespace(symbol="AMD", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+        ],
+        daily_volumes={"AAPL": 900000, "MSFT": 800000, "NVDA": 700000, "AMD": 600000},
+    )
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            broad_market_scan_enabled=True,
+            broad_scan_batch_size=1,
+            broad_scan_max_requests_per_cycle=2,
+            min_average_volume=10000,
+            watchlist_size=2,
+            allowed_symbols=["AAPL", "MSFT", "NVDA", "AMD"],
+        ),
+        broker_factory=lambda config: fake_broker,
+    )
+
+    broker.connect()
+    snapshot = broker.collect_snapshot()
+
+    assert fake_broker.last_prices_batches == [["AAPL"], ["MSFT"]]
+    assert snapshot.market_data["broad_batch_request_count"] == 2
+    assert snapshot.market_data["broad_price_filtered_count"] == 2
+    assert set(snapshot.market_data["symbols"]).issubset({"AAPL", "MSFT"})
+
+
+def test_broad_market_scan_rate_limit_falls_back_to_scanner_v1(caplog):
+    fake_broker = MockDataBroker(
+        assets=[
+            types.SimpleNamespace(symbol="AAPL", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+            types.SimpleNamespace(symbol="MSFT", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+        ],
+        rate_limit_batches=True,
+    )
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            broad_market_scan_enabled=True,
+            scanner_universe=["AAPL", "MSFT"],
+            allowed_symbols=["AAPL", "MSFT"],
+            watchlist_size=2,
+        ),
+        broker_factory=lambda config: fake_broker,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="broker"):
+        broker.connect()
+        snapshot = broker.collect_snapshot()
+
+    assert snapshot.market_data["broad_rate_limit_fallback"] is True
+    assert snapshot.market_data["scanner_status"] == "generated"
+    assert snapshot.market_data["scanner_mode"] == "configured_universe"
+    assert "rate limit fallback triggered" in caplog.text
 
 
 def test_broad_market_scan_aggregates_insufficient_data_logs(caplog):

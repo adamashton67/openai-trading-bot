@@ -291,10 +291,23 @@ class BrokerClient:
 
             stage = "applying liquidity filters"
             logger.info("Broad scanner: applying liquidity filters.")
+            logger.info("Broad scanner: batch size is %s.", self.settings.broad_scan_batch_size)
             preliminary_candidates = []
             missing_price_symbols = []
+            batch_price_result = self._fetch_broad_latest_prices(candidate_symbols)
+            market_data["broad_batch_request_count"] = batch_price_result["request_count"]
+            logger.info(
+                "Broad scanner: processed %s symbols across %s batch requests.",
+                batch_price_result["symbols_processed"],
+                batch_price_result["request_count"],
+            )
+            logger.info(
+                "Broad scanner: skipped %s symbols during batched price fetch.",
+                batch_price_result["symbols_skipped"],
+            )
+
             for symbol in candidate_symbols:
-                price = self._safe_last_price(symbol)
+                price = batch_price_result["prices"].get(symbol)
                 if price is None:
                     missing_price_symbols.append(symbol)
                     continue
@@ -339,6 +352,7 @@ class BrokerClient:
                 capped_symbols,
                 broad_universe_data,
                 warn_on_missing=False,
+                collect_prices=False,
             )
 
             liquid_symbols = []
@@ -384,6 +398,9 @@ class BrokerClient:
             return market_data
         except Exception as exc:
             setattr(exc, "broad_scanner_stage", stage)
+            if self._is_rate_limit_error(exc):
+                market_data["broad_rate_limit_fallback"] = True
+                logger.warning("Broad scanner: rate limit fallback triggered.")
             logger.warning("Broad scanner failed during %s.", stage)
             logger.warning("Exception: %s.", exc.__class__.__name__)
             logger.warning("Message: %s.", self._safe_exception_message(exc))
@@ -436,6 +453,125 @@ class BrokerClient:
                 deduped.append(normalized_symbol)
         return deduped
 
+    def _fetch_broad_latest_prices(self, symbols: list[str]) -> dict[str, Any]:
+        batch_size = max(1, self.settings.broad_scan_batch_size)
+        max_requests = max(1, self.settings.broad_scan_max_requests_per_cycle)
+        prices: dict[str, float] = {}
+        request_count = 0
+        processed_count = 0
+
+        for start in range(0, len(symbols), batch_size):
+            if request_count >= max_requests:
+                logger.info(
+                    "Broad scanner: max batch request cap reached at %s requests.",
+                    request_count,
+                )
+                break
+
+            batch = symbols[start : start + batch_size]
+            request_count += 1
+            processed_count += len(batch)
+            try:
+                batch_prices = self._get_latest_prices_batch(batch)
+            except Exception as exc:
+                if self._is_rate_limit_error(exc):
+                    logger.warning(
+                        "Broad scanner: Alpaca rate limit hit after %s batch requests.",
+                        request_count,
+                    )
+                    raise
+                logger.info(
+                    "Broad scanner: skipped one price batch safely: %s.",
+                    exc.__class__.__name__,
+                )
+                continue
+
+            prices.update(batch_prices)
+
+        return {
+            "prices": prices,
+            "request_count": request_count,
+            "symbols_processed": processed_count,
+            "symbols_skipped": max(0, processed_count - len(prices)),
+        }
+
+    def _get_latest_prices_batch(self, symbols: list[str]) -> dict[str, float]:
+        data_source = getattr(self._broker, "data_source", None)
+        for owner in (data_source, self._broker, getattr(self._broker, "api", None)):
+            if owner is None:
+                continue
+            for method_name in (
+                "get_last_prices",
+                "get_latest_prices",
+                "get_latest_quotes",
+            ):
+                if not hasattr(owner, method_name):
+                    continue
+                raw_prices = getattr(owner, method_name)(symbols)
+                parsed_prices = self._parse_batched_price_response(raw_prices)
+                if parsed_prices:
+                    return parsed_prices
+        raise AttributeError("Broker does not expose batched latest price data.")
+
+    def _parse_batched_price_response(self, response: Any) -> dict[str, float]:
+        if response is None:
+            return {}
+
+        if hasattr(response, "data"):
+            response = response.data
+
+        if isinstance(response, dict):
+            items = response.items()
+        else:
+            items = []
+
+        prices: dict[str, float] = {}
+        for symbol, value in items:
+            normalized_symbol = str(symbol).upper()
+            price = self._extract_price(value)
+            if price is not None:
+                prices[normalized_symbol] = price
+        return prices
+
+    def _extract_price(self, value: Any) -> float | None:
+        if isinstance(value, dict):
+            for field_name in (
+                "price",
+                "last_price",
+                "ask_price",
+                "bid_price",
+                "ap",
+                "bp",
+                "close",
+            ):
+                price = self._to_float(value.get(field_name))
+                if price is not None and price > 0:
+                    return price
+            return None
+
+        for field_name in (
+            "price",
+            "last_price",
+            "ask_price",
+            "bid_price",
+            "ap",
+            "bp",
+            "close",
+        ):
+            price = self._to_float(getattr(value, field_name, None))
+            if price is not None and price > 0:
+                return price
+
+        price = self._to_float(value)
+        return price if price is not None and price > 0 else None
+
+    def _is_rate_limit_error(self, exc: Exception) -> bool:
+        status_code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+        if str(status_code) == "429":
+            return True
+        message = str(exc).lower()
+        return "429" in message or "too many requests" in message or "rate limit" in message
+
     def _safe_exception_message(self, exc: Exception) -> str:
         message = str(exc).strip()
         return message if message else "<empty>"
@@ -484,25 +620,27 @@ class BrokerClient:
         symbols: list[str],
         market_data: dict[str, Any],
         warn_on_missing: bool = True,
+        collect_prices: bool = True,
     ) -> dict[str, int]:
         stats = {"missing_prices": 0, "price_failures": 0, "indicator_failures": 0}
         for symbol in symbols:
             normalized_symbol = symbol.upper()
-            try:
-                latest_price = self._get_last_price(normalized_symbol)
-                market_data["prices"][normalized_symbol] = {"last_price": latest_price}
-                if latest_price is None:
-                    stats["missing_prices"] += 1
+            if collect_prices:
+                try:
+                    latest_price = self._get_last_price(normalized_symbol)
+                    market_data["prices"][normalized_symbol] = {"last_price": latest_price}
+                    if latest_price is None:
+                        stats["missing_prices"] += 1
+                        if warn_on_missing:
+                            logger.warning("Latest price for %s is missing.", normalized_symbol)
+                except Exception as exc:
+                    stats["price_failures"] += 1
                     if warn_on_missing:
-                        logger.warning("Latest price for %s is missing.", normalized_symbol)
-            except Exception as exc:
-                stats["price_failures"] += 1
-                if warn_on_missing:
-                    logger.warning(
-                        "Could not collect latest price for %s: %s.",
-                        normalized_symbol,
-                        exc.__class__.__name__,
-                    )
+                        logger.warning(
+                            "Could not collect latest price for %s: %s.",
+                            normalized_symbol,
+                            exc.__class__.__name__,
+                        )
 
             try:
                 minute_bars = self._get_historical_bars(normalized_symbol, length=120, timestep="minute")
@@ -520,12 +658,6 @@ class BrokerClient:
                         exc.__class__.__name__,
                     )
         return stats
-
-    def _safe_last_price(self, symbol: str) -> float | None:
-        try:
-            return self._get_last_price(symbol)
-        except Exception:
-            return None
 
     def _asset_volume_for_symbol(self, assets: list[Any], symbol: str) -> float | None:
         for asset in assets:

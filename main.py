@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+from dataclasses import replace
 
 from config import load_settings, missing_required_values
 from database import init_database
@@ -36,6 +37,22 @@ def parse_args() -> argparse.Namespace:
         "--test-execution",
         action="store_true",
         help="Run a safe dry-run execution-path test and exit.",
+    )
+    parser.add_argument(
+        "--single-cycle",
+        action="store_true",
+        help="Run exactly one trading cycle and exit. Respects configured safety gates.",
+    )
+    parser.add_argument(
+        "--test-scanner",
+        action="store_true",
+        help="Run only the dynamic watchlist scanner and exit.",
+    )
+    parser.add_argument(
+        "--scanner-max-symbols",
+        type=int,
+        default=None,
+        help="Temporarily cap broad scanner candidates for fast scanner testing.",
     )
     return parser.parse_args()
 
@@ -82,6 +99,19 @@ def main() -> None:
 
         raise SystemExit(run_execution_test(settings))
 
+    if args.scanner_max_symbols is not None:
+        scanner_cap = max(1, args.scanner_max_symbols)
+        settings = replace(
+            settings,
+            broad_market_max_symbols=min(settings.broad_market_max_symbols, scanner_cap),
+            max_scanner_candidates_after_filters=min(
+                settings.max_scanner_candidates_after_filters,
+                scanner_cap,
+            ),
+        )
+    if args.test_scanner and not settings.dynamic_watchlist_enabled:
+        settings = replace(settings, dynamic_watchlist_enabled=True)
+
     if not settings.bot_enabled:
         logger.warning("BOT_ENABLED is false. Bot will monitor market hours but skip trading.")
 
@@ -90,12 +120,18 @@ def main() -> None:
         logger.warning("Missing environment values: %s", ", ".join(missing_values))
 
     from broker import BrokerClient
-    from risk_manager import RiskManager
-    from scheduler import MarketScheduler
-    from strategy import TradingStrategy
 
     broker = BrokerClient(settings)
     broker.connect()
+
+    if args.test_scanner:
+        from scanner_test import run_scanner_test
+
+        raise SystemExit(run_scanner_test(settings, broker))
+
+    from risk_manager import RiskManager
+    from scheduler import MarketScheduler
+    from strategy import TradingStrategy
 
     scheduler = MarketScheduler(settings)
     risk_manager = RiskManager(settings)
@@ -105,6 +141,12 @@ def main() -> None:
         risk_manager=risk_manager,
         journal=journal,
     )
+
+    if args.single_cycle:
+        logger.info("Running one trading cycle via --single-cycle.")
+        strategy.run_cycle()
+        logger.info("Single trading cycle complete. Exiting.")
+        return
 
     while True:
         try:

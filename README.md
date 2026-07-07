@@ -102,6 +102,8 @@ DATABASE_PATH=/data/trading_bot.db
 | `BROAD_MARKET_SCAN_ENABLED` | `false` | Uses Alpaca tradable US equity assets for a broader scanner before selecting the final watchlist. |
 | `BROAD_MARKET_MAX_SYMBOLS` | `1000` | Maximum liquid broad-scan candidates evaluated before final ranking. |
 | `MAX_SCANNER_CANDIDATES_AFTER_FILTERS` | `1000` | Maximum broad-scan candidates sent into indicator calculation after asset and price filters. |
+| `BROAD_SCAN_BATCH_SIZE` | `100` | Symbols requested per broad-scan batch market data call. |
+| `BROAD_SCAN_MAX_REQUESTS_PER_CYCLE` | `20` | Maximum broad-scan batch market data requests before falling back for the cycle. |
 | `MIN_STOCK_PRICE` | `5` | Minimum current price for broad-scan candidates. |
 | `MIN_AVERAGE_VOLUME` | `500000` | Minimum 20-day average volume for broad-scan candidates when available. |
 | `EXCLUDE_ETFS` | `true` | Excludes ETF-like assets from the broad scan where identifiable. |
@@ -175,6 +177,22 @@ python main.py --test-execution --dry-run
 ```
 
 This builds a fake approved BUY decision and fake market snapshot, then runs the broker execution path with `DRY_RUN=true`. It confirms the execution guard blocks submission and does not call Alpaca or Lumibot.
+
+To run one real trading cycle and exit:
+
+```bash
+python main.py --single-cycle
+```
+
+This initialises the normal settings, database, broker, risk manager, and strategy, runs exactly one cycle, then exits. It respects `DRY_RUN` and the existing risk/execution safety gates.
+
+To test only the watchlist scanner:
+
+```bash
+python main.py --test-scanner --scanner-max-symbols 100
+```
+
+This collects scanner data, logs the scanner counts and final selected symbols, then exits before OpenAI, risk checks, or order execution.
 
 ## Discord Daily Summaries
 
