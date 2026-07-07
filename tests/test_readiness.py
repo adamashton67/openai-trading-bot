@@ -13,6 +13,7 @@ import pytest
 import pandas as pd
 
 import config
+import context_history
 import database
 import main
 from config import Settings, load_settings
@@ -69,6 +70,10 @@ def make_settings(**overrides):
             "SHOP",
             "PLTR",
         ],
+        "decision_history_limit": 20,
+        "execution_history_limit": 20,
+        "portfolio_history_limit": 20,
+        "include_history_context": True,
         "prompts_dir": Path("prompts"),
         "data_dir": Path("data"),
         "discord_webhook_url": "",
@@ -113,6 +118,10 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
         "DYNAMIC_WATCHLIST_ENABLED",
         "WATCHLIST_SIZE",
         "SCANNER_UNIVERSE",
+        "DECISION_HISTORY_LIMIT",
+        "EXECUTION_HISTORY_LIMIT",
+        "PORTFOLIO_HISTORY_LIMIT",
+        "INCLUDE_HISTORY_CONTEXT",
     ]:
         monkeypatch.delenv(key, raising=False)
 
@@ -126,6 +135,8 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
     assert settings.dynamic_watchlist_enabled is False
     assert settings.watchlist_size == 20
     assert "AAPL" in settings.scanner_universe
+    assert settings.include_history_context is True
+    assert settings.decision_history_limit == 20
 
 
 def test_config_loading_reads_environment(monkeypatch):
@@ -138,6 +149,10 @@ def test_config_loading_reads_environment(monkeypatch):
     monkeypatch.setenv("DYNAMIC_WATCHLIST_ENABLED", "true")
     monkeypatch.setenv("WATCHLIST_SIZE", "3")
     monkeypatch.setenv("SCANNER_UNIVERSE", "spy, aapl")
+    monkeypatch.setenv("DECISION_HISTORY_LIMIT", "7")
+    monkeypatch.setenv("EXECUTION_HISTORY_LIMIT", "8")
+    monkeypatch.setenv("PORTFOLIO_HISTORY_LIMIT", "9")
+    monkeypatch.setenv("INCLUDE_HISTORY_CONTEXT", "false")
 
     settings = load_settings()
 
@@ -149,6 +164,10 @@ def test_config_loading_reads_environment(monkeypatch):
     assert settings.dynamic_watchlist_enabled is True
     assert settings.watchlist_size == 3
     assert settings.scanner_universe == ["SPY", "AAPL"]
+    assert settings.decision_history_limit == 7
+    assert settings.execution_history_limit == 8
+    assert settings.portfolio_history_limit == 9
+    assert settings.include_history_context is False
 
 
 def test_database_path_defaults_to_local_file(monkeypatch):
@@ -363,6 +382,155 @@ def test_database_watchlist_insert_succeeds(tmp_path):
     assert json.loads(row[3])["score"] == 5
 
 
+def test_history_context_loads_recent_decisions_in_descending_order(tmp_path):
+    database_path = tmp_path / "trading_bot.db"
+    database.init_database(database_path)
+    database.insert_decision(
+        decision={"symbol": "AAPL", "action": "BUY", "confidence": 0.8, "suggested_allocation_percent": 1, "reason": "Older."},
+        raw_response={"symbol": "AAPL"},
+        approved=True,
+        approval_reason="Approved.",
+        executed=False,
+        timestamp=datetime(2026, 7, 6, 10, 0),
+    )
+    database.insert_decision(
+        decision={"symbol": "MSFT", "action": "HOLD", "confidence": 0.4, "suggested_allocation_percent": 0, "reason": "Newer."},
+        raw_response={"symbol": "MSFT"},
+        approved=False,
+        approval_reason="Hold.",
+        executed=False,
+        timestamp=datetime(2026, 7, 6, 10, 15),
+    )
+
+    history = context_history.load_history_context(
+        decision_limit=20,
+        execution_limit=20,
+        portfolio_limit=20,
+        today=date(2026, 7, 6),
+    )
+
+    assert [decision["symbol"] for decision in history["recent_ai_decisions"]] == ["MSFT", "AAPL"]
+    assert history["recent_ai_decisions"][0]["approved"] is False
+    assert history["recent_ai_decisions"][1]["executed"] is False
+
+
+def test_history_context_loads_recent_executions(tmp_path):
+    database_path = tmp_path / "trading_bot.db"
+    database.init_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO executions (
+                timestamp, symbol, side, quantity, fill_price, status, broker_order_id, raw_response
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("2026-07-06T10:30:00", "AAPL", "buy", 5, 214.33, "filled", "order-1", "{}"),
+        )
+
+    history = context_history.load_history_context(
+        decision_limit=20,
+        execution_limit=20,
+        portfolio_limit=20,
+        today=date(2026, 7, 6),
+    )
+
+    assert history["recent_executions"] == [
+        {
+            "timestamp": "2026-07-06T10:30:00",
+            "symbol": "AAPL",
+            "side": "buy",
+            "quantity": 5,
+            "fill_price": 214.33,
+            "status": "filled",
+            "broker_order_id": "order-1",
+        }
+    ]
+
+
+def test_history_portfolio_summary_calculates_latest_vs_previous(tmp_path):
+    database_path = tmp_path / "trading_bot.db"
+    database.init_database(database_path)
+    database.insert_portfolio_snapshot(
+        snapshot={"account": {"cash": 25000, "buying_power": 25000, "portfolio_value": 100000}, "positions": []},
+        timestamp=datetime(2026, 7, 6, 10, 0),
+    )
+    database.insert_portfolio_snapshot(
+        snapshot={"account": {"cash": 26000, "buying_power": 26000, "portfolio_value": 101000}, "positions": [{"symbol": "AAPL"}]},
+        timestamp=datetime(2026, 7, 6, 10, 15),
+    )
+
+    history = context_history.load_history_context(
+        decision_limit=20,
+        execution_limit=20,
+        portfolio_limit=20,
+        today=date(2026, 7, 6),
+    )
+    summary = history["portfolio_performance_summary"]
+
+    assert summary["latest_portfolio_value"] == 101000
+    assert summary["previous_portfolio_value"] == 100000
+    assert summary["portfolio_change"] == 1000
+    assert summary["portfolio_change_percent"] == 1
+    assert summary["latest_cash"] == 26000
+    assert summary["latest_buying_power"] == 26000
+    assert summary["latest_positions_count"] == 1
+    assert summary["approximate_current_exposure"] == 75000
+
+
+def test_history_counts_buy_sell_hold_for_today(tmp_path):
+    database_path = tmp_path / "trading_bot.db"
+    database.init_database(database_path)
+    for action, timestamp in [
+        ("BUY", datetime(2026, 7, 6, 10, 0)),
+        ("SELL", datetime(2026, 7, 6, 10, 15)),
+        ("HOLD", datetime(2026, 7, 6, 10, 30)),
+        ("BUY", datetime(2026, 7, 5, 10, 0)),
+    ]:
+        database.insert_decision(
+            decision={"symbol": "AAPL", "action": action, "confidence": 0.8, "suggested_allocation_percent": 1, "reason": action},
+            raw_response={"action": action},
+            timestamp=timestamp,
+        )
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO executions (timestamp, symbol, side, quantity, status) VALUES (?, ?, ?, ?, ?)",
+            ("2026-07-06T11:00:00", "AAPL", "buy", 1, "filled"),
+        )
+
+    history = context_history.load_history_context(
+        decision_limit=20,
+        execution_limit=20,
+        portfolio_limit=20,
+        today=date(2026, 7, 6),
+    )
+    summary = history["portfolio_performance_summary"]
+
+    assert summary["number_of_decisions_today"] == 3
+    assert summary["buy_count_today"] == 1
+    assert summary["sell_count_today"] == 1
+    assert summary["hold_count_today"] == 1
+    assert summary["executed_trade_count_today"] == 1
+
+
+def test_history_context_failure_returns_empty(monkeypatch, tmp_path):
+    database.init_database(tmp_path / "trading_bot.db")
+
+    def failing_connect(path):
+        raise sqlite3.OperationalError("database unavailable")
+
+    monkeypatch.setattr(database, "_connect", failing_connect)
+
+    history = context_history.load_history_context(
+        decision_limit=20,
+        execution_limit=20,
+        portfolio_limit=20,
+        today=date(2026, 7, 6),
+    )
+
+    assert history == context_history.empty_history_context()
+
+
 def test_database_initialisation_failure_does_not_crash(tmp_path):
     blocked_parent = tmp_path / "not_a_directory"
     blocked_parent.write_text("blocked", encoding="utf-8")
@@ -468,6 +636,24 @@ def test_user_prompt_includes_structured_market_intelligence():
                 }
             }
         },
+        history_context={
+            "recent_ai_decisions": [
+                {
+                    "timestamp": "2026-07-06T10:00:00",
+                    "symbol": "AAPL",
+                    "action": "HOLD",
+                    "confidence": 0.3,
+                    "reason": "Unclear conditions.",
+                }
+            ],
+            "recent_executions": [],
+            "portfolio_performance_summary": {
+                "latest_portfolio_value": 100000,
+                "portfolio_change": 0,
+                "buy_count_today": 0,
+                "hold_count_today": 3,
+            },
+        },
     )
 
     rendered = client._render_user_prompt(context)
@@ -483,6 +669,9 @@ def test_user_prompt_includes_structured_market_intelligence():
     assert '"current_price": 214.33' in rendered
     assert '"5m_change_percent": null' in rendered
     assert '"RSI14": 58.4' in rendered
+    assert "Historical Context:" in rendered
+    assert '"recent_ai_decisions": [' in rendered
+    assert '"hold_count_today": 3' in rendered
 
 
 def test_user_prompt_instructs_null_indicators_are_unavailable():
@@ -494,6 +683,26 @@ def test_user_prompt_instructs_null_indicators_are_unavailable():
     assert "Consider current portfolio exposure" in template
     assert "Dynamic Watchlist" in template
     assert "Do not recommend symbols outside this final watchlist" in template
+    assert "Historical Context" in template
+    assert "Do not repeat a previous BUY solely" in template
+    assert "Use Historical Context as context only" in template
+
+
+def test_empty_history_renders_cleanly():
+    client = object.__new__(OpenAIDecisionClient)
+    client.prompts_dir = Path("prompts")
+    context = TradingContext(
+        current_datetime=datetime(2026, 7, 6, 10, 0, tzinfo=ZoneInfo("America/New_York")),
+        market_status="open",
+        watchlist_symbols=["AAPL"],
+        history_context=context_history.empty_history_context(),
+    )
+
+    rendered = client._render_user_prompt(context)
+
+    assert "Historical Context:" in rendered
+    assert '"recent_ai_decisions": []' in rendered
+    assert '"recent_executions": []' in rendered
 
 
 def test_ai_response_validation_accepts_supported_decision():
@@ -1206,6 +1415,43 @@ def test_strategy_context_includes_populated_broker_data():
     assert context.current_positions == [{"symbol": "MSFT", "quantity": 2}]
     assert context.recent_price_data["prices"]["AAPL"]["last_price"] == 214.33
     assert context.recent_price_data["market_intelligence"]["AAPL"]["RSI14"] == 55.2
+
+
+def test_strategy_history_context_can_be_disabled():
+    snapshot = BrokerSnapshot(
+        account={"cash": 25000, "buying_power": 25000, "portfolio_value": 100000},
+        positions=[],
+        market_data={},
+    )
+    strategy = TradingStrategy(
+        settings=make_settings(include_history_context=False),
+        broker=None,
+        risk_manager=RiskManager(make_settings()),
+    )
+
+    history = strategy._load_history_context(datetime(2026, 7, 6, 10, 0))
+    context = strategy._build_ai_context(snapshot)
+
+    assert history == context_history.empty_history_context()
+    assert context.history_context == {}
+
+
+def test_strategy_history_database_failure_does_not_crash_context_build(monkeypatch, tmp_path):
+    database.init_database(tmp_path / "trading_bot.db")
+
+    def failing_loader(*args, **kwargs):
+        raise sqlite3.OperationalError("database unavailable")
+
+    monkeypatch.setattr(context_history, "load_history_context", failing_loader)
+    strategy = TradingStrategy(
+        settings=make_settings(include_history_context=True),
+        broker=None,
+        risk_manager=RiskManager(make_settings()),
+    )
+
+    history = strategy._load_history_context(datetime(2026, 7, 6, 10, 0))
+
+    assert history == context_history.empty_history_context()
 
 
 def test_strategy_writes_one_market_snapshot_per_symbol_per_cycle(tmp_path):

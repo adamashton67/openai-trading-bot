@@ -54,6 +54,10 @@ class Settings:
     dynamic_watchlist_enabled: bool
     watchlist_size: int
     scanner_universe: list[str]
+    decision_history_limit: int
+    execution_history_limit: int
+    portfolio_history_limit: int
+    include_history_context: bool
     prompts_dir: Path
     data_dir: Path
     discord_webhook_url: str
@@ -95,6 +99,13 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         watchlist_size=int(os.getenv("WATCHLIST_SIZE", "20")),
         scanner_universe=_parse_symbols(
             os.getenv("SCANNER_UNIVERSE", DEFAULT_SCANNER_UNIVERSE)
+        ),
+        decision_history_limit=int(os.getenv("DECISION_HISTORY_LIMIT", "20")),
+        execution_history_limit=int(os.getenv("EXECUTION_HISTORY_LIMIT", "20")),
+        portfolio_history_limit=int(os.getenv("PORTFOLIO_HISTORY_LIMIT", "20")),
+        include_history_context=_parse_bool(
+            os.getenv("INCLUDE_HISTORY_CONTEXT"),
+            default=True,
         ),
         prompts_dir=BASE_DIR / "prompts",
         data_dir=BASE_DIR / "data",

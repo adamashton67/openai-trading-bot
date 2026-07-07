@@ -104,6 +104,10 @@ DATABASE_PATH=/data/trading_bot.db
 | `DISCORD_WEBHOOK_URL` | empty | Discord incoming webhook URL for summaries. |
 | `DISCORD_DAILY_SUMMARY_ENABLED` | `false` | Enables one daily summary after regular US market close. |
 | `DATABASE_PATH` | `trading_bot.db` | SQLite database path. Use `/data/trading_bot.db` on Railway with a mounted volume. |
+| `DECISION_HISTORY_LIMIT` | `20` | Recent AI decisions included in OpenAI historical context. |
+| `EXECUTION_HISTORY_LIMIT` | `20` | Recent executions included in OpenAI historical context. |
+| `PORTFOLIO_HISTORY_LIMIT` | `20` | Recent portfolio snapshots used for performance context. |
+| `INCLUDE_HISTORY_CONTEXT` | `true` | Enables SQLite-backed decision and portfolio history in prompts. |
 
 ## Trading Flow
 
@@ -141,6 +145,8 @@ Real Alpaca paper order submission is isolated in `broker.py` and remains blocke
 `database.py` uses Python's built-in SQLite support to persist finalized AI decisions. Local development defaults to `trading_bot.db` in the project folder. Railway should use `DATABASE_PATH=/data/trading_bot.db` so records survive deploys and restarts.
 
 The database initializes automatically on startup and creates these tables for current and future analytics: `decisions`, `executions`, `portfolio_snapshots`, `market_snapshots`, and `watchlists`. If SQLite is unavailable, the bot logs the failure class and continues without database writes.
+
+When `INCLUDE_HISTORY_CONTEXT=true`, recent decisions, executions, and portfolio snapshots are loaded from SQLite and sent to OpenAI as context. This history is advisory only; Python validation, risk management, and execution gates remain authoritative.
 
 ## Dynamic Watchlist
 

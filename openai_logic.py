@@ -55,6 +55,7 @@ class TradingContext(BaseModel):
     recent_price_data: dict[str, Any] = Field(default_factory=dict)
     risk_rules: dict[str, Any] = Field(default_factory=dict)
     previous_trade_summary: str | None = None
+    history_context: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("watchlist_symbols")
     @classmethod
@@ -196,6 +197,7 @@ class OpenAIDecisionClient:
             ),
             "dynamic_watchlist": self._format_dynamic_watchlist(context_dict),
             "market_intelligence": self._format_market_intelligence(context_dict),
+            "historical_context": self._format_history_context(context_dict),
             "risk_rules": json.dumps(context_dict["risk_rules"], indent=2),
             "previous_trades": context.previous_trade_summary or "None",
             "context": context_json,
@@ -260,6 +262,22 @@ class OpenAIDecisionClient:
             lines.append(json.dumps(payload, indent=2, sort_keys=True))
 
         return "\n\n".join(lines) if lines else "Dynamic watchlist unavailable."
+
+    def _format_history_context(self, context_dict: dict[str, Any]) -> str:
+        """Render recent stored history for the prompt."""
+        history_context = context_dict.get("history_context") or {}
+        if not history_context:
+            return "Historical context disabled or unavailable."
+
+        payload = {
+            "recent_ai_decisions": history_context.get("recent_ai_decisions", []),
+            "recent_executions": history_context.get("recent_executions", []),
+            "portfolio_performance_summary": history_context.get(
+                "portfolio_performance_summary",
+                {},
+            ),
+        }
+        return json.dumps(payload, indent=2, sort_keys=True)
 
     def _market_intelligence_by_symbol(self, market_intelligence: Any) -> dict[str, dict[str, Any]]:
         """Index market intelligence by uppercase symbol."""

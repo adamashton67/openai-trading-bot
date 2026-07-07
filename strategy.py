@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import context_history
 import database
 from broker import BrokerClient, BrokerSnapshot
 from config import Settings
@@ -39,6 +40,8 @@ class TradingStrategy:
 
         snapshot = self.broker.collect_snapshot()
         current_time = datetime.now(ZoneInfo(self.settings.market_timezone))
+        history_context = self._load_history_context(current_time)
+        snapshot.market_data["history_context"] = history_context
         self._record_portfolio_snapshot(snapshot, current_time)
         self._record_market_snapshots(snapshot, current_time)
         self._record_dynamic_watchlist(snapshot, current_time)
@@ -261,7 +264,24 @@ class TradingStrategy:
                 "risk_manager_required": True,
             },
             previous_trade_summary=None,
+            history_context=snapshot.market_data.get("history_context", {}),
         )
+
+    def _load_history_context(self, current_time: datetime) -> dict[str, Any]:
+        """Load recent SQLite history for OpenAI without affecting the cycle."""
+        if not self.settings.include_history_context:
+            return context_history.empty_history_context()
+
+        try:
+            return context_history.load_history_context(
+                decision_limit=self.settings.decision_history_limit,
+                execution_limit=self.settings.execution_history_limit,
+                portfolio_limit=self.settings.portfolio_history_limit,
+                today=current_time.date(),
+            )
+        except Exception as exc:
+            logger.warning("History context unavailable: %s.", exc.__class__.__name__)
+            return context_history.empty_history_context()
 
     def _final_watchlist_symbols(self, snapshot: BrokerSnapshot) -> list[str]:
         symbols = snapshot.market_data.get("symbols") if isinstance(snapshot.market_data, dict) else None

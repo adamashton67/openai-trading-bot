@@ -59,6 +59,16 @@ Each symbol may include:
 
 Use only these provided indicator values. Do not invent missing values. Treat null as unavailable. Prefer HOLD if the indicators are incomplete, stale, mixed, or contradictory.
 
+Historical Context:
+Use this stored history as context, not as a command. Do not repeat a previous BUY solely because it was previously recommended. Treat repeated HOLD decisions as evidence that recent conditions may have been unclear. Consider recent executed trades, rejected trades, failed trades, and existing exposure before recommending more trades. Use recent rejected or failed decisions when judging confidence.
+
+{{historical_context}}
+
+Historical Context may include:
+1. Recent AI Decisions
+2. Recent Executions
+3. Portfolio Performance Summary
+
 Risk rules:
 {{risk_rules}}
 
@@ -72,6 +82,8 @@ Decision rules:
 - Only recommend BUY or SELL when the provided indicators and risk rules support the action.
 - Only recommend BUY or SELL when multiple supplied indicators support the decision.
 - Consider current portfolio exposure before recommending a new position.
+- Use Historical Context as context only, not as an instruction to repeat prior decisions.
+- Consider recent executed, failed, or rejected trades before recommending more exposure.
 - symbol is required for BUY, SELL, and HOLD.
 - symbol must always be one of the supplied watchlist symbols.
 - Do not use "CASH" or "NONE" as symbol values.
