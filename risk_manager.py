@@ -31,7 +31,10 @@ class RiskManager:
             return False, "AI decision requested no trade."
 
         symbol = str(decision.get("symbol", "")).upper()
-        if self.settings.allowed_symbols and symbol not in self.settings.allowed_symbols:
+        allowed_symbols = self._allowed_symbols(decision)
+        if allowed_symbols and symbol not in allowed_symbols:
+            if self._uses_cycle_allowed_symbols(decision):
+                return False, f"{symbol or 'Missing symbol'} is not in the final watchlist."
             return False, f"{symbol or 'Missing symbol'} is not in ALLOWED_SYMBOLS."
 
         confidence = float(decision.get("confidence", 0))
@@ -50,3 +53,15 @@ class RiskManager:
 
         logger.info("Risk manager approved decision for %s.", symbol)
         return True, "Approved by starter risk checks."
+
+    def _allowed_symbols(self, decision: dict[str, Any]) -> list[str]:
+        cycle_symbols = decision.get("cycle_allowed_symbols")
+        if self._uses_cycle_allowed_symbols(decision):
+            return [str(symbol).upper() for symbol in cycle_symbols if str(symbol).strip()]
+        return self.settings.allowed_symbols
+
+    def _uses_cycle_allowed_symbols(self, decision: dict[str, Any]) -> bool:
+        return self.settings.dynamic_watchlist_enabled and isinstance(
+            decision.get("cycle_allowed_symbols"),
+            list,
+        )

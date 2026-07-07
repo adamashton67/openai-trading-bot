@@ -62,8 +62,9 @@ class TradingStrategy:
                 timestamp=current_time,
             )
 
-        approved, reason = self.risk_manager.validate(decision)
-        final_watchlist_reason = self._final_watchlist_rejection(decision, snapshot)
+        decision_for_cycle = self._decision_with_cycle_universe(decision, snapshot)
+        approved, reason = self.risk_manager.validate(decision_for_cycle)
+        final_watchlist_reason = self._final_watchlist_rejection(decision_for_cycle, snapshot)
         if final_watchlist_reason:
             approved, reason = False, final_watchlist_reason
 
@@ -85,7 +86,7 @@ class TradingStrategy:
             )
             return
 
-        result = self.broker.execute_order(decision)
+        result = self.broker.execute_order(decision_for_cycle)
         logger.info("Execution result: %s", result)
         if self.journal is not None:
             self.journal.record_trade_result(
@@ -299,6 +300,12 @@ class TradingStrategy:
         if final_watchlist and symbol not in final_watchlist:
             return f"{symbol or 'Missing symbol'} is not in the final watchlist."
         return None
+
+    def _decision_with_cycle_universe(self, decision: dict[str, Any], snapshot: BrokerSnapshot) -> dict[str, Any]:
+        enriched_decision = dict(decision)
+        if self.settings.dynamic_watchlist_enabled:
+            enriched_decision["cycle_allowed_symbols"] = self._final_watchlist_symbols(snapshot)
+        return enriched_decision
 
     def _fallback_hold_symbol(self) -> str:
         """Return a watchlist-backed symbol for HOLD fallbacks."""

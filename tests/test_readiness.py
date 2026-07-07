@@ -1027,6 +1027,67 @@ def test_risk_manager_rejects_unsupported_symbols():
     assert "ALLOWED_SYMBOLS" in reason
 
 
+def test_static_mode_rejects_symbols_outside_allowed_symbols():
+    manager = RiskManager(make_settings(dynamic_watchlist_enabled=False, allowed_symbols=["AAPL"]))
+
+    approved, reason = manager.validate(
+        {
+            "symbol": "PLTR",
+            "action": "BUY",
+            "confidence": 0.9,
+            "suggested_allocation_percent": 1,
+            "cycle_allowed_symbols": ["PLTR"],
+        }
+    )
+
+    assert approved is False
+    assert "ALLOWED_SYMBOLS" in reason
+
+
+def test_dynamic_mode_allows_symbols_in_final_watchlist():
+    manager = RiskManager(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            allowed_symbols=["AAPL"],
+        )
+    )
+
+    approved, reason = manager.validate(
+        {
+            "symbol": "PLTR",
+            "action": "BUY",
+            "confidence": 0.9,
+            "suggested_allocation_percent": 1,
+            "cycle_allowed_symbols": ["PLTR", "AAPL"],
+        }
+    )
+
+    assert approved is True
+    assert "Approved" in reason
+
+
+def test_dynamic_mode_rejects_symbols_outside_final_watchlist():
+    manager = RiskManager(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            allowed_symbols=["AAPL", "PLTR"],
+        )
+    )
+
+    approved, reason = manager.validate(
+        {
+            "symbol": "MSFT",
+            "action": "BUY",
+            "confidence": 0.9,
+            "suggested_allocation_percent": 1,
+            "cycle_allowed_symbols": ["PLTR"],
+        }
+    )
+
+    assert approved is False
+    assert "final watchlist" in reason
+
+
 def test_risk_manager_rejects_allocation_above_max_limit():
     manager = RiskManager(make_settings(max_position_allocation_percent=5))
 
@@ -1053,7 +1114,7 @@ def broker_with_snapshot(settings, price=100, fake_broker=None, execution_strate
     broker._last_snapshot = BrokerSnapshot(
         account={"portfolio_value": 100000, "cash": 25000, "buying_power": 25000},
         positions=[],
-        market_data={"prices": {"AAPL": {"last_price": price}, "MSFT": {"last_price": price}}},
+        market_data={"prices": {"AAPL": {"last_price": price}, "MSFT": {"last_price": price}, "PLTR": {"last_price": price}}},
     )
     return broker
 
@@ -1232,11 +1293,31 @@ def test_broad_asset_filter_excludes_inactive_untradable_otc_and_etf():
         types.SimpleNamespace(symbol="HALT", status="inactive", tradable=True, asset_class="us_equity", exchange="NYSE"),
         types.SimpleNamespace(symbol="LOCK", status="active", tradable=False, asset_class="us_equity", exchange="NYSE"),
         types.SimpleNamespace(symbol="OTC1", status="active", tradable=True, asset_class="us_equity", exchange="OTC"),
-        types.SimpleNamespace(symbol="ETF1", status="active", tradable=True, asset_class="us_equity", exchange="ARCA", name="Example ETF"),
+        types.SimpleNamespace(symbol="ETF1", status="active", tradable=True, asset_class="us_equity", exchange="ARCA", asset_type="etf"),
     ]
 
     assert is_broad_scan_asset_candidate(good_asset) is True
     assert all(not is_broad_scan_asset_candidate(asset) for asset in bad_assets)
+
+
+def test_broad_asset_filter_keeps_realistic_alpaca_field_shapes():
+    enum_like_asset = types.SimpleNamespace(
+        symbol="PLTR",
+        status=types.SimpleNamespace(value="active"),
+        tradable=True,
+        asset_class=types.SimpleNamespace(value="us_equity"),
+        exchange=types.SimpleNamespace(value="NASDAQ"),
+    )
+    dotted_enum_asset = types.SimpleNamespace(
+        symbol="NVDA",
+        status="AssetStatus.ACTIVE",
+        tradable=True,
+        asset_class="AssetClass.US_EQUITY",
+        exchange="AssetExchange.NASDAQ",
+    )
+
+    assert is_broad_scan_asset_candidate(enum_like_asset) is True
+    assert is_broad_scan_asset_candidate(dotted_enum_asset) is True
 
 
 class MockLumibotBroker:
@@ -1358,6 +1439,7 @@ class MockDataBroker:
             "TSLA": 250.25,
             "NVDA": 180.10,
             "AMD": 160.50,
+            "PLTR": 24.50,
             "LOWP": 3.50,
             "LOWV": 85.25,
         }
@@ -1581,6 +1663,44 @@ def test_broad_market_scan_filters_assets_price_and_volume():
     assert snapshot.market_data["scanner_status"] == "broad_generated"
     assert snapshot.market_data["symbols"] == ["AAPL"]
     assert snapshot.market_data["broad_candidate_count"] == 1
+
+
+def test_broad_market_scan_keeps_realistic_active_tradable_equities():
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            broad_market_scan_enabled=True,
+            min_average_volume=10000,
+            watchlist_size=2,
+            allowed_symbols=["PLTR", "NVDA"],
+        ),
+        broker_factory=lambda config: MockDataBroker(
+            assets=[
+                types.SimpleNamespace(
+                    symbol="PLTR",
+                    status=types.SimpleNamespace(value="active"),
+                    tradable=True,
+                    asset_class=types.SimpleNamespace(value="us_equity"),
+                    exchange=types.SimpleNamespace(value="NASDAQ"),
+                ),
+                types.SimpleNamespace(
+                    symbol="NVDA",
+                    status="AssetStatus.ACTIVE",
+                    tradable=True,
+                    asset_class="AssetClass.US_EQUITY",
+                    exchange="AssetExchange.NASDAQ",
+                ),
+            ],
+            daily_volumes={"PLTR": 900000, "NVDA": 800000},
+        ),
+    )
+
+    broker.connect()
+    snapshot = broker.collect_snapshot()
+
+    assert snapshot.market_data["scanner_status"] == "broad_generated"
+    assert set(snapshot.market_data["symbols"]) == {"PLTR", "NVDA"}
+    assert snapshot.market_data["broad_candidate_count"] == 2
 
 
 def test_broad_market_scan_failure_falls_back_to_scanner_v1():
@@ -2105,6 +2225,68 @@ def test_strategy_rejects_buy_outside_final_watchlist_before_execution(tmp_path)
     assert broker.execute_called is False
 
 
+def test_strategy_allows_dynamic_symbol_in_final_watchlist(tmp_path):
+    database.init_database(tmp_path / "trading_bot.db")
+
+    class StubBroker:
+        def __init__(self):
+            self.executed_decision = None
+
+        def collect_snapshot(self):
+            return BrokerSnapshot(
+                account={"cash": 100000, "buying_power": 100000, "portfolio_value": 100000},
+                positions=[],
+                market_data={
+                    "symbols": ["PLTR"],
+                    "dynamic_watchlist": [{"symbol": "PLTR", "score": 8, "reasons_added": ["high relative volume"]}],
+                    "market_intelligence": {
+                        "PLTR": {
+                            "current_price": 24.5,
+                            "volume": 1000,
+                            "RSI14": 55,
+                            "EMA20": 24,
+                            "EMA50": 23,
+                            "VWAP": 24.2,
+                        }
+                    },
+                },
+            )
+
+        def execute_order(self, approved_decision):
+            self.executed_decision = approved_decision
+            return {"executed": False, "reason": "test execution skipped"}
+
+    broker = StubBroker()
+    settings = make_settings(
+        dry_run=False,
+        allowed_symbols=["AAPL", "MSFT"],
+        dynamic_watchlist_enabled=True,
+    )
+    strategy = TradingStrategy(
+        settings=settings,
+        broker=broker,
+        risk_manager=RiskManager(settings),
+    )
+    strategy.ai_client = types.SimpleNamespace(
+        last_raw_response='{"symbol":"PLTR","action":"BUY"}',
+        get_decision=lambda context: types.SimpleNamespace(
+            to_risk_manager_dict=lambda: {
+                "symbol": "PLTR",
+                "action": "BUY",
+                "confidence": 0.95,
+                "suggested_allocation_percent": 1,
+                "reason": "In final generated watchlist.",
+            }
+        ),
+    )
+
+    strategy.run_cycle()
+
+    assert broker.executed_decision is not None
+    assert broker.executed_decision["symbol"] == "PLTR"
+    assert broker.executed_decision["cycle_allowed_symbols"] == ["PLTR"]
+
+
 def test_no_scanner_candidates_returns_hold_without_openai_call():
     snapshot = BrokerSnapshot(
         account={"cash": 100000, "buying_power": 100000, "portfolio_value": 100000},
@@ -2195,6 +2377,51 @@ def test_broker_unsupported_symbol_does_not_call_lumibot():
 
     assert result["executed"] is False
     assert "ALLOWED_SYMBOLS" in result["reason"]
+    assert fake_broker.submitted_orders == []
+
+
+def test_broker_dynamic_mode_allows_symbol_in_final_watchlist():
+    fake_broker = MockLumibotBroker()
+    broker = broker_with_snapshot(
+        make_settings(
+            allowed_symbols=["AAPL"],
+            dynamic_watchlist_enabled=True,
+        ),
+        fake_broker=fake_broker,
+    )
+
+    result = broker.execute_order(
+        approved_decision(
+            symbol="PLTR",
+            suggested_allocation_percent=1,
+            cycle_allowed_symbols=["PLTR"],
+        )
+    )
+
+    assert result["executed"] is True
+    assert fake_broker.submitted_orders
+
+
+def test_broker_dynamic_mode_rejects_symbol_outside_final_watchlist():
+    fake_broker = MockLumibotBroker()
+    broker = broker_with_snapshot(
+        make_settings(
+            allowed_symbols=["AAPL", "PLTR"],
+            dynamic_watchlist_enabled=True,
+        ),
+        fake_broker=fake_broker,
+    )
+
+    result = broker.execute_order(
+        approved_decision(
+            symbol="PLTR",
+            suggested_allocation_percent=1,
+            cycle_allowed_symbols=["AAPL"],
+        )
+    )
+
+    assert result["executed"] is False
+    assert "final watchlist" in result["reason"]
     assert fake_broker.submitted_orders == []
 
 

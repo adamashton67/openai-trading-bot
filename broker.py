@@ -268,6 +268,7 @@ class BrokerClient:
             logger.info("Broad scanner: fetching tradable assets.")
             assets = self._get_broad_market_assets()
             logger.info("Broad scanner: fetched %s assets.", len(assets))
+            logger.info("Broad scanner: sample assets: %s.", self._safe_asset_samples(assets))
 
             stage = "applying asset filters"
             logger.info("Broad scanner: filtering tradable US equities.")
@@ -278,6 +279,8 @@ class BrokerClient:
             ]
             candidate_symbols = self._dedupe_symbols(candidate_symbols)
             logger.info("Broad scanner: %s symbols remain after asset filters.", len(candidate_symbols))
+            if not candidate_symbols:
+                logger.warning("Broad scanner: no symbols remained after asset filters. Sample assets: %s.", self._safe_asset_samples(assets))
 
             stage = "beginning market data collection"
             logger.info("Broad scanner: collecting market data.")
@@ -384,6 +387,35 @@ class BrokerClient:
     def _safe_exception_message(self, exc: Exception) -> str:
         message = str(exc).strip()
         return message if message else "<empty>"
+
+    def _safe_asset_samples(self, assets: list[Any], limit: int = 3) -> list[dict[str, Any]]:
+        samples = []
+        for asset in assets[:limit]:
+            samples.append(
+                {
+                    "symbol": str(getattr(asset, "symbol", "") or ""),
+                    "status": self._safe_asset_field(getattr(asset, "status", None)),
+                    "tradable": getattr(asset, "tradable", None),
+                    "asset_class": self._safe_asset_field(getattr(asset, "asset_class", None)),
+                    "exchange": self._safe_asset_field(getattr(asset, "exchange", None)),
+                    "asset_type": self._safe_asset_field(getattr(asset, "asset_type", None)),
+                    "attributes": self._safe_asset_field(getattr(asset, "attributes", None)),
+                }
+            )
+        return samples
+
+    def _safe_asset_field(self, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple, set)):
+            return [self._safe_asset_field(item) for item in value]
+        enum_value = getattr(value, "value", None)
+        if enum_value not in (None, ""):
+            return str(enum_value)
+        enum_name = getattr(value, "name", None)
+        if enum_name not in (None, ""):
+            return str(enum_name)
+        return str(value)
 
     def _analysis_symbols(self) -> list[str]:
         return self.settings.allowed_symbols
@@ -598,7 +630,10 @@ class BrokerClient:
             return f"Unsupported action {action or 'UNKNOWN'}."
 
         symbol = str(decision.get("symbol", "")).upper()
-        if self.settings.allowed_symbols and symbol not in self.settings.allowed_symbols:
+        allowed_symbols = self._allowed_symbols_for_decision(decision)
+        if allowed_symbols and symbol not in allowed_symbols:
+            if self._uses_cycle_allowed_symbols(decision):
+                return f"{symbol or 'Missing symbol'} is not in the final watchlist."
             return f"{symbol or 'Missing symbol'} is not in ALLOWED_SYMBOLS."
 
         allocation = self._to_float(decision.get("suggested_allocation_percent"))
@@ -622,6 +657,18 @@ class BrokerClient:
 
         notional = portfolio_value * (allocation / 100)
         return int(notional // latest_price)
+
+    def _allowed_symbols_for_decision(self, decision: dict[str, Any]) -> list[str]:
+        cycle_symbols = decision.get("cycle_allowed_symbols")
+        if self._uses_cycle_allowed_symbols(decision):
+            return [str(symbol).upper() for symbol in cycle_symbols if str(symbol).strip()]
+        return self.settings.allowed_symbols
+
+    def _uses_cycle_allowed_symbols(self, decision: dict[str, Any]) -> bool:
+        return self.settings.dynamic_watchlist_enabled and isinstance(
+            decision.get("cycle_allowed_symbols"),
+            list,
+        )
 
     def _position_guard_failure(self, decision: dict[str, Any], latest_price: float) -> str | None:
         action = str(decision.get("action", "")).upper()

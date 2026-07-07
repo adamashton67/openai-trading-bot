@@ -154,7 +154,7 @@ def is_broad_scan_asset_candidate(asset: Any, exclude_etfs: bool = True) -> bool
     if not symbol:
         return False
 
-    status = str(getattr(asset, "status", "") or "").lower()
+    status = _normalized_asset_field(getattr(asset, "status", ""))
     if status and status != "active":
         return False
 
@@ -162,15 +162,21 @@ def is_broad_scan_asset_candidate(asset: Any, exclude_etfs: bool = True) -> bool
     if tradable is False:
         return False
 
-    asset_class = str(
+    asset_class = _normalized_asset_field(
         getattr(asset, "asset_class", None)
         or getattr(asset, "class", None)
         or ""
-    ).lower()
-    if asset_class and asset_class not in {"us_equity", "stock", "equity"}:
+    )
+    if asset_class and asset_class not in {
+        "us_equity",
+        "usequity",
+        "us equity",
+        "stock",
+        "equity",
+    }:
         return False
 
-    exchange = str(getattr(asset, "exchange", "") or "").upper()
+    exchange = _normalized_asset_field(getattr(asset, "exchange", "")).upper()
     if exchange == "OTC":
         return False
 
@@ -201,11 +207,29 @@ def _looks_like_etf(asset: Any) -> bool:
     metadata_values = [
         getattr(asset, "asset_type", None),
         getattr(asset, "type", None),
-        getattr(asset, "name", None),
     ]
     attributes = getattr(asset, "attributes", None)
     if isinstance(attributes, (list, tuple, set)):
         metadata_values.extend(attributes)
 
-    joined = " ".join(str(value).lower() for value in metadata_values if value)
-    return "etf" in joined or "exchange traded fund" in joined
+    normalized_values = {_normalized_asset_field(value) for value in metadata_values if value}
+    return "etf" in normalized_values or "exchange_traded_fund" in normalized_values
+
+
+def _normalized_asset_field(value: Any) -> str:
+    """Normalize Alpaca enum/string fields without assuming one SDK shape."""
+    if value in (None, ""):
+        return ""
+
+    enum_value = getattr(value, "value", None)
+    if enum_value not in (None, ""):
+        value = enum_value
+    else:
+        enum_name = getattr(value, "name", None)
+        if enum_name not in (None, ""):
+            value = enum_name
+
+    normalized = str(value).strip().lower()
+    if "." in normalized:
+        normalized = normalized.rsplit(".", 1)[-1]
+    return normalized.replace("-", "_").replace(" ", "_")
