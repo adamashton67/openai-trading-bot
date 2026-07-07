@@ -25,6 +25,7 @@ from risk_manager import RiskManager
 from scheduler import MarketScheduler
 from storage import TradingJournal
 from strategy import TradingStrategy
+from watchlist_scanner import DynamicWatchlistScanner
 
 
 def make_settings(**overrides):
@@ -42,6 +43,30 @@ def make_settings(**overrides):
         "max_position_allocation_percent": 5,
         "min_confidence": 0.7,
         "allowed_symbols": ["AAPL", "MSFT"],
+        "dynamic_watchlist_enabled": False,
+        "watchlist_size": 20,
+        "scanner_universe": [
+            "SPY",
+            "QQQ",
+            "AAPL",
+            "MSFT",
+            "NVDA",
+            "AMZN",
+            "GOOGL",
+            "META",
+            "TSLA",
+            "AMD",
+            "NFLX",
+            "AVGO",
+            "INTC",
+            "ORCL",
+            "CRM",
+            "ADBE",
+            "PYPL",
+            "UBER",
+            "SHOP",
+            "PLTR",
+        ],
         "prompts_dir": Path("prompts"),
         "data_dir": Path("data"),
         "discord_webhook_url": "",
@@ -63,6 +88,9 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
         "ALPACA_SECRET_KEY",
         "DISCORD_WEBHOOK_URL",
         "DISCORD_DAILY_SUMMARY_ENABLED",
+        "DYNAMIC_WATCHLIST_ENABLED",
+        "WATCHLIST_SIZE",
+        "SCANNER_UNIVERSE",
     ]:
         monkeypatch.delenv(key, raising=False)
 
@@ -73,6 +101,9 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
     assert settings.dry_run is True
     assert settings.discord_daily_summary_enabled is False
     assert settings.openai_model == "gpt-5-mini"
+    assert settings.dynamic_watchlist_enabled is False
+    assert settings.watchlist_size == 20
+    assert "AAPL" in settings.scanner_universe
 
 
 def test_config_loading_reads_environment(monkeypatch):
@@ -82,6 +113,9 @@ def test_config_loading_reads_environment(monkeypatch):
     monkeypatch.setenv("DRY_RUN", "false")
     monkeypatch.setenv("DISCORD_DAILY_SUMMARY_ENABLED", "true")
     monkeypatch.setenv("ALLOWED_SYMBOLS", "aapl, msft")
+    monkeypatch.setenv("DYNAMIC_WATCHLIST_ENABLED", "true")
+    monkeypatch.setenv("WATCHLIST_SIZE", "3")
+    monkeypatch.setenv("SCANNER_UNIVERSE", "spy, aapl")
 
     settings = load_settings()
 
@@ -90,6 +124,9 @@ def test_config_loading_reads_environment(monkeypatch):
     assert settings.dry_run is False
     assert settings.discord_daily_summary_enabled is True
     assert settings.allowed_symbols == ["AAPL", "MSFT"]
+    assert settings.dynamic_watchlist_enabled is True
+    assert settings.watchlist_size == 3
+    assert settings.scanner_universe == ["SPY", "AAPL"]
 
 
 def test_database_path_defaults_to_local_file(monkeypatch):
@@ -282,6 +319,28 @@ def test_database_portfolio_snapshot_missing_fields_are_null(tmp_path):
     assert json.loads(row[5])["account"]["cash"] is None
 
 
+def test_database_watchlist_insert_succeeds(tmp_path):
+    database_path = tmp_path / "trading_bot.db"
+    database.init_database(database_path)
+
+    watchlist_id = database.insert_watchlist_symbol(
+        trading_date="2026-07-06",
+        symbol="aapl",
+        reason_added="top volume, high relative volume",
+        raw_metadata={"symbol": "AAPL", "score": 5, "reasons_added": ["top volume"]},
+    )
+
+    assert watchlist_id == 1
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT date, symbol, reason_added, raw_metadata FROM watchlists WHERE id = ?",
+            (watchlist_id,),
+        ).fetchone()
+
+    assert row[:3] == ("2026-07-06", "AAPL", "top volume, high relative volume")
+    assert json.loads(row[3])["score"] == 5
+
+
 def test_database_initialisation_failure_does_not_crash(tmp_path):
     blocked_parent = tmp_path / "not_a_directory"
     blocked_parent.write_text("blocked", encoding="utf-8")
@@ -356,6 +415,18 @@ def test_user_prompt_includes_structured_market_intelligence():
         current_positions=[{"symbol": "AAPL", "quantity": 3}],
         watchlist_symbols=["AAPL", "MSFT"],
         recent_price_data={
+            "dynamic_watchlist": [
+                {
+                    "symbol": "AAPL",
+                    "score": 7,
+                    "reasons_added": ["top gainer", "high relative volume"],
+                    "current_price": 214.33,
+                    "day_change_percent": 1.4,
+                    "volume": 123456,
+                    "relative_volume": 1.23,
+                    "volatility_metric": 2.2,
+                }
+            ],
             "market_intelligence": {
                 "AAPL": {
                     "current_price": 214.33,
@@ -380,8 +451,11 @@ def test_user_prompt_includes_structured_market_intelligence():
     rendered = client._render_user_prompt(context)
 
     assert "Market Intelligence:" in rendered
+    assert "Dynamic Watchlist:" in rendered
     assert "AAPL:" in rendered
     assert "MSFT:" in rendered
+    assert '"score": 7' in rendered
+    assert "high relative volume" in rendered
     assert '"current_position": {' in rendered
     assert '"quantity": 3' in rendered
     assert '"current_price": 214.33' in rendered
@@ -396,6 +470,8 @@ def test_user_prompt_instructs_null_indicators_are_unavailable():
     assert "Use only these provided indicator values" in template
     assert "multiple supplied indicators support the decision" in template
     assert "Consider current portfolio exposure" in template
+    assert "Dynamic Watchlist" in template
+    assert "Do not recommend symbols outside this final watchlist" in template
 
 
 def test_ai_response_validation_accepts_supported_decision():
@@ -798,6 +874,69 @@ def test_missing_bars_do_not_crash_indicator_calculation():
     assert indicators["RSI14"] is None
 
 
+def test_dynamic_scanner_creates_ranked_watchlist():
+    scanner = DynamicWatchlistScanner(watchlist_size=3)
+    ranked = scanner.rank(
+        ["AAPL", "MSFT", "TSLA"],
+        {
+            "AAPL": {
+                "current_price": 200,
+                "day_change_percent": 2.1,
+                "volume": 5000000,
+                "relative_volume": 2.0,
+                "1h_change_percent": 2.4,
+            },
+            "MSFT": {
+                "current_price": 400,
+                "day_change_percent": -1.5,
+                "volume": 3000000,
+                "relative_volume": 1.1,
+                "1h_change_percent": 0.5,
+            },
+            "TSLA": {
+                "current_price": 250,
+                "day_change_percent": 0.2,
+                "volume": 1000000,
+                "relative_volume": 1.0,
+                "1h_change_percent": 0.2,
+            },
+        },
+    )
+
+    assert [candidate.symbol for candidate in ranked] == ["AAPL", "MSFT", "TSLA"]
+    assert ranked[0].score == 9
+    assert "high relative volume" in ranked[0].reasons_added
+    assert "high volatility" in ranked[0].reasons_added
+
+
+def test_dynamic_scanner_merges_duplicate_symbols():
+    scanner = DynamicWatchlistScanner(watchlist_size=10)
+    ranked = scanner.rank(
+        ["aapl", "AAPL", "msft"],
+        {
+            "AAPL": {"volume": 1000, "day_change_percent": 1.2, "relative_volume": 1.6},
+            "MSFT": {"volume": 900, "day_change_percent": 0.1, "relative_volume": 1.0},
+        },
+    )
+
+    assert [candidate.symbol for candidate in ranked].count("AAPL") == 1
+    assert [candidate.symbol for candidate in ranked] == ["AAPL", "MSFT"]
+
+
+def test_dynamic_scanner_caps_final_watchlist_size():
+    scanner = DynamicWatchlistScanner(watchlist_size=2)
+    ranked = scanner.rank(
+        ["AAPL", "MSFT", "NVDA"],
+        {
+            "AAPL": {"volume": 1000, "day_change_percent": 1.1, "relative_volume": 1.6},
+            "MSFT": {"volume": 900, "day_change_percent": 1.1, "relative_volume": 1.6},
+            "NVDA": {"volume": 800, "day_change_percent": 1.1, "relative_volume": 1.6},
+        },
+    )
+
+    assert len(ranked) == 2
+
+
 class MockLumibotBroker:
     def __init__(self, should_raise=False):
         self.submitted_orders = []
@@ -842,9 +981,21 @@ class MockDataSource:
     ):
         if asset.symbol in self.failing_symbols:
             raise RuntimeError("bar data unavailable")
+        base_volume = {
+            "AAPL": 3000,
+            "MSFT": 2000,
+            "SPY": 1500,
+            "TSLA": 2500,
+        }.get(asset.symbol, 1000)
+        start_price = {
+            "AAPL": 100,
+            "MSFT": 120,
+            "SPY": 90,
+            "TSLA": 80,
+        }.get(asset.symbol, 70)
         if timestep == "minute":
-            return types.SimpleNamespace(df=make_mock_bars(length=length, start_price=100, volume=1000))
-        return types.SimpleNamespace(df=make_mock_bars(length=length, start_price=90, volume=10000))
+            return types.SimpleNamespace(df=make_mock_bars(length=length, start_price=start_price, volume=base_volume))
+        return types.SimpleNamespace(df=make_mock_bars(length=length, start_price=start_price, volume=base_volume * 10))
 
 
 class MockDataBroker:
@@ -901,6 +1052,70 @@ def test_failed_symbol_does_not_crash_whole_market_collection():
     assert "AAPL" in snapshot.market_data["market_intelligence"]
     assert "SPY" in snapshot.market_data["market_intelligence"]
     assert "MSFT" not in snapshot.market_data["market_intelligence"]
+
+
+def test_dynamic_watchlist_enabled_builds_capped_final_watchlist():
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            watchlist_size=2,
+            scanner_universe=["AAPL", "MSFT", "SPY"],
+            allowed_symbols=["AAPL", "MSFT", "SPY"],
+        ),
+        broker_factory=lambda config: MockDataBroker(),
+    )
+
+    broker.connect()
+    snapshot = broker.collect_snapshot()
+
+    assert snapshot.market_data["dynamic_watchlist_enabled"] is True
+    assert len(snapshot.market_data["symbols"]) == 2
+    assert len(snapshot.market_data["dynamic_watchlist"]) == 2
+    assert set(snapshot.market_data["symbols"]) == set(snapshot.market_data["market_intelligence"])
+    assert snapshot.market_data["dynamic_watchlist"][0]["score"] >= snapshot.market_data["dynamic_watchlist"][1]["score"]
+
+
+def test_dynamic_scanner_failure_falls_back_to_static_watchlist(monkeypatch):
+    def failing_rank(self, universe, market_intelligence):
+        raise RuntimeError("scanner failed")
+
+    monkeypatch.setattr("broker.DynamicWatchlistScanner.rank", failing_rank)
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            watchlist_size=2,
+            scanner_universe=["AAPL", "MSFT"],
+            allowed_symbols=["SPY"],
+        ),
+        broker_factory=lambda config: MockDataBroker(failing_symbols={"AAPL", "MSFT"}),
+    )
+
+    broker.connect()
+    snapshot = broker.collect_snapshot()
+
+    assert snapshot.market_data["symbols"] == ["SPY"]
+    assert snapshot.market_data["scanner_status"] == "fallback_static"
+    assert snapshot.market_data["dynamic_watchlist"] == []
+    assert "SPY" in snapshot.market_data["market_intelligence"]
+
+
+def test_dynamic_scanner_no_candidates_produces_hold_status():
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            watchlist_size=2,
+            scanner_universe=["AAPL", "MSFT"],
+            allowed_symbols=["SPY"],
+        ),
+        broker_factory=lambda config: MockDataBroker(failing_symbols={"AAPL", "MSFT"}),
+    )
+
+    broker.connect()
+    snapshot = broker.collect_snapshot()
+
+    assert snapshot.market_data["scanner_status"] == "no_candidates"
+    assert snapshot.market_data["symbols"] == ["SPY"]
+    assert snapshot.market_data["dynamic_watchlist"] == []
 
 
 def test_alpaca_config_uses_paper_without_deprecated_endpoint():
@@ -998,6 +1213,49 @@ def test_strategy_writes_one_market_snapshot_per_symbol_per_cycle(tmp_path):
     assert [row[0] for row in rows] == ["AAPL", "MSFT"]
     assert json.loads(rows[0][1])["current_price"] == 214.33
     assert json.loads(rows[1][1])["RSI14"] == 48.1
+
+
+def test_strategy_persists_dynamic_watchlist_rows(tmp_path):
+    database_path = tmp_path / "trading_bot.db"
+    database.init_database(database_path)
+    snapshot = BrokerSnapshot(
+        account={"cash": 25000, "buying_power": 25000, "portfolio_value": 100000},
+        positions=[],
+        market_data={
+            "symbols": ["AAPL", "MSFT"],
+            "dynamic_watchlist": [
+                {
+                    "symbol": "AAPL",
+                    "score": 7,
+                    "reasons_added": ["top gainer", "high relative volume"],
+                    "current_price": 214.33,
+                },
+                {
+                    "symbol": "MSFT",
+                    "score": 4,
+                    "reasons_added": ["top volume"],
+                    "current_price": 434.8,
+                },
+            ],
+        },
+    )
+    strategy = TradingStrategy(
+        settings=make_settings(dynamic_watchlist_enabled=True),
+        broker=None,
+        risk_manager=RiskManager(make_settings()),
+    )
+
+    strategy._record_dynamic_watchlist(snapshot, datetime(2026, 7, 6, 10, 0))
+
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(
+            "SELECT date, symbol, reason_added, raw_metadata FROM watchlists ORDER BY symbol"
+        ).fetchall()
+
+    assert len(rows) == 2
+    assert rows[0][:3] == ("2026-07-06", "AAPL", "top gainer, high relative volume")
+    assert json.loads(rows[0][3])["score"] == 7
+    assert rows[1][1] == "MSFT"
 
 
 def test_strategy_writes_one_portfolio_snapshot_per_cycle(tmp_path):
@@ -1153,6 +1411,92 @@ def test_broker_bot_disabled_blocks_execution():
     assert result["executed"] is False
     assert "BOT_ENABLED" in result["reason"]
     assert fake_broker.submitted_orders == []
+
+
+def test_strategy_rejects_buy_outside_final_watchlist_before_execution(tmp_path):
+    database.init_database(tmp_path / "trading_bot.db")
+
+    class StubBroker:
+        def __init__(self):
+            self.execute_called = False
+
+        def collect_snapshot(self):
+            return BrokerSnapshot(
+                account={"cash": 100000, "buying_power": 100000, "portfolio_value": 100000},
+                positions=[],
+                market_data={
+                    "symbols": ["AAPL"],
+                    "dynamic_watchlist": [{"symbol": "AAPL", "score": 5, "reasons_added": ["top volume"]}],
+                    "market_intelligence": {
+                        "AAPL": {
+                            "current_price": 214.33,
+                            "volume": 1000,
+                            "RSI14": 55,
+                            "EMA20": 210,
+                            "EMA50": 205,
+                            "VWAP": 212,
+                        }
+                    },
+                },
+            )
+
+        def execute_order(self, approved_decision):
+            self.execute_called = True
+            return {"executed": True}
+
+    broker = StubBroker()
+    strategy = TradingStrategy(
+        settings=make_settings(
+            dry_run=False,
+            allowed_symbols=["AAPL", "MSFT"],
+            dynamic_watchlist_enabled=True,
+        ),
+        broker=broker,
+        risk_manager=RiskManager(
+            make_settings(
+                dry_run=False,
+                allowed_symbols=["AAPL", "MSFT"],
+                dynamic_watchlist_enabled=True,
+            )
+        ),
+    )
+    strategy.ai_client = types.SimpleNamespace(
+        last_raw_response='{"symbol":"MSFT","action":"BUY"}',
+        get_decision=lambda context: types.SimpleNamespace(
+            to_risk_manager_dict=lambda: {
+                "symbol": "MSFT",
+                "action": "BUY",
+                "confidence": 0.95,
+                "suggested_allocation_percent": 1,
+                "reason": "Outside final watchlist.",
+            }
+        ),
+    )
+
+    strategy.run_cycle()
+
+    assert broker.execute_called is False
+
+
+def test_no_scanner_candidates_returns_hold_without_openai_call():
+    snapshot = BrokerSnapshot(
+        account={"cash": 100000, "buying_power": 100000, "portfolio_value": 100000},
+        positions=[],
+        market_data={"symbols": ["SPY"], "scanner_status": "no_candidates"},
+    )
+    strategy = TradingStrategy(
+        settings=make_settings(dynamic_watchlist_enabled=True, allowed_symbols=["SPY"]),
+        broker=None,
+        risk_manager=RiskManager(make_settings()),
+    )
+    strategy.ai_client = types.SimpleNamespace(
+        get_decision=lambda context: pytest.fail("OpenAI should not be called")
+    )
+
+    decision = strategy.get_ai_decision(snapshot)
+
+    assert decision["action"] == "HOLD"
+    assert decision["reason"] == "Dynamic scanner returned no candidates."
 
 
 def test_broker_connect_failure_is_caught_safely():

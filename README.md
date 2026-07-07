@@ -98,6 +98,9 @@ DATABASE_PATH=/data/trading_bot.db
 | `MAX_POSITION_ALLOCATION_PERCENT` | `5` | Starter risk limit per suggested trade. |
 | `MIN_CONFIDENCE` | `0.70` | Minimum AI confidence before a trade can pass risk checks. |
 | `ALLOWED_SYMBOLS` | sample symbols | Optional comma-separated symbol allowlist. |
+| `DYNAMIC_WATCHLIST_ENABLED` | `false` | Enables the scanner-built analysis watchlist during each trading cycle. |
+| `WATCHLIST_SIZE` | `20` | Maximum scanner-selected symbols sent to OpenAI. |
+| `SCANNER_UNIVERSE` | sample symbols | Comma-separated US stock symbols for scanner v1. |
 | `DISCORD_WEBHOOK_URL` | empty | Discord incoming webhook URL for summaries. |
 | `DISCORD_DAILY_SUMMARY_ENABLED` | `false` | Enables one daily summary after regular US market close. |
 | `DATABASE_PATH` | `trading_bot.db` | SQLite database path. Use `/data/trading_bot.db` on Railway with a mounted volume. |
@@ -138,6 +141,10 @@ Real Alpaca paper order submission is isolated in `broker.py` and remains blocke
 `database.py` uses Python's built-in SQLite support to persist finalized AI decisions. Local development defaults to `trading_bot.db` in the project folder. Railway should use `DATABASE_PATH=/data/trading_bot.db` so records survive deploys and restarts.
 
 The database initializes automatically on startup and creates these tables for current and future analytics: `decisions`, `executions`, `portfolio_snapshots`, `market_snapshots`, and `watchlists`. If SQLite is unavailable, the bot logs the failure class and continues without database writes.
+
+## Dynamic Watchlist
+
+Dynamic watchlists are disabled by default. When `DYNAMIC_WATCHLIST_ENABLED=true`, the bot scans `SCANNER_UNIVERSE`, ranks symbols by volume, gain/loss movement, relative volume, and volatility, then sends the final capped watchlist to OpenAI. The risk manager and broker safety gates still apply, so the scanner cannot bypass configured trading controls.
 
 To test OpenAI with fake paper-trading context:
 

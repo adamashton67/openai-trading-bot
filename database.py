@@ -182,6 +182,41 @@ def insert_portfolio_snapshot(
         return None
 
 
+def insert_watchlist_symbol(
+    trading_date: str,
+    symbol: str,
+    reason_added: str,
+    raw_metadata: Any,
+) -> int | None:
+    """Persist one generated watchlist symbol without interrupting the bot."""
+    if not _ensure_database_available():
+        return None
+
+    try:
+        with _connect(_database_path) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO watchlists (
+                    date,
+                    symbol,
+                    reason_added,
+                    raw_metadata
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    trading_date,
+                    symbol.upper(),
+                    reason_added,
+                    _json_text(raw_metadata),
+                ),
+            )
+            return int(cursor.lastrowid)
+    except Exception as exc:
+        logger.error("Database watchlist insert failed safely: %s.", exc.__class__.__name__)
+        return None
+
+
 def _ensure_database_available() -> bool:
     if _database_available and _database_path is not None:
         return True

@@ -27,6 +27,11 @@ Current positions:
 Watchlist:
 {{watchlist}}
 
+Dynamic Watchlist:
+If dynamic watchlist data is supplied, these are the final scanner-selected symbols OpenAI may consider. Each row includes the scanner score and reason the symbol was selected. Do not recommend symbols outside this final watchlist.
+
+{{dynamic_watchlist}}
+
 Recent market data:
 {{recent_market_data}}
 
@@ -82,6 +87,7 @@ Decision rules:
 - For HOLD decisions, take_profit_percent must be null.
 - Do not use 0 for stop_loss_percent or take_profit_percent.
 - Never suggest a trade outside the supplied watchlist.
+- Never suggest a trade outside the final dynamic watchlist when dynamic watchlist data is supplied.
 - Never suggest a trade outside regular US market hours.
 - Do not exceed the supplied max allocation limits.
 - Return JSON only.

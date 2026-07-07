@@ -7,6 +7,7 @@ from typing import Any
 
 from config import Settings
 from market_indicators import calculate_market_indicators
+from watchlist_scanner import DynamicWatchlistScanner
 
 
 logger = logging.getLogger(__name__)
@@ -133,43 +134,102 @@ class BrokerClient:
         return positions
 
     def _collect_market_data(self) -> dict[str, Any]:
+        symbols = self._analysis_symbols()
         market_data = {
-            "symbols": self.settings.allowed_symbols,
+            "symbols": symbols,
             "prices": {},
             "market_intelligence": {},
+            "dynamic_watchlist_enabled": self.settings.dynamic_watchlist_enabled,
+            "dynamic_watchlist": [],
+            "scanner_status": "disabled",
         }
 
         if self._broker is None:
             logger.warning("Broker unavailable; latest prices were not collected.")
             return market_data
 
-        for symbol in self.settings.allowed_symbols:
+        if not self.settings.dynamic_watchlist_enabled:
+            self._collect_market_data_for_symbols(symbols, market_data)
+            return market_data
+
+        market_data["scanner_status"] = "enabled"
+
+        universe_data = {
+            "symbols": self.settings.scanner_universe,
+            "prices": {},
+            "market_intelligence": {},
+            "dynamic_watchlist_enabled": True,
+            "dynamic_watchlist": [],
+        }
+        try:
+            self._collect_market_data_for_symbols(self.settings.scanner_universe, universe_data)
+            scanner = DynamicWatchlistScanner(self.settings.watchlist_size)
+            selected = scanner.rank(
+                self.settings.scanner_universe,
+                universe_data["market_intelligence"],
+            )
+        except Exception as exc:
+            logger.warning("Dynamic watchlist scanner failed safely: %s.", exc.__class__.__name__)
+            market_data["scanner_status"] = "fallback_static"
+            self._collect_market_data_for_symbols(symbols, market_data)
+            return market_data
+
+        if not selected:
+            logger.warning("Dynamic watchlist scanner returned no candidates; using HOLD-only scanner status.")
+            market_data["symbols"] = self._hold_only_symbols()
+            market_data["scanner_status"] = "no_candidates"
+            return market_data
+
+        final_symbols = [candidate.symbol for candidate in selected]
+        market_data["symbols"] = final_symbols
+        market_data["scanner_status"] = "generated"
+        market_data["dynamic_watchlist"] = [candidate.to_dict() for candidate in selected]
+        market_data["scanner_universe"] = self.settings.scanner_universe
+        for symbol in final_symbols:
+            if symbol in universe_data["prices"]:
+                market_data["prices"][symbol] = universe_data["prices"][symbol]
+            if symbol in universe_data["market_intelligence"]:
+                market_data["market_intelligence"][symbol] = universe_data["market_intelligence"][symbol]
+        return market_data
+
+    def _analysis_symbols(self) -> list[str]:
+        return self.settings.allowed_symbols
+
+    def _hold_only_symbols(self) -> list[str]:
+        if "SPY" in self.settings.allowed_symbols:
+            return ["SPY"]
+        if self.settings.allowed_symbols:
+            return [self.settings.allowed_symbols[0]]
+        return ["SPY"]
+
+    def _collect_market_data_for_symbols(self, symbols: list[str], market_data: dict[str, Any]) -> None:
+        for symbol in symbols:
+            normalized_symbol = symbol.upper()
             try:
-                latest_price = self._get_last_price(symbol)
-                market_data["prices"][symbol] = {"last_price": latest_price}
+                latest_price = self._get_last_price(normalized_symbol)
+                market_data["prices"][normalized_symbol] = {"last_price": latest_price}
                 if latest_price is None:
-                    logger.warning("Latest price for %s is missing.", symbol)
+                    logger.warning("Latest price for %s is missing.", normalized_symbol)
             except Exception as exc:
                 logger.warning(
                     "Could not collect latest price for %s: %s.",
-                    symbol,
+                    normalized_symbol,
                     exc.__class__.__name__,
                 )
 
             try:
-                minute_bars = self._get_historical_bars(symbol, length=120, timestep="minute")
-                daily_bars = self._get_historical_bars(symbol, length=60, timestep="day")
-                indicators = calculate_market_indicators(symbol, minute_bars, daily_bars)
+                minute_bars = self._get_historical_bars(normalized_symbol, length=120, timestep="minute")
+                daily_bars = self._get_historical_bars(normalized_symbol, length=60, timestep="day")
+                indicators = calculate_market_indicators(normalized_symbol, minute_bars, daily_bars)
                 if indicators.get("current_price") is None:
-                    indicators["current_price"] = market_data["prices"].get(symbol, {}).get("last_price")
-                market_data["market_intelligence"][symbol] = indicators
+                    indicators["current_price"] = market_data["prices"].get(normalized_symbol, {}).get("last_price")
+                market_data["market_intelligence"][normalized_symbol] = indicators
             except Exception as exc:
                 logger.warning(
                     "Could not calculate market indicators for %s: %s.",
-                    symbol,
+                    normalized_symbol,
                     exc.__class__.__name__,
                 )
-        return market_data
 
     def _get_last_price(self, symbol: str) -> float | None:
         from lumibot.entities import Asset
@@ -218,7 +278,7 @@ class BrokerClient:
         missing_indicator_symbols = []
         prices = snapshot.market_data.get("prices", {})
         market_intelligence = snapshot.market_data.get("market_intelligence", {})
-        for symbol in self.settings.allowed_symbols:
+        for symbol in snapshot.market_data.get("symbols", self.settings.allowed_symbols):
             price_data = prices.get(symbol)
             latest_price = price_data.get("last_price") if isinstance(price_data, dict) else None
             if latest_price is None:

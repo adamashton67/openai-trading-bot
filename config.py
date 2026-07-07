@@ -14,6 +14,10 @@ except ImportError:
 
 
 BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_SCANNER_UNIVERSE = (
+    "SPY,QQQ,AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,AMD,NFLX,AVGO,"
+    "INTC,ORCL,CRM,ADBE,PYPL,UBER,SHOP,PLTR"
+)
 
 
 def _parse_bool(value: str | None, default: bool = False) -> bool:
@@ -47,6 +51,9 @@ class Settings:
     max_position_allocation_percent: float
     min_confidence: float
     allowed_symbols: list[str]
+    dynamic_watchlist_enabled: bool
+    watchlist_size: int
+    scanner_universe: list[str]
     prompts_dir: Path
     data_dir: Path
     discord_webhook_url: str
@@ -81,6 +88,14 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         ),
         min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.70")),
         allowed_symbols=_parse_symbols(os.getenv("ALLOWED_SYMBOLS")),
+        dynamic_watchlist_enabled=_parse_bool(
+            os.getenv("DYNAMIC_WATCHLIST_ENABLED"),
+            default=False,
+        ),
+        watchlist_size=int(os.getenv("WATCHLIST_SIZE", "20")),
+        scanner_universe=_parse_symbols(
+            os.getenv("SCANNER_UNIVERSE", DEFAULT_SCANNER_UNIVERSE)
+        ),
         prompts_dir=BASE_DIR / "prompts",
         data_dir=BASE_DIR / "data",
         discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", ""),

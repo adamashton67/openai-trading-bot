@@ -41,6 +41,7 @@ class TradingStrategy:
         current_time = datetime.now(ZoneInfo(self.settings.market_timezone))
         self._record_portfolio_snapshot(snapshot, current_time)
         self._record_market_snapshots(snapshot, current_time)
+        self._record_dynamic_watchlist(snapshot, current_time)
         if self.journal is not None:
             self.journal.record_balance_snapshot(
                 trading_day=current_time.date(),
@@ -59,6 +60,10 @@ class TradingStrategy:
             )
 
         approved, reason = self.risk_manager.validate(decision)
+        final_watchlist_reason = self._final_watchlist_rejection(decision, snapshot)
+        if final_watchlist_reason:
+            approved, reason = False, final_watchlist_reason
+
         if not approved:
             logger.info("Trading cycle skipped by risk manager: %s", reason)
             if self.journal is not None and decision.get("action") != "HOLD":
@@ -103,6 +108,16 @@ class TradingStrategy:
 
     def get_ai_decision(self, snapshot: BrokerSnapshot) -> dict[str, Any]:
         """Ask OpenAI for a validated suggestion and return it for risk checks."""
+        if snapshot.market_data.get("scanner_status") == "no_candidates":
+            logger.info("Dynamic scanner returned no candidates. Falling back to HOLD.")
+            return {
+                "symbol": self._fallback_hold_symbol(),
+                "action": "HOLD",
+                "confidence": 0,
+                "suggested_allocation_percent": 0,
+                "reason": "Dynamic scanner returned no candidates.",
+            }
+
         context = self._build_ai_context(snapshot)
         self._last_ai_raw_response = None
 
@@ -182,6 +197,36 @@ class TradingStrategy:
                     )
                 recorded_symbols.add(normalized_symbol)
 
+    def _record_dynamic_watchlist(self, snapshot: BrokerSnapshot, timestamp: datetime) -> None:
+        """Persist generated dynamic watchlist rows without affecting trading flow."""
+        dynamic_watchlist = snapshot.market_data.get("dynamic_watchlist", [])
+        if not isinstance(dynamic_watchlist, list):
+            return
+
+        trading_date = timestamp.date().isoformat()
+        recorded_symbols = set()
+        for candidate in dynamic_watchlist:
+            if not isinstance(candidate, dict):
+                continue
+            symbol = str(candidate.get("symbol", "")).upper()
+            if not symbol or symbol in recorded_symbols:
+                continue
+            reasons = candidate.get("reasons_added") or []
+            reason_added = ", ".join(str(reason) for reason in reasons)
+            try:
+                database.insert_watchlist_symbol(
+                    trading_date=trading_date,
+                    symbol=symbol,
+                    reason_added=reason_added,
+                    raw_metadata=candidate,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Database watchlist insert failed safely: %s.",
+                    exc.__class__.__name__,
+                )
+            recorded_symbols.add(symbol)
+
     def _get_ai_client(self) -> OpenAIDecisionClient:
         """Create the OpenAI client only when a trading cycle needs it."""
         if self.ai_client is None:
@@ -203,7 +248,7 @@ class TradingStrategy:
             buying_power=account.get("buying_power"),
             portfolio_value=account.get("portfolio_value"),
             current_positions=snapshot.positions,
-            watchlist_symbols=self.settings.allowed_symbols,
+            watchlist_symbols=self._final_watchlist_symbols(snapshot),
             recent_price_data=snapshot.market_data,
             risk_rules={
                 "paper_trading": self.settings.paper_trading,
@@ -211,11 +256,29 @@ class TradingStrategy:
                 "max_position_allocation_percent": (
                     self.settings.max_position_allocation_percent
                 ),
-                "allowed_symbols": self.settings.allowed_symbols,
+                "allowed_symbols": self._final_watchlist_symbols(snapshot),
+                "static_allowed_symbols": self.settings.allowed_symbols,
                 "risk_manager_required": True,
             },
             previous_trade_summary=None,
         )
+
+    def _final_watchlist_symbols(self, snapshot: BrokerSnapshot) -> list[str]:
+        symbols = snapshot.market_data.get("symbols") if isinstance(snapshot.market_data, dict) else None
+        if isinstance(symbols, list) and symbols:
+            return [str(symbol).upper() for symbol in symbols]
+        return self.settings.allowed_symbols
+
+    def _final_watchlist_rejection(self, decision: dict[str, Any], snapshot: BrokerSnapshot) -> str | None:
+        action = str(decision.get("action", "")).upper()
+        if action == "HOLD":
+            return None
+
+        final_watchlist = set(self._final_watchlist_symbols(snapshot))
+        symbol = str(decision.get("symbol", "")).upper()
+        if final_watchlist and symbol not in final_watchlist:
+            return f"{symbol or 'Missing symbol'} is not in the final watchlist."
+        return None
 
     def _fallback_hold_symbol(self) -> str:
         """Return a watchlist-backed symbol for HOLD fallbacks."""

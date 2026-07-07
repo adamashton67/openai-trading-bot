@@ -194,6 +194,7 @@ class OpenAIDecisionClient:
                 context_dict["recent_price_data"],
                 indent=2,
             ),
+            "dynamic_watchlist": self._format_dynamic_watchlist(context_dict),
             "market_intelligence": self._format_market_intelligence(context_dict),
             "risk_rules": json.dumps(context_dict["risk_rules"], indent=2),
             "previous_trades": context.previous_trade_summary or "None",
@@ -234,6 +235,31 @@ class OpenAIDecisionClient:
             return "No market intelligence supplied."
 
         return "\n\n".join(lines)
+
+    def _format_dynamic_watchlist(self, context_dict: dict[str, Any]) -> str:
+        """Render scanner-selected symbols with score and reasons."""
+        recent_price_data = context_dict.get("recent_price_data") or {}
+        dynamic_watchlist = recent_price_data.get("dynamic_watchlist") or []
+        if not dynamic_watchlist:
+            return "Dynamic watchlist disabled or unavailable. Using configured watchlist."
+
+        lines = []
+        for candidate in dynamic_watchlist:
+            if not isinstance(candidate, dict):
+                continue
+            payload = {
+                "symbol": candidate.get("symbol"),
+                "score": candidate.get("score"),
+                "reasons_added": candidate.get("reasons_added"),
+                "current_price": candidate.get("current_price"),
+                "day_change_percent": candidate.get("day_change_percent"),
+                "volume": candidate.get("volume"),
+                "relative_volume": candidate.get("relative_volume"),
+                "volatility_metric": candidate.get("volatility_metric"),
+            }
+            lines.append(json.dumps(payload, indent=2, sort_keys=True))
+
+        return "\n\n".join(lines) if lines else "Dynamic watchlist unavailable."
 
     def _market_intelligence_by_symbol(self, market_intelligence: Any) -> dict[str, dict[str, Any]]:
         """Index market intelligence by uppercase symbol."""
