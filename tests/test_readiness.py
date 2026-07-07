@@ -29,6 +29,7 @@ from scheduler import MarketScheduler
 from storage import TradingJournal
 from strategy import TradingStrategy
 from watchlist_scanner import DynamicWatchlistScanner
+from watchlist_scanner import is_broad_scan_asset_candidate
 
 
 def make_settings(**overrides):
@@ -47,6 +48,11 @@ def make_settings(**overrides):
         "min_confidence": 0.7,
         "allowed_symbols": ["AAPL", "MSFT"],
         "dynamic_watchlist_enabled": False,
+        "broad_market_scan_enabled": False,
+        "broad_market_max_symbols": 1000,
+        "min_stock_price": 5,
+        "min_average_volume": 500000,
+        "exclude_etfs": True,
         "watchlist_size": 20,
         "scanner_universe": [
             "SPY",
@@ -116,6 +122,11 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
         "DISCORD_WEBHOOK_URL",
         "DISCORD_DAILY_SUMMARY_ENABLED",
         "DYNAMIC_WATCHLIST_ENABLED",
+        "BROAD_MARKET_SCAN_ENABLED",
+        "BROAD_MARKET_MAX_SYMBOLS",
+        "MIN_STOCK_PRICE",
+        "MIN_AVERAGE_VOLUME",
+        "EXCLUDE_ETFS",
         "WATCHLIST_SIZE",
         "SCANNER_UNIVERSE",
         "DECISION_HISTORY_LIMIT",
@@ -133,6 +144,11 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
     assert settings.discord_daily_summary_enabled is False
     assert settings.openai_model == "gpt-5-mini"
     assert settings.dynamic_watchlist_enabled is False
+    assert settings.broad_market_scan_enabled is False
+    assert settings.broad_market_max_symbols == 1000
+    assert settings.min_stock_price == 5
+    assert settings.min_average_volume == 500000
+    assert settings.exclude_etfs is True
     assert settings.watchlist_size == 20
     assert "AAPL" in settings.scanner_universe
     assert settings.include_history_context is True
@@ -147,6 +163,11 @@ def test_config_loading_reads_environment(monkeypatch):
     monkeypatch.setenv("DISCORD_DAILY_SUMMARY_ENABLED", "true")
     monkeypatch.setenv("ALLOWED_SYMBOLS", "aapl, msft")
     monkeypatch.setenv("DYNAMIC_WATCHLIST_ENABLED", "true")
+    monkeypatch.setenv("BROAD_MARKET_SCAN_ENABLED", "true")
+    monkeypatch.setenv("BROAD_MARKET_MAX_SYMBOLS", "50")
+    monkeypatch.setenv("MIN_STOCK_PRICE", "10")
+    monkeypatch.setenv("MIN_AVERAGE_VOLUME", "750000")
+    monkeypatch.setenv("EXCLUDE_ETFS", "false")
     monkeypatch.setenv("WATCHLIST_SIZE", "3")
     monkeypatch.setenv("SCANNER_UNIVERSE", "spy, aapl")
     monkeypatch.setenv("DECISION_HISTORY_LIMIT", "7")
@@ -162,6 +183,11 @@ def test_config_loading_reads_environment(monkeypatch):
     assert settings.discord_daily_summary_enabled is True
     assert settings.allowed_symbols == ["AAPL", "MSFT"]
     assert settings.dynamic_watchlist_enabled is True
+    assert settings.broad_market_scan_enabled is True
+    assert settings.broad_market_max_symbols == 50
+    assert settings.min_stock_price == 10
+    assert settings.min_average_volume == 750000
+    assert settings.exclude_etfs is False
     assert settings.watchlist_size == 3
     assert settings.scanner_universe == ["SPY", "AAPL"]
     assert settings.decision_history_limit == 7
@@ -1169,6 +1195,50 @@ def test_dynamic_scanner_caps_final_watchlist_size():
     assert len(ranked) == 2
 
 
+def test_dynamic_scanner_scores_momentum_indicators():
+    scanner = DynamicWatchlistScanner(watchlist_size=2)
+    ranked = scanner.rank(
+        ["AAPL", "MSFT"],
+        {
+            "AAPL": {
+                "volume": 1000,
+                "day_change_percent": 0.1,
+                "relative_volume": 1.0,
+                "5d_change_percent": 4,
+                "20d_change_percent": 6,
+            },
+            "MSFT": {
+                "volume": 900,
+                "day_change_percent": 0.1,
+                "relative_volume": 1.0,
+            },
+        },
+    )
+
+    assert ranked[0].symbol == "AAPL"
+    assert "strong 5d momentum" in ranked[0].reasons_added
+    assert "strong 20d momentum" in ranked[0].reasons_added
+
+
+def test_broad_asset_filter_excludes_inactive_untradable_otc_and_etf():
+    good_asset = types.SimpleNamespace(
+        symbol="AAPL",
+        status="active",
+        tradable=True,
+        asset_class="us_equity",
+        exchange="NASDAQ",
+    )
+    bad_assets = [
+        types.SimpleNamespace(symbol="HALT", status="inactive", tradable=True, asset_class="us_equity", exchange="NYSE"),
+        types.SimpleNamespace(symbol="LOCK", status="active", tradable=False, asset_class="us_equity", exchange="NYSE"),
+        types.SimpleNamespace(symbol="OTC1", status="active", tradable=True, asset_class="us_equity", exchange="OTC"),
+        types.SimpleNamespace(symbol="ETF1", status="active", tradable=True, asset_class="us_equity", exchange="ARCA", name="Example ETF"),
+    ]
+
+    assert is_broad_scan_asset_candidate(good_asset) is True
+    assert all(not is_broad_scan_asset_candidate(asset) for asset in bad_assets)
+
+
 class MockLumibotBroker:
     def __init__(self, should_raise=False):
         self.submitted_orders = []
@@ -1205,6 +1275,15 @@ class MockExecutionStrategy:
 
 
 class MockAlpacaApi:
+    def __init__(self, assets=None, raise_assets=False):
+        self.assets = assets or [
+            types.SimpleNamespace(symbol="AAPL", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+            types.SimpleNamespace(symbol="MSFT", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+            types.SimpleNamespace(symbol="SPY", status="active", tradable=True, asset_class="us_equity", exchange="ARCA"),
+            types.SimpleNamespace(symbol="TSLA", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+        ]
+        self.raise_assets = raise_assets
+
     def get_account(self):
         return types.SimpleNamespace(
             cash="25000",
@@ -1222,10 +1301,17 @@ class MockAlpacaApi:
             )
         ]
 
+    def get_all_assets(self):
+        if self.raise_assets:
+            raise RuntimeError("asset list unavailable")
+        return self.assets
+
 
 class MockDataSource:
-    def __init__(self, failing_symbols=None):
+    def __init__(self, failing_symbols=None, daily_volumes=None, start_prices=None):
         self.failing_symbols = set(failing_symbols or [])
+        self.daily_volumes = daily_volumes or {}
+        self.start_prices = start_prices or {}
 
     def get_historical_prices(
         self,
@@ -1248,21 +1334,32 @@ class MockDataSource:
             "SPY": 90,
             "TSLA": 80,
         }.get(asset.symbol, 70)
+        start_price = self.start_prices.get(asset.symbol, start_price)
         if timestep == "minute":
             return types.SimpleNamespace(df=make_mock_bars(length=length, start_price=start_price, volume=base_volume))
-        return types.SimpleNamespace(df=make_mock_bars(length=length, start_price=start_price, volume=base_volume * 10))
+        daily_volume = self.daily_volumes.get(asset.symbol, base_volume * 10)
+        return types.SimpleNamespace(df=make_mock_bars(length=length, start_price=start_price, volume=daily_volume))
 
 
 class MockDataBroker:
-    def __init__(self, failing_symbols=None):
-        self.api = MockAlpacaApi()
-        self.data_source = MockDataSource(failing_symbols=failing_symbols)
+    def __init__(self, failing_symbols=None, assets=None, raise_assets=False, daily_volumes=None, start_prices=None):
+        self.api = MockAlpacaApi(assets=assets, raise_assets=raise_assets)
+        self.data_source = MockDataSource(
+            failing_symbols=failing_symbols,
+            daily_volumes=daily_volumes,
+            start_prices=start_prices,
+        )
 
     def get_last_price(self, asset):
         prices = {
             "AAPL": 214.33,
             "MSFT": 434.80,
             "SPY": 550.25,
+            "TSLA": 250.25,
+            "NVDA": 180.10,
+            "AMD": 160.50,
+            "LOWP": 3.50,
+            "LOWV": 85.25,
         }
         return prices.get(asset.symbol)
 
@@ -1328,6 +1425,170 @@ def test_dynamic_watchlist_enabled_builds_capped_final_watchlist():
     assert len(snapshot.market_data["dynamic_watchlist"]) == 2
     assert set(snapshot.market_data["symbols"]) == set(snapshot.market_data["market_intelligence"])
     assert snapshot.market_data["dynamic_watchlist"][0]["score"] >= snapshot.market_data["dynamic_watchlist"][1]["score"]
+
+
+def test_broad_market_scan_enabled_builds_final_watchlist():
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            broad_market_scan_enabled=True,
+            broad_market_max_symbols=3,
+            min_average_volume=10000,
+            watchlist_size=2,
+            allowed_symbols=["AAPL", "MSFT", "NVDA", "AMD"],
+        ),
+        broker_factory=lambda config: MockDataBroker(
+            assets=[
+                types.SimpleNamespace(symbol="AAPL", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+                types.SimpleNamespace(symbol="MSFT", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+                types.SimpleNamespace(symbol="NVDA", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+                types.SimpleNamespace(symbol="AMD", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+            ],
+            daily_volumes={"AAPL": 900000, "MSFT": 800000, "NVDA": 700000, "AMD": 600000},
+        ),
+    )
+
+    broker.connect()
+    snapshot = broker.collect_snapshot()
+
+    assert snapshot.market_data["scanner_status"] == "broad_generated"
+    assert snapshot.market_data["scanner_mode"] == "broad_market"
+    assert snapshot.market_data["broad_candidate_count"] == 3
+    assert len(snapshot.market_data["symbols"]) == 2
+    assert set(snapshot.market_data["symbols"]) == set(snapshot.market_data["market_intelligence"])
+    assert len(snapshot.market_data["dynamic_watchlist"]) == 2
+
+
+def test_broad_scan_context_only_contains_final_watchlist():
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            broad_market_scan_enabled=True,
+            broad_market_max_symbols=4,
+            min_average_volume=10000,
+            watchlist_size=2,
+            allowed_symbols=["AAPL", "MSFT", "NVDA", "AMD"],
+        ),
+        broker_factory=lambda config: MockDataBroker(
+            assets=[
+                types.SimpleNamespace(symbol="AAPL", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+                types.SimpleNamespace(symbol="MSFT", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+                types.SimpleNamespace(symbol="NVDA", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+                types.SimpleNamespace(symbol="AMD", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+            ],
+            daily_volumes={"AAPL": 900000, "MSFT": 800000, "NVDA": 700000, "AMD": 600000},
+        ),
+    )
+    broker.connect()
+    snapshot = broker.collect_snapshot()
+    strategy = TradingStrategy(
+        settings=make_settings(dynamic_watchlist_enabled=True),
+        broker=broker,
+        risk_manager=RiskManager(make_settings()),
+    )
+
+    context = strategy._build_ai_context(snapshot)
+
+    assert len(context.watchlist_symbols) == 2
+    assert set(context.recent_price_data["market_intelligence"]) == set(context.watchlist_symbols)
+    assert set(context.recent_price_data["prices"]) == set(context.watchlist_symbols)
+
+
+def test_broad_market_scan_disabled_uses_configured_scanner_v1():
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            broad_market_scan_enabled=False,
+            watchlist_size=2,
+            scanner_universe=["AAPL", "MSFT", "SPY"],
+            allowed_symbols=["AAPL", "MSFT", "SPY"],
+        ),
+        broker_factory=lambda config: MockDataBroker(),
+    )
+
+    broker.connect()
+    snapshot = broker.collect_snapshot()
+
+    assert snapshot.market_data["scanner_status"] == "generated"
+    assert snapshot.market_data["scanner_mode"] == "configured_universe"
+
+
+def test_broad_market_scan_filters_assets_price_and_volume():
+    assets = [
+        types.SimpleNamespace(symbol="AAPL", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+        types.SimpleNamespace(symbol="LOWP", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+        types.SimpleNamespace(symbol="LOWV", status="active", tradable=True, asset_class="us_equity", exchange="NYSE"),
+        types.SimpleNamespace(symbol="ETF1", status="active", tradable=True, asset_class="us_equity", exchange="ARCA", name="Example ETF"),
+        types.SimpleNamespace(symbol="OTC1", status="active", tradable=True, asset_class="us_equity", exchange="OTC"),
+        types.SimpleNamespace(symbol="HALT", status="inactive", tradable=True, asset_class="us_equity", exchange="NYSE"),
+    ]
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            broad_market_scan_enabled=True,
+            min_stock_price=5,
+            min_average_volume=500000,
+            watchlist_size=5,
+            allowed_symbols=["AAPL", "LOWP", "LOWV"],
+        ),
+        broker_factory=lambda config: MockDataBroker(
+            assets=assets,
+            daily_volumes={"AAPL": 900000, "LOWP": 900000, "LOWV": 1000},
+            start_prices={"LOWP": -118},
+        ),
+    )
+
+    broker.connect()
+    snapshot = broker.collect_snapshot()
+
+    assert snapshot.market_data["scanner_status"] == "broad_generated"
+    assert snapshot.market_data["symbols"] == ["AAPL"]
+    assert snapshot.market_data["broad_candidate_count"] == 1
+
+
+def test_broad_market_scan_failure_falls_back_to_scanner_v1():
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            broad_market_scan_enabled=True,
+            scanner_universe=["AAPL", "MSFT"],
+            allowed_symbols=["AAPL", "MSFT"],
+            watchlist_size=2,
+        ),
+        broker_factory=lambda config: MockDataBroker(raise_assets=True),
+    )
+
+    broker.connect()
+    snapshot = broker.collect_snapshot()
+
+    assert snapshot.market_data["broad_scan_failed"] is True
+    assert snapshot.market_data["scanner_status"] == "generated"
+    assert snapshot.market_data["scanner_mode"] == "configured_universe"
+    assert set(snapshot.market_data["symbols"]).issubset({"AAPL", "MSFT"})
+
+
+def test_broad_and_configured_scanner_failure_falls_back_to_static(monkeypatch):
+    def failing_rank(self, universe, market_intelligence):
+        raise RuntimeError("scanner failed")
+
+    monkeypatch.setattr("broker.DynamicWatchlistScanner.rank", failing_rank)
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            broad_market_scan_enabled=True,
+            scanner_universe=["AAPL", "MSFT"],
+            allowed_symbols=["SPY"],
+            watchlist_size=2,
+        ),
+        broker_factory=lambda config: MockDataBroker(raise_assets=True),
+    )
+
+    broker.connect()
+    snapshot = broker.collect_snapshot()
+
+    assert snapshot.market_data["scanner_status"] == "fallback_static"
+    assert snapshot.market_data["scanner_mode"] == "static"
+    assert snapshot.market_data["symbols"] == ["SPY"]
 
 
 def test_dynamic_scanner_failure_falls_back_to_static_watchlist(monkeypatch):

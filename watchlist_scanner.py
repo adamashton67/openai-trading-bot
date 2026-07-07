@@ -98,6 +98,16 @@ class DynamicWatchlistScanner:
             score += 2
             reasons.append("high volatility")
 
+        five_day_change = _to_float(indicators.get("5d_change_percent"))
+        if five_day_change is not None and five_day_change >= 3:
+            score += 2
+            reasons.append("strong 5d momentum")
+
+        twenty_day_change = _to_float(indicators.get("20d_change_percent"))
+        if twenty_day_change is not None and twenty_day_change >= 5:
+            score += 1
+            reasons.append("strong 20d momentum")
+
         if not reasons:
             reasons.append("scanner universe")
 
@@ -131,3 +141,71 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def broad_asset_symbol(asset: Any) -> str:
+    """Return an uppercase symbol from an Alpaca asset-like object."""
+    return str(getattr(asset, "symbol", "") or "").strip().upper()
+
+
+def is_broad_scan_asset_candidate(asset: Any, exclude_etfs: bool = True) -> bool:
+    """Return whether an Alpaca asset-like object is safe to consider."""
+    symbol = broad_asset_symbol(asset)
+    if not symbol:
+        return False
+
+    status = str(getattr(asset, "status", "") or "").lower()
+    if status and status != "active":
+        return False
+
+    tradable = getattr(asset, "tradable", True)
+    if tradable is False:
+        return False
+
+    asset_class = str(
+        getattr(asset, "asset_class", None)
+        or getattr(asset, "class", None)
+        or ""
+    ).lower()
+    if asset_class and asset_class not in {"us_equity", "stock", "equity"}:
+        return False
+
+    exchange = str(getattr(asset, "exchange", "") or "").upper()
+    if exchange == "OTC":
+        return False
+
+    if exclude_etfs and _looks_like_etf(asset):
+        return False
+
+    return True
+
+
+def passes_broad_liquidity_filters(
+    indicators: dict[str, Any],
+    min_stock_price: float,
+    min_average_volume: float,
+) -> bool:
+    """Return whether indicator data meets broad scanner liquidity filters."""
+    current_price = _to_float(indicators.get("current_price"))
+    if current_price is None or current_price < min_stock_price:
+        return False
+
+    average_volume = _to_float(indicators.get("average_20d_volume"))
+    if average_volume is not None and average_volume < min_average_volume:
+        return False
+
+    return True
+
+
+def _looks_like_etf(asset: Any) -> bool:
+    metadata_values = [
+        getattr(asset, "asset_type", None),
+        getattr(asset, "type", None),
+        getattr(asset, "name", None),
+    ]
+    attributes = getattr(asset, "attributes", None)
+    if isinstance(attributes, (list, tuple, set)):
+        metadata_values.extend(attributes)
+
+    joined = " ".join(str(value).lower() for value in metadata_values if value)
+    return "etf" in joined or "exchange traded fund" in joined

@@ -7,7 +7,12 @@ from typing import Any
 
 from config import Settings
 from market_indicators import calculate_market_indicators
-from watchlist_scanner import DynamicWatchlistScanner
+from watchlist_scanner import (
+    DynamicWatchlistScanner,
+    broad_asset_symbol,
+    is_broad_scan_asset_candidate,
+    passes_broad_liquidity_filters,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -187,6 +192,7 @@ class BrokerClient:
             "dynamic_watchlist_enabled": self.settings.dynamic_watchlist_enabled,
             "dynamic_watchlist": [],
             "scanner_status": "disabled",
+            "scanner_mode": "static",
         }
 
         if self._broker is None:
@@ -197,15 +203,27 @@ class BrokerClient:
             self._collect_market_data_for_symbols(symbols, market_data)
             return market_data
 
-        market_data["scanner_status"] = "enabled"
+        if self.settings.broad_market_scan_enabled:
+            try:
+                return self._collect_broad_watchlist_market_data(market_data)
+            except Exception as exc:
+                logger.warning("Broad market scanner failed safely: %s.", exc.__class__.__name__)
+                market_data["broad_scan_failed"] = True
 
-        universe_data = {
-            "symbols": self.settings.scanner_universe,
-            "prices": {},
-            "market_intelligence": {},
-            "dynamic_watchlist_enabled": True,
-            "dynamic_watchlist": [],
-        }
+        try:
+            return self._collect_configured_watchlist_market_data(market_data)
+        except Exception as exc:
+            logger.warning("Dynamic watchlist scanner failed safely: %s.", exc.__class__.__name__)
+            market_data["scanner_status"] = "fallback_static"
+            market_data["scanner_mode"] = "static"
+            self._collect_market_data_for_symbols(symbols, market_data)
+            return market_data
+
+    def _collect_configured_watchlist_market_data(self, market_data: dict[str, Any]) -> dict[str, Any]:
+        market_data["scanner_status"] = "enabled"
+        market_data["scanner_mode"] = "configured_universe"
+
+        universe_data = self._empty_market_data(self.settings.scanner_universe)
         try:
             self._collect_market_data_for_symbols(self.settings.scanner_universe, universe_data)
             scanner = DynamicWatchlistScanner(self.settings.watchlist_size)
@@ -215,27 +233,123 @@ class BrokerClient:
             )
         except Exception as exc:
             logger.warning("Dynamic watchlist scanner failed safely: %s.", exc.__class__.__name__)
-            market_data["scanner_status"] = "fallback_static"
-            self._collect_market_data_for_symbols(symbols, market_data)
-            return market_data
+            raise
 
         if not selected:
             logger.warning("Dynamic watchlist scanner returned no candidates; using HOLD-only scanner status.")
             market_data["symbols"] = self._hold_only_symbols()
             market_data["scanner_status"] = "no_candidates"
+            market_data["scanner_mode"] = "configured_universe"
             return market_data
 
+        self._copy_selected_watchlist(market_data, universe_data, selected)
+        market_data["scanner_status"] = "generated"
+        market_data["scanner_mode"] = "configured_universe"
+        market_data["scanner_universe"] = self.settings.scanner_universe
+        logger.info(
+            "Dynamic watchlist scanner selected %s symbols: %s.",
+            len(selected),
+            ", ".join(candidate.symbol for candidate in selected[:5]),
+        )
+        return market_data
+
+    def _collect_broad_watchlist_market_data(self, market_data: dict[str, Any]) -> dict[str, Any]:
+        logger.info("Broad market scanner enabled.")
+        market_data["scanner_status"] = "enabled"
+        market_data["scanner_mode"] = "broad_market"
+
+        assets = self._get_broad_market_assets()
+        candidate_symbols = [
+            broad_asset_symbol(asset)
+            for asset in assets
+            if is_broad_scan_asset_candidate(asset, exclude_etfs=self.settings.exclude_etfs)
+        ]
+        candidate_symbols = self._dedupe_symbols(candidate_symbols)
+
+        broad_universe_data = self._empty_market_data(candidate_symbols)
+        liquid_symbols = []
+        for symbol in candidate_symbols:
+            symbol_data = self._empty_market_data([symbol])
+            self._collect_market_data_for_symbols([symbol], symbol_data)
+            indicators = symbol_data["market_intelligence"].get(symbol, {})
+            if not indicators:
+                continue
+            if not passes_broad_liquidity_filters(
+                indicators,
+                self.settings.min_stock_price,
+                self.settings.min_average_volume,
+            ):
+                continue
+
+            liquid_symbols.append(symbol)
+            broad_universe_data["prices"].update(symbol_data["prices"])
+            broad_universe_data["market_intelligence"].update(symbol_data["market_intelligence"])
+            if len(liquid_symbols) >= self.settings.broad_market_max_symbols:
+                break
+
+        scanner = DynamicWatchlistScanner(self.settings.watchlist_size)
+        selected = scanner.rank(liquid_symbols, broad_universe_data["market_intelligence"])
+        if not selected:
+            raise RuntimeError("Broad scanner returned no candidates.")
+
+        self._copy_selected_watchlist(market_data, broad_universe_data, selected)
+        market_data["scanner_status"] = "broad_generated"
+        market_data["scanner_mode"] = "broad_market"
+        market_data["broad_candidate_count"] = len(liquid_symbols)
+        logger.info(
+            "Broad market scanner considered %s liquid candidates and selected %s: %s.",
+            len(liquid_symbols),
+            len(selected),
+            ", ".join(candidate.symbol for candidate in selected[:5]),
+        )
+        return market_data
+
+    def _empty_market_data(self, symbols: list[str]) -> dict[str, Any]:
+        return {
+            "symbols": symbols,
+            "prices": {},
+            "market_intelligence": {},
+            "dynamic_watchlist_enabled": True,
+            "dynamic_watchlist": [],
+        }
+
+    def _copy_selected_watchlist(
+        self,
+        market_data: dict[str, Any],
+        source_data: dict[str, Any],
+        selected: list[Any],
+    ) -> None:
         final_symbols = [candidate.symbol for candidate in selected]
         market_data["symbols"] = final_symbols
-        market_data["scanner_status"] = "generated"
         market_data["dynamic_watchlist"] = [candidate.to_dict() for candidate in selected]
-        market_data["scanner_universe"] = self.settings.scanner_universe
         for symbol in final_symbols:
-            if symbol in universe_data["prices"]:
-                market_data["prices"][symbol] = universe_data["prices"][symbol]
-            if symbol in universe_data["market_intelligence"]:
-                market_data["market_intelligence"][symbol] = universe_data["market_intelligence"][symbol]
-        return market_data
+            if symbol in source_data["prices"]:
+                market_data["prices"][symbol] = source_data["prices"][symbol]
+            if symbol in source_data["market_intelligence"]:
+                market_data["market_intelligence"][symbol] = source_data["market_intelligence"][symbol]
+
+    def _get_broad_market_assets(self) -> list[Any]:
+        if self._broker is None:
+            return []
+
+        api = getattr(self._broker, "api", None)
+        if api is not None and hasattr(api, "get_all_assets"):
+            return list(api.get_all_assets())
+
+        if hasattr(self._broker, "get_all_assets"):
+            return list(self._broker.get_all_assets())
+
+        raise AttributeError("Broker does not expose tradable assets.")
+
+    def _dedupe_symbols(self, symbols: list[str]) -> list[str]:
+        deduped = []
+        seen = set()
+        for symbol in symbols:
+            normalized_symbol = symbol.strip().upper()
+            if normalized_symbol and normalized_symbol not in seen:
+                seen.add(normalized_symbol)
+                deduped.append(normalized_symbol)
+        return deduped
 
     def _analysis_symbols(self) -> list[str]:
         return self.settings.allowed_symbols

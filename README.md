@@ -99,6 +99,11 @@ DATABASE_PATH=/data/trading_bot.db
 | `MIN_CONFIDENCE` | `0.70` | Minimum AI confidence before a trade can pass risk checks. |
 | `ALLOWED_SYMBOLS` | sample symbols | Optional comma-separated symbol allowlist. |
 | `DYNAMIC_WATCHLIST_ENABLED` | `false` | Enables the scanner-built analysis watchlist during each trading cycle. |
+| `BROAD_MARKET_SCAN_ENABLED` | `false` | Uses Alpaca tradable US equity assets for a broader scanner before selecting the final watchlist. |
+| `BROAD_MARKET_MAX_SYMBOLS` | `1000` | Maximum liquid broad-scan candidates evaluated before final ranking. |
+| `MIN_STOCK_PRICE` | `5` | Minimum current price for broad-scan candidates. |
+| `MIN_AVERAGE_VOLUME` | `500000` | Minimum 20-day average volume for broad-scan candidates when available. |
+| `EXCLUDE_ETFS` | `true` | Excludes ETF-like assets from the broad scan where identifiable. |
 | `WATCHLIST_SIZE` | `20` | Maximum scanner-selected symbols sent to OpenAI. |
 | `SCANNER_UNIVERSE` | sample symbols | Comma-separated US stock symbols for scanner v1. |
 | `DISCORD_WEBHOOK_URL` | empty | Discord incoming webhook URL for summaries. |
@@ -150,7 +155,9 @@ When `INCLUDE_HISTORY_CONTEXT=true`, recent decisions, executions, and portfolio
 
 ## Dynamic Watchlist
 
-Dynamic watchlists are disabled by default. When `DYNAMIC_WATCHLIST_ENABLED=true`, the bot scans `SCANNER_UNIVERSE`, ranks symbols by volume, gain/loss movement, relative volume, and volatility, then sends the final capped watchlist to OpenAI. The risk manager and broker safety gates still apply, so the scanner cannot bypass configured trading controls.
+Dynamic watchlists are disabled by default. When `DYNAMIC_WATCHLIST_ENABLED=true`, the bot scans `SCANNER_UNIVERSE`, ranks symbols by volume, gain/loss movement, relative volume, volatility, and momentum, then sends the final capped watchlist to OpenAI. The risk manager and broker safety gates still apply, so the scanner cannot bypass configured trading controls.
+
+When `BROAD_MARKET_SCAN_ENABLED=true`, the scanner first pulls tradable US equity assets from Alpaca, filters out inactive, untradable, OTC, ETF-like, low-price, and low-volume candidates where possible, then ranks up to `BROAD_MARKET_MAX_SYMBOLS` liquid symbols. Only the final `WATCHLIST_SIZE` symbols and their indicators are sent to OpenAI. If broad scanning fails, the bot falls back to scanner v1; if that fails, it falls back to the static allowed symbols.
 
 To test OpenAI with fake paper-trading context:
 

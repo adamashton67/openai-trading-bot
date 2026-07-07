@@ -52,6 +52,11 @@ class Settings:
     min_confidence: float
     allowed_symbols: list[str]
     dynamic_watchlist_enabled: bool
+    broad_market_scan_enabled: bool
+    broad_market_max_symbols: int
+    min_stock_price: float
+    min_average_volume: float
+    exclude_etfs: bool
     watchlist_size: int
     scanner_universe: list[str]
     decision_history_limit: int
@@ -96,6 +101,14 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
             os.getenv("DYNAMIC_WATCHLIST_ENABLED"),
             default=False,
         ),
+        broad_market_scan_enabled=_parse_bool(
+            os.getenv("BROAD_MARKET_SCAN_ENABLED"),
+            default=False,
+        ),
+        broad_market_max_symbols=int(os.getenv("BROAD_MARKET_MAX_SYMBOLS", "1000")),
+        min_stock_price=float(os.getenv("MIN_STOCK_PRICE", "5")),
+        min_average_volume=float(os.getenv("MIN_AVERAGE_VOLUME", "500000")),
+        exclude_etfs=_parse_bool(os.getenv("EXCLUDE_ETFS"), default=True),
         watchlist_size=int(os.getenv("WATCHLIST_SIZE", "20")),
         scanner_universe=_parse_symbols(
             os.getenv("SCANNER_UNIVERSE", DEFAULT_SCANNER_UNIVERSE)
