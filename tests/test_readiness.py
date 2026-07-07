@@ -3,6 +3,7 @@
 import json
 import logging
 import sqlite3
+import time
 from datetime import date, datetime
 from pathlib import Path
 import sys
@@ -53,6 +54,7 @@ def make_settings(**overrides):
         "max_scanner_candidates_after_filters": 1000,
         "broad_scan_batch_size": 100,
         "broad_scan_max_requests_per_cycle": 20,
+        "broad_scan_batch_timeout_seconds": 10,
         "min_stock_price": 5,
         "min_average_volume": 500000,
         "exclude_etfs": True,
@@ -130,6 +132,7 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
         "MAX_SCANNER_CANDIDATES_AFTER_FILTERS",
         "BROAD_SCAN_BATCH_SIZE",
         "BROAD_SCAN_MAX_REQUESTS_PER_CYCLE",
+        "BROAD_SCAN_BATCH_TIMEOUT_SECONDS",
         "MIN_STOCK_PRICE",
         "MIN_AVERAGE_VOLUME",
         "EXCLUDE_ETFS",
@@ -155,6 +158,7 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
     assert settings.max_scanner_candidates_after_filters == 1000
     assert settings.broad_scan_batch_size == 100
     assert settings.broad_scan_max_requests_per_cycle == 20
+    assert settings.broad_scan_batch_timeout_seconds == 10
     assert settings.min_stock_price == 5
     assert settings.min_average_volume == 500000
     assert settings.exclude_etfs is True
@@ -177,6 +181,7 @@ def test_config_loading_reads_environment(monkeypatch):
     monkeypatch.setenv("MAX_SCANNER_CANDIDATES_AFTER_FILTERS", "25")
     monkeypatch.setenv("BROAD_SCAN_BATCH_SIZE", "12")
     monkeypatch.setenv("BROAD_SCAN_MAX_REQUESTS_PER_CYCLE", "3")
+    monkeypatch.setenv("BROAD_SCAN_BATCH_TIMEOUT_SECONDS", "1.5")
     monkeypatch.setenv("MIN_STOCK_PRICE", "10")
     monkeypatch.setenv("MIN_AVERAGE_VOLUME", "750000")
     monkeypatch.setenv("EXCLUDE_ETFS", "false")
@@ -200,6 +205,7 @@ def test_config_loading_reads_environment(monkeypatch):
     assert settings.max_scanner_candidates_after_filters == 25
     assert settings.broad_scan_batch_size == 12
     assert settings.broad_scan_max_requests_per_cycle == 3
+    assert settings.broad_scan_batch_timeout_seconds == 1.5
     assert settings.min_stock_price == 10
     assert settings.min_average_volume == 750000
     assert settings.exclude_etfs is False
@@ -1630,6 +1636,8 @@ class MockDataBroker:
         daily_volumes=None,
         start_prices=None,
         rate_limit_batches=False,
+        fail_batches=False,
+        batch_delay_seconds=0,
     ):
         self.api = MockAlpacaApi(assets=assets, raise_assets=raise_assets)
         self.data_source = MockDataSource(
@@ -1640,6 +1648,8 @@ class MockDataBroker:
         self.last_price_calls = []
         self.last_prices_batches = []
         self.rate_limit_batches = rate_limit_batches
+        self.fail_batches = fail_batches
+        self.batch_delay_seconds = batch_delay_seconds
 
     def get_last_price(self, asset):
         self.last_price_calls.append(asset.symbol)
@@ -1658,8 +1668,12 @@ class MockDataBroker:
 
     def get_last_prices(self, symbols):
         self.last_prices_batches.append(list(symbols))
+        if self.batch_delay_seconds:
+            time.sleep(self.batch_delay_seconds)
         if self.rate_limit_batches:
             raise RuntimeError("429 Client Error: Too Many Requests")
+        if self.fail_batches:
+            raise RuntimeError("batch failed")
         prices = {
             "AAPL": 214.33,
             "MSFT": 434.80,
@@ -1801,6 +1815,8 @@ def test_broad_market_scan_logs_major_stages(caplog):
     assert "Broad scanner: collecting market data." in caplog.text
     assert "Broad scanner: applying liquidity filters." in caplog.text
     assert "Broad scanner: 3 symbols remain after price filters." in caplog.text
+    assert "Broad scanner: requesting batch 1 with 3 symbols." in caplog.text
+    assert "Broad scanner: completed batch 1 with 3 prices." in caplog.text
     assert "Broad scanner: capped 3 symbols for indicator calculation." in caplog.text
     assert "Broad scanner: 3 symbols remain after liquidity filters." in caplog.text
     assert "Broad scanner: beginning ranking." in caplog.text
@@ -2054,6 +2070,70 @@ def test_broad_market_scan_rate_limit_falls_back_to_scanner_v1(caplog):
     assert snapshot.market_data["scanner_status"] == "generated"
     assert snapshot.market_data["scanner_mode"] == "configured_universe"
     assert "rate limit fallback triggered" in caplog.text
+
+
+def test_broad_market_scan_batch_timeout_falls_back_without_blocking(caplog):
+    fake_broker = MockDataBroker(
+        assets=[
+            types.SimpleNamespace(symbol="AAPL", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+            types.SimpleNamespace(symbol="MSFT", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+        ],
+        batch_delay_seconds=0.05,
+    )
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            broad_market_scan_enabled=True,
+            broad_scan_batch_size=2,
+            broad_scan_batch_timeout_seconds=0.01,
+            scanner_universe=["AAPL", "MSFT"],
+            allowed_symbols=["AAPL", "MSFT"],
+            watchlist_size=2,
+        ),
+        broker_factory=lambda config: fake_broker,
+    )
+
+    with caplog.at_level(logging.INFO, logger="broker"):
+        broker.connect()
+        snapshot = broker.collect_snapshot()
+
+    assert fake_broker.last_prices_batches == [["AAPL", "MSFT"]]
+    assert snapshot.market_data["broad_batch_timeout_count"] == 1
+    assert snapshot.market_data["broad_scan_failed"] is True
+    assert snapshot.market_data["scanner_status"] == "generated"
+    assert snapshot.market_data["scanner_mode"] == "configured_universe"
+    assert "Broad scanner: requesting batch 1 with 2 symbols." in caplog.text
+    assert "Broad scanner: batch 1 timed out after 0.01 seconds." in caplog.text
+
+
+def test_broad_market_scan_batch_failure_skips_batch_and_falls_back(caplog):
+    fake_broker = MockDataBroker(
+        assets=[
+            types.SimpleNamespace(symbol="AAPL", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+            types.SimpleNamespace(symbol="MSFT", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+        ],
+        fail_batches=True,
+    )
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            broad_market_scan_enabled=True,
+            broad_scan_batch_size=2,
+            scanner_universe=["AAPL", "MSFT"],
+            allowed_symbols=["AAPL", "MSFT"],
+            watchlist_size=2,
+        ),
+        broker_factory=lambda config: fake_broker,
+    )
+
+    with caplog.at_level(logging.INFO, logger="broker"):
+        broker.connect()
+        snapshot = broker.collect_snapshot()
+
+    assert fake_broker.last_prices_batches == [["AAPL", "MSFT"]]
+    assert snapshot.market_data["broad_scan_failed"] is True
+    assert snapshot.market_data["scanner_status"] == "generated"
+    assert "Broad scanner: skipped one price batch safely: RuntimeError." in caplog.text
 
 
 def test_broad_market_scan_aggregates_insufficient_data_logs(caplog):

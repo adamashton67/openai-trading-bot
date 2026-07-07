@@ -104,6 +104,7 @@ DATABASE_PATH=/data/trading_bot.db
 | `MAX_SCANNER_CANDIDATES_AFTER_FILTERS` | `1000` | Maximum broad-scan candidates sent into indicator calculation after asset and price filters. |
 | `BROAD_SCAN_BATCH_SIZE` | `100` | Symbols requested per broad-scan batch market data call. |
 | `BROAD_SCAN_MAX_REQUESTS_PER_CYCLE` | `20` | Maximum broad-scan batch market data requests before falling back for the cycle. |
+| `BROAD_SCAN_BATCH_TIMEOUT_SECONDS` | `10` | Per-batch timeout for broad-scan market data calls. Timed-out batches are skipped safely. |
 | `MIN_STOCK_PRICE` | `5` | Minimum current price for broad-scan candidates. |
 | `MIN_AVERAGE_VOLUME` | `500000` | Minimum 20-day average volume for broad-scan candidates when available. |
 | `EXCLUDE_ETFS` | `true` | Excludes ETF-like assets from the broad scan where identifiable. |

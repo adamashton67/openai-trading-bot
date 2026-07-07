@@ -1,6 +1,8 @@
 """Broker integration layer for Lumibot and Alpaca Paper Trading."""
 
 import logging
+import signal
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -296,6 +298,7 @@ class BrokerClient:
             missing_price_symbols = []
             batch_price_result = self._fetch_broad_latest_prices(candidate_symbols)
             market_data["broad_batch_request_count"] = batch_price_result["request_count"]
+            market_data["broad_batch_timeout_count"] = batch_price_result["timeout_count"]
             logger.info(
                 "Broad scanner: processed %s symbols across %s batch requests.",
                 batch_price_result["symbols_processed"],
@@ -459,6 +462,7 @@ class BrokerClient:
         prices: dict[str, float] = {}
         request_count = 0
         processed_count = 0
+        timeout_count = 0
 
         for start in range(0, len(symbols), batch_size):
             if request_count >= max_requests:
@@ -471,8 +475,18 @@ class BrokerClient:
             batch = symbols[start : start + batch_size]
             request_count += 1
             processed_count += len(batch)
+            logger.info(
+                "Broad scanner: requesting batch %s with %s symbols.",
+                request_count,
+                len(batch),
+            )
             try:
                 batch_prices = self._get_latest_prices_batch(batch)
+                logger.info(
+                    "Broad scanner: completed batch %s with %s prices.",
+                    request_count,
+                    len(batch_prices),
+                )
             except Exception as exc:
                 if self._is_rate_limit_error(exc):
                     logger.warning(
@@ -480,6 +494,14 @@ class BrokerClient:
                         request_count,
                     )
                     raise
+                if isinstance(exc, TimeoutError):
+                    timeout_count += 1
+                    logger.warning(
+                        "Broad scanner: batch %s timed out after %.2f seconds.",
+                        request_count,
+                        self.settings.broad_scan_batch_timeout_seconds,
+                    )
+                    continue
                 logger.info(
                     "Broad scanner: skipped one price batch safely: %s.",
                     exc.__class__.__name__,
@@ -491,6 +513,7 @@ class BrokerClient:
         return {
             "prices": prices,
             "request_count": request_count,
+            "timeout_count": timeout_count,
             "symbols_processed": processed_count,
             "symbols_skipped": max(0, processed_count - len(prices)),
         }
@@ -507,11 +530,32 @@ class BrokerClient:
             ):
                 if not hasattr(owner, method_name):
                     continue
-                raw_prices = getattr(owner, method_name)(symbols)
+                raw_prices = self._call_batched_price_method(
+                    getattr(owner, method_name),
+                    symbols,
+                )
                 parsed_prices = self._parse_batched_price_response(raw_prices)
                 if parsed_prices:
                     return parsed_prices
         raise AttributeError("Broker does not expose batched latest price data.")
+
+    def _call_batched_price_method(self, method: Any, symbols: list[str]) -> Any:
+        timeout_seconds = self.settings.broad_scan_batch_timeout_seconds
+        if timeout_seconds <= 0 or threading.current_thread() is not threading.main_thread():
+            return method(symbols)
+
+        previous_handler = signal.getsignal(signal.SIGALRM)
+
+        def _timeout_handler(signum: int, frame: Any) -> None:
+            raise TimeoutError("Broad scanner batch market data request timed out.")
+
+        try:
+            signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+            return method(symbols)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
 
     def _parse_batched_price_response(self, response: Any) -> dict[str, float]:
         if response is None:
