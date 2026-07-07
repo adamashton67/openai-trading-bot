@@ -207,7 +207,10 @@ class BrokerClient:
             try:
                 return self._collect_broad_watchlist_market_data(market_data)
             except Exception as exc:
-                logger.warning("Broad market scanner failed safely: %s.", exc.__class__.__name__)
+                stage = getattr(exc, "broad_scanner_stage", "unknown stage")
+                logger.warning("Broad market scanner failed safely during %s.", stage)
+                logger.warning("Broad scanner exception class: %s.", exc.__class__.__name__)
+                logger.warning("Broad scanner exception message: %s.", self._safe_exception_message(exc))
                 market_data["broad_scan_failed"] = True
 
         try:
@@ -254,55 +257,82 @@ class BrokerClient:
         return market_data
 
     def _collect_broad_watchlist_market_data(self, market_data: dict[str, Any]) -> dict[str, Any]:
-        logger.info("Broad market scanner enabled.")
         market_data["scanner_status"] = "enabled"
         market_data["scanner_mode"] = "broad_market"
 
-        assets = self._get_broad_market_assets()
-        candidate_symbols = [
-            broad_asset_symbol(asset)
-            for asset in assets
-            if is_broad_scan_asset_candidate(asset, exclude_etfs=self.settings.exclude_etfs)
-        ]
-        candidate_symbols = self._dedupe_symbols(candidate_symbols)
+        stage = "starting broad market scan"
+        try:
+            logger.info("Broad scanner: starting broad market scan.")
 
-        broad_universe_data = self._empty_market_data(candidate_symbols)
-        liquid_symbols = []
-        for symbol in candidate_symbols:
-            symbol_data = self._empty_market_data([symbol])
-            self._collect_market_data_for_symbols([symbol], symbol_data)
-            indicators = symbol_data["market_intelligence"].get(symbol, {})
-            if not indicators:
-                continue
-            if not passes_broad_liquidity_filters(
-                indicators,
-                self.settings.min_stock_price,
-                self.settings.min_average_volume,
-            ):
-                continue
+            stage = "fetching tradable assets"
+            logger.info("Broad scanner: fetching tradable assets.")
+            assets = self._get_broad_market_assets()
+            logger.info("Broad scanner: fetched %s assets.", len(assets))
 
-            liquid_symbols.append(symbol)
-            broad_universe_data["prices"].update(symbol_data["prices"])
-            broad_universe_data["market_intelligence"].update(symbol_data["market_intelligence"])
-            if len(liquid_symbols) >= self.settings.broad_market_max_symbols:
-                break
+            stage = "applying asset filters"
+            logger.info("Broad scanner: filtering tradable US equities.")
+            candidate_symbols = [
+                broad_asset_symbol(asset)
+                for asset in assets
+                if is_broad_scan_asset_candidate(asset, exclude_etfs=self.settings.exclude_etfs)
+            ]
+            candidate_symbols = self._dedupe_symbols(candidate_symbols)
+            logger.info("Broad scanner: %s symbols remain after asset filters.", len(candidate_symbols))
 
-        scanner = DynamicWatchlistScanner(self.settings.watchlist_size)
-        selected = scanner.rank(liquid_symbols, broad_universe_data["market_intelligence"])
-        if not selected:
-            raise RuntimeError("Broad scanner returned no candidates.")
+            stage = "beginning market data collection"
+            logger.info("Broad scanner: collecting market data.")
+            broad_universe_data = self._empty_market_data(candidate_symbols)
 
-        self._copy_selected_watchlist(market_data, broad_universe_data, selected)
-        market_data["scanner_status"] = "broad_generated"
-        market_data["scanner_mode"] = "broad_market"
-        market_data["broad_candidate_count"] = len(liquid_symbols)
-        logger.info(
-            "Broad market scanner considered %s liquid candidates and selected %s: %s.",
-            len(liquid_symbols),
-            len(selected),
-            ", ".join(candidate.symbol for candidate in selected[:5]),
-        )
-        return market_data
+            stage = "applying liquidity filters"
+            logger.info("Broad scanner: applying liquidity filters.")
+            liquid_symbols = []
+            for symbol in candidate_symbols:
+                stage = "market data collection"
+                symbol_data = self._empty_market_data([symbol])
+                self._collect_market_data_for_symbols([symbol], symbol_data)
+                indicators = symbol_data["market_intelligence"].get(symbol, {})
+                if not indicators:
+                    continue
+
+                stage = "applying liquidity filters"
+                if not passes_broad_liquidity_filters(
+                    indicators,
+                    self.settings.min_stock_price,
+                    self.settings.min_average_volume,
+                ):
+                    continue
+
+                liquid_symbols.append(symbol)
+                broad_universe_data["prices"].update(symbol_data["prices"])
+                broad_universe_data["market_intelligence"].update(symbol_data["market_intelligence"])
+                if len(liquid_symbols) >= self.settings.broad_market_max_symbols:
+                    break
+            logger.info("Broad scanner: %s symbols remain after liquidity filters.", len(liquid_symbols))
+
+            stage = "beginning ranking"
+            logger.info("Broad scanner: beginning ranking.")
+            scanner = DynamicWatchlistScanner(self.settings.watchlist_size)
+            selected = scanner.rank(liquid_symbols, broad_universe_data["market_intelligence"])
+            if not selected:
+                raise RuntimeError("Broad scanner returned no candidates.")
+
+            stage = "finalizing watchlist"
+            self._copy_selected_watchlist(market_data, broad_universe_data, selected)
+            market_data["scanner_status"] = "broad_generated"
+            market_data["scanner_mode"] = "broad_market"
+            market_data["broad_candidate_count"] = len(liquid_symbols)
+            logger.info("Broad scanner: final watchlist size is %s.", len(selected))
+            logger.info(
+                "Broad scanner: top selected symbols: %s.",
+                ", ".join(candidate.symbol for candidate in selected[:10]),
+            )
+            return market_data
+        except Exception as exc:
+            setattr(exc, "broad_scanner_stage", stage)
+            logger.warning("Broad scanner failed during %s.", stage)
+            logger.warning("Exception: %s.", exc.__class__.__name__)
+            logger.warning("Message: %s.", self._safe_exception_message(exc))
+            raise
 
     def _empty_market_data(self, symbols: list[str]) -> dict[str, Any]:
         return {
@@ -350,6 +380,10 @@ class BrokerClient:
                 seen.add(normalized_symbol)
                 deduped.append(normalized_symbol)
         return deduped
+
+    def _safe_exception_message(self, exc: Exception) -> str:
+        message = str(exc).strip()
+        return message if message else "<empty>"
 
     def _analysis_symbols(self) -> list[str]:
         return self.settings.allowed_symbols

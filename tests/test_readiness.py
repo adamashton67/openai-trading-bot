@@ -1459,6 +1459,43 @@ def test_broad_market_scan_enabled_builds_final_watchlist():
     assert len(snapshot.market_data["dynamic_watchlist"]) == 2
 
 
+def test_broad_market_scan_logs_major_stages(caplog):
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            broad_market_scan_enabled=True,
+            broad_market_max_symbols=3,
+            min_average_volume=10000,
+            watchlist_size=2,
+            allowed_symbols=["AAPL", "MSFT", "NVDA"],
+        ),
+        broker_factory=lambda config: MockDataBroker(
+            assets=[
+                types.SimpleNamespace(symbol="AAPL", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+                types.SimpleNamespace(symbol="MSFT", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+                types.SimpleNamespace(symbol="NVDA", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+            ],
+            daily_volumes={"AAPL": 900000, "MSFT": 800000, "NVDA": 700000},
+        ),
+    )
+
+    with caplog.at_level(logging.INFO, logger="broker"):
+        broker.connect()
+        broker.collect_snapshot()
+
+    assert "Broad scanner: starting broad market scan." in caplog.text
+    assert "Broad scanner: fetching tradable assets." in caplog.text
+    assert "Broad scanner: fetched 3 assets." in caplog.text
+    assert "Broad scanner: filtering tradable US equities." in caplog.text
+    assert "Broad scanner: 3 symbols remain after asset filters." in caplog.text
+    assert "Broad scanner: collecting market data." in caplog.text
+    assert "Broad scanner: applying liquidity filters." in caplog.text
+    assert "Broad scanner: 3 symbols remain after liquidity filters." in caplog.text
+    assert "Broad scanner: beginning ranking." in caplog.text
+    assert "Broad scanner: final watchlist size is 2." in caplog.text
+    assert "Broad scanner: top selected symbols:" in caplog.text
+
+
 def test_broad_scan_context_only_contains_final_watchlist():
     broker = BrokerClient(
         make_settings(
@@ -1565,6 +1602,32 @@ def test_broad_market_scan_failure_falls_back_to_scanner_v1():
     assert snapshot.market_data["scanner_status"] == "generated"
     assert snapshot.market_data["scanner_mode"] == "configured_universe"
     assert set(snapshot.market_data["symbols"]).issubset({"AAPL", "MSFT"})
+
+
+def test_broad_market_scan_failure_logs_stage_class_and_message(caplog):
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            broad_market_scan_enabled=True,
+            scanner_universe=["AAPL", "MSFT"],
+            allowed_symbols=["AAPL", "MSFT"],
+            watchlist_size=2,
+        ),
+        broker_factory=lambda config: MockDataBroker(raise_assets=True),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="broker"):
+        broker.connect()
+        snapshot = broker.collect_snapshot()
+
+    assert snapshot.market_data["broad_scan_failed"] is True
+    assert snapshot.market_data["scanner_status"] == "generated"
+    assert "Broad scanner failed during fetching tradable assets." in caplog.text
+    assert "Exception: RuntimeError." in caplog.text
+    assert "Message: asset list unavailable." in caplog.text
+    assert "Broad market scanner failed safely during fetching tradable assets." in caplog.text
+    assert "Broad scanner exception class: RuntimeError." in caplog.text
+    assert "Broad scanner exception message: asset list unavailable." in caplog.text
 
 
 def test_broad_and_configured_scanner_failure_falls_back_to_static(monkeypatch):
