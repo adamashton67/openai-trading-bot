@@ -50,6 +50,7 @@ def make_settings(**overrides):
         "dynamic_watchlist_enabled": False,
         "broad_market_scan_enabled": False,
         "broad_market_max_symbols": 1000,
+        "max_scanner_candidates_after_filters": 1000,
         "min_stock_price": 5,
         "min_average_volume": 500000,
         "exclude_etfs": True,
@@ -124,6 +125,7 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
         "DYNAMIC_WATCHLIST_ENABLED",
         "BROAD_MARKET_SCAN_ENABLED",
         "BROAD_MARKET_MAX_SYMBOLS",
+        "MAX_SCANNER_CANDIDATES_AFTER_FILTERS",
         "MIN_STOCK_PRICE",
         "MIN_AVERAGE_VOLUME",
         "EXCLUDE_ETFS",
@@ -146,6 +148,7 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
     assert settings.dynamic_watchlist_enabled is False
     assert settings.broad_market_scan_enabled is False
     assert settings.broad_market_max_symbols == 1000
+    assert settings.max_scanner_candidates_after_filters == 1000
     assert settings.min_stock_price == 5
     assert settings.min_average_volume == 500000
     assert settings.exclude_etfs is True
@@ -165,6 +168,7 @@ def test_config_loading_reads_environment(monkeypatch):
     monkeypatch.setenv("DYNAMIC_WATCHLIST_ENABLED", "true")
     monkeypatch.setenv("BROAD_MARKET_SCAN_ENABLED", "true")
     monkeypatch.setenv("BROAD_MARKET_MAX_SYMBOLS", "50")
+    monkeypatch.setenv("MAX_SCANNER_CANDIDATES_AFTER_FILTERS", "25")
     monkeypatch.setenv("MIN_STOCK_PRICE", "10")
     monkeypatch.setenv("MIN_AVERAGE_VOLUME", "750000")
     monkeypatch.setenv("EXCLUDE_ETFS", "false")
@@ -185,6 +189,7 @@ def test_config_loading_reads_environment(monkeypatch):
     assert settings.dynamic_watchlist_enabled is True
     assert settings.broad_market_scan_enabled is True
     assert settings.broad_market_max_symbols == 50
+    assert settings.max_scanner_candidates_after_filters == 25
     assert settings.min_stock_price == 10
     assert settings.min_average_volume == 750000
     assert settings.exclude_etfs is False
@@ -1300,6 +1305,41 @@ def test_broad_asset_filter_excludes_inactive_untradable_otc_and_etf():
     assert all(not is_broad_scan_asset_candidate(asset) for asset in bad_assets)
 
 
+def test_broad_asset_filter_excludes_noisy_symbols_and_instruments():
+    bad_assets = [
+        types.SimpleNamespace(symbol="BRK.B", status="active", tradable=True, asset_class="us_equity", exchange="NYSE"),
+        types.SimpleNamespace(symbol="ABC/WS", status="active", tradable=True, asset_class="us_equity", exchange="NYSE"),
+        types.SimpleNamespace(symbol="LONGER", status="active", tradable=True, asset_class="us_equity", exchange="NYSE"),
+        types.SimpleNamespace(symbol="FDRV", status="active", tradable=True, asset_class="us_equity", exchange="ARCA", name="Fidelity Electric Vehicles ETF"),
+        types.SimpleNamespace(symbol="ABCU", status="active", tradable=True, asset_class="us_equity", exchange="NYSE", name="Example Acquisition Units"),
+        types.SimpleNamespace(symbol="ABCR", status="active", tradable=True, asset_class="us_equity", exchange="NYSE", name="Example Rights"),
+        types.SimpleNamespace(symbol="PREF", status="active", tradable=True, asset_class="us_equity", exchange="NYSE", name="Example Preferred Shares"),
+    ]
+    good_asset = types.SimpleNamespace(
+        symbol="PLTR",
+        status="active",
+        tradable=True,
+        asset_class="us_equity",
+        exchange="NYSE",
+    )
+
+    assert all(not is_broad_scan_asset_candidate(asset) for asset in bad_assets)
+    assert is_broad_scan_asset_candidate(good_asset) is True
+
+
+def test_broad_asset_filter_allows_long_symbol_when_explicitly_allowed():
+    asset = types.SimpleNamespace(
+        symbol="LONGER",
+        status="active",
+        tradable=True,
+        asset_class="us_equity",
+        exchange="NYSE",
+    )
+
+    assert is_broad_scan_asset_candidate(asset) is False
+    assert is_broad_scan_asset_candidate(asset, explicit_allowed_symbols=["LONGER"]) is True
+
+
 def test_broad_asset_filter_keeps_realistic_alpaca_field_shapes():
     enum_like_asset = types.SimpleNamespace(
         symbol="PLTR",
@@ -1572,6 +1612,8 @@ def test_broad_market_scan_logs_major_stages(caplog):
     assert "Broad scanner: 3 symbols remain after asset filters." in caplog.text
     assert "Broad scanner: collecting market data." in caplog.text
     assert "Broad scanner: applying liquidity filters." in caplog.text
+    assert "Broad scanner: 3 symbols remain after price filters." in caplog.text
+    assert "Broad scanner: capped 3 symbols for indicator calculation." in caplog.text
     assert "Broad scanner: 3 symbols remain after liquidity filters." in caplog.text
     assert "Broad scanner: beginning ranking." in caplog.text
     assert "Broad scanner: final watchlist size is 2." in caplog.text
@@ -1701,6 +1743,67 @@ def test_broad_market_scan_keeps_realistic_active_tradable_equities():
     assert snapshot.market_data["scanner_status"] == "broad_generated"
     assert set(snapshot.market_data["symbols"]) == {"PLTR", "NVDA"}
     assert snapshot.market_data["broad_candidate_count"] == 2
+
+
+def test_broad_market_scan_applies_candidate_cap_before_indicators():
+    assets = [
+        types.SimpleNamespace(symbol="AAPL", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ", average_volume=900000),
+        types.SimpleNamespace(symbol="MSFT", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ", average_volume=800000),
+        types.SimpleNamespace(symbol="NVDA", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ", average_volume=700000),
+        types.SimpleNamespace(symbol="AMD", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ", average_volume=600000),
+    ]
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            broad_market_scan_enabled=True,
+            broad_market_max_symbols=10,
+            max_scanner_candidates_after_filters=2,
+            min_average_volume=10000,
+            watchlist_size=2,
+            allowed_symbols=["AAPL", "MSFT", "NVDA", "AMD"],
+        ),
+        broker_factory=lambda config: MockDataBroker(
+            assets=assets,
+            daily_volumes={"AAPL": 900000, "MSFT": 800000, "NVDA": 700000, "AMD": 600000},
+        ),
+    )
+
+    broker.connect()
+    snapshot = broker.collect_snapshot()
+
+    assert snapshot.market_data["broad_price_filtered_count"] == 4
+    assert snapshot.market_data["broad_capped_candidate_count"] == 2
+    assert snapshot.market_data["broad_candidate_count"] == 2
+    assert len(snapshot.market_data["symbols"]) == 2
+
+
+def test_broad_market_scan_aggregates_insufficient_data_logs(caplog):
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            broad_market_scan_enabled=True,
+            min_average_volume=10000,
+            watchlist_size=2,
+            allowed_symbols=["AAPL", "MSFT", "SPY"],
+        ),
+        broker_factory=lambda config: MockDataBroker(
+            assets=[
+                types.SimpleNamespace(symbol="AAPL", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+                types.SimpleNamespace(symbol="MSFT", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+                types.SimpleNamespace(symbol="SPY", status="active", tradable=True, asset_class="us_equity", exchange="ARCA"),
+            ],
+            failing_symbols={"MSFT"},
+            daily_volumes={"AAPL": 900000, "MSFT": 800000, "SPY": 700000},
+        ),
+    )
+
+    with caplog.at_level(logging.INFO, logger="broker"):
+        broker.connect()
+        snapshot = broker.collect_snapshot()
+
+    assert snapshot.market_data["scanner_status"] == "broad_generated"
+    assert "Broad scanner: skipped 1 symbols due to insufficient data." in caplog.text
+    assert "Could not calculate market indicators for MSFT" not in caplog.text
 
 
 def test_broad_market_scan_failure_falls_back_to_scanner_v1():

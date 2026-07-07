@@ -101,6 +101,7 @@ DATABASE_PATH=/data/trading_bot.db
 | `DYNAMIC_WATCHLIST_ENABLED` | `false` | Enables the scanner-built analysis watchlist during each trading cycle. |
 | `BROAD_MARKET_SCAN_ENABLED` | `false` | Uses Alpaca tradable US equity assets for a broader scanner before selecting the final watchlist. |
 | `BROAD_MARKET_MAX_SYMBOLS` | `1000` | Maximum liquid broad-scan candidates evaluated before final ranking. |
+| `MAX_SCANNER_CANDIDATES_AFTER_FILTERS` | `1000` | Maximum broad-scan candidates sent into indicator calculation after asset and price filters. |
 | `MIN_STOCK_PRICE` | `5` | Minimum current price for broad-scan candidates. |
 | `MIN_AVERAGE_VOLUME` | `500000` | Minimum 20-day average volume for broad-scan candidates when available. |
 | `EXCLUDE_ETFS` | `true` | Excludes ETF-like assets from the broad scan where identifiable. |

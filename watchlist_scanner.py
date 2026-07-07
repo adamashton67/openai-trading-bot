@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any
 
 
@@ -148,10 +149,19 @@ def broad_asset_symbol(asset: Any) -> str:
     return str(getattr(asset, "symbol", "") or "").strip().upper()
 
 
-def is_broad_scan_asset_candidate(asset: Any, exclude_etfs: bool = True) -> bool:
+def is_broad_scan_asset_candidate(
+    asset: Any,
+    exclude_etfs: bool = True,
+    explicit_allowed_symbols: list[str] | None = None,
+) -> bool:
     """Return whether an Alpaca asset-like object is safe to consider."""
     symbol = broad_asset_symbol(asset)
     if not symbol:
+        return False
+    explicit_symbols = {value.upper() for value in explicit_allowed_symbols or []}
+    explicitly_allowed = symbol in explicit_symbols
+
+    if not explicitly_allowed and not re.fullmatch(r"[A-Z]{1,5}", symbol):
         return False
 
     status = _normalized_asset_field(getattr(asset, "status", ""))
@@ -178,6 +188,9 @@ def is_broad_scan_asset_candidate(asset: Any, exclude_etfs: bool = True) -> bool
 
     exchange = _normalized_asset_field(getattr(asset, "exchange", "")).upper()
     if exchange == "OTC":
+        return False
+
+    if not explicitly_allowed and _looks_like_non_common_equity(asset):
         return False
 
     if exclude_etfs and _looks_like_etf(asset):
@@ -207,13 +220,59 @@ def _looks_like_etf(asset: Any) -> bool:
     metadata_values = [
         getattr(asset, "asset_type", None),
         getattr(asset, "type", None),
+        getattr(asset, "name", None),
     ]
     attributes = getattr(asset, "attributes", None)
     if isinstance(attributes, (list, tuple, set)):
         metadata_values.extend(attributes)
 
     normalized_values = {_normalized_asset_field(value) for value in metadata_values if value}
-    return "etf" in normalized_values or "exchange_traded_fund" in normalized_values
+    normalized_parts = {
+        part
+        for value in normalized_values
+        for part in value.replace("-", "_").split("_")
+    }
+    return bool(
+        normalized_values
+        & {
+            "etf",
+            "exchange_traded_fund",
+            "exchange_traded_product",
+            "fund",
+        }
+        or "etf" in normalized_parts
+    )
+
+
+def _looks_like_non_common_equity(asset: Any) -> bool:
+    descriptors = [
+        getattr(asset, "asset_type", None),
+        getattr(asset, "type", None),
+        getattr(asset, "name", None),
+    ]
+    attributes = getattr(asset, "attributes", None)
+    if isinstance(attributes, (list, tuple, set)):
+        descriptors.extend(attributes)
+
+    text = " ".join(_normalized_asset_field(value) for value in descriptors if value)
+    excluded_terms = {
+        "warrant",
+        "warrants",
+        "unit",
+        "units",
+        "right",
+        "rights",
+        "preferred",
+        "preference",
+        "bond",
+        "bonds",
+        "note",
+        "notes",
+        "fund",
+        "funds",
+        "trust",
+    }
+    return any(term in text.split("_") or term in text.split() for term in excluded_terms)
 
 
 def _normalized_asset_field(value: Any) -> str:

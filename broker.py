@@ -275,7 +275,11 @@ class BrokerClient:
             candidate_symbols = [
                 broad_asset_symbol(asset)
                 for asset in assets
-                if is_broad_scan_asset_candidate(asset, exclude_etfs=self.settings.exclude_etfs)
+                if is_broad_scan_asset_candidate(
+                    asset,
+                    exclude_etfs=self.settings.exclude_etfs,
+                    explicit_allowed_symbols=self.settings.allowed_symbols,
+                )
             ]
             candidate_symbols = self._dedupe_symbols(candidate_symbols)
             logger.info("Broad scanner: %s symbols remain after asset filters.", len(candidate_symbols))
@@ -284,33 +288,81 @@ class BrokerClient:
 
             stage = "beginning market data collection"
             logger.info("Broad scanner: collecting market data.")
-            broad_universe_data = self._empty_market_data(candidate_symbols)
 
             stage = "applying liquidity filters"
             logger.info("Broad scanner: applying liquidity filters.")
-            liquid_symbols = []
+            preliminary_candidates = []
+            missing_price_symbols = []
             for symbol in candidate_symbols:
-                stage = "market data collection"
-                symbol_data = self._empty_market_data([symbol])
-                self._collect_market_data_for_symbols([symbol], symbol_data)
-                indicators = symbol_data["market_intelligence"].get(symbol, {})
-                if not indicators:
+                price = self._safe_last_price(symbol)
+                if price is None:
+                    missing_price_symbols.append(symbol)
+                    continue
+                if price < self.settings.min_stock_price:
                     continue
 
-                stage = "applying liquidity filters"
+                asset_volume = self._asset_volume_for_symbol(assets, symbol)
+                if asset_volume is not None and asset_volume < self.settings.min_average_volume:
+                    continue
+
+                preliminary_candidates.append(
+                    {
+                        "symbol": symbol,
+                        "price": price,
+                        "volume": asset_volume,
+                    }
+                )
+
+            logger.info("Broad scanner: %s symbols remain after price filters.", len(preliminary_candidates))
+            market_data["broad_price_filtered_count"] = len(preliminary_candidates)
+            if missing_price_symbols:
+                logger.info(
+                    "Broad scanner: skipped %s symbols with missing recent price data.",
+                    len(missing_price_symbols),
+                )
+
+            capped_candidates = self._cap_broad_candidates(preliminary_candidates)
+            market_data["broad_capped_candidate_count"] = len(capped_candidates)
+            logger.info(
+                "Broad scanner: capped %s symbols for indicator calculation.",
+                len(capped_candidates),
+            )
+
+            capped_symbols = [candidate["symbol"] for candidate in capped_candidates]
+            broad_universe_data = self._empty_market_data(capped_symbols)
+            for candidate in capped_candidates:
+                broad_universe_data["prices"][candidate["symbol"]] = {
+                    "last_price": candidate["price"],
+                }
+
+            self._collect_market_data_for_symbols(
+                capped_symbols,
+                broad_universe_data,
+                warn_on_missing=False,
+            )
+
+            liquid_symbols = []
+            insufficient_data_symbols = []
+            for symbol in capped_symbols:
+                indicators = broad_universe_data["market_intelligence"].get(symbol, {})
+                if not indicators:
+                    insufficient_data_symbols.append(symbol)
+                    continue
                 if not passes_broad_liquidity_filters(
                     indicators,
                     self.settings.min_stock_price,
                     self.settings.min_average_volume,
                 ):
                     continue
-
                 liquid_symbols.append(symbol)
-                broad_universe_data["prices"].update(symbol_data["prices"])
-                broad_universe_data["market_intelligence"].update(symbol_data["market_intelligence"])
-                if len(liquid_symbols) >= self.settings.broad_market_max_symbols:
-                    break
+
             logger.info("Broad scanner: %s symbols remain after liquidity filters.", len(liquid_symbols))
+            skipped_count = len(insufficient_data_symbols)
+            if skipped_count:
+                logger.info(
+                    "Broad scanner: skipped %s symbols due to insufficient data.",
+                    skipped_count,
+                )
 
             stage = "beginning ranking"
             logger.info("Broad scanner: beginning ranking.")
@@ -427,20 +479,30 @@ class BrokerClient:
             return [self.settings.allowed_symbols[0]]
         return ["SPY"]
 
-    def _collect_market_data_for_symbols(self, symbols: list[str], market_data: dict[str, Any]) -> None:
+    def _collect_market_data_for_symbols(
+        self,
+        symbols: list[str],
+        market_data: dict[str, Any],
+        warn_on_missing: bool = True,
+    ) -> dict[str, int]:
+        stats = {"missing_prices": 0, "price_failures": 0, "indicator_failures": 0}
         for symbol in symbols:
             normalized_symbol = symbol.upper()
             try:
                 latest_price = self._get_last_price(normalized_symbol)
                 market_data["prices"][normalized_symbol] = {"last_price": latest_price}
                 if latest_price is None:
-                    logger.warning("Latest price for %s is missing.", normalized_symbol)
+                    stats["missing_prices"] += 1
+                    if warn_on_missing:
+                        logger.warning("Latest price for %s is missing.", normalized_symbol)
             except Exception as exc:
-                logger.warning(
-                    "Could not collect latest price for %s: %s.",
-                    normalized_symbol,
-                    exc.__class__.__name__,
-                )
+                stats["price_failures"] += 1
+                if warn_on_missing:
+                    logger.warning(
+                        "Could not collect latest price for %s: %s.",
+                        normalized_symbol,
+                        exc.__class__.__name__,
+                    )
 
             try:
                 minute_bars = self._get_historical_bars(normalized_symbol, length=120, timestep="minute")
@@ -450,11 +512,59 @@ class BrokerClient:
                     indicators["current_price"] = market_data["prices"].get(normalized_symbol, {}).get("last_price")
                 market_data["market_intelligence"][normalized_symbol] = indicators
             except Exception as exc:
-                logger.warning(
-                    "Could not calculate market indicators for %s: %s.",
-                    normalized_symbol,
-                    exc.__class__.__name__,
-                )
+                stats["indicator_failures"] += 1
+                if warn_on_missing:
+                    logger.warning(
+                        "Could not calculate market indicators for %s: %s.",
+                        normalized_symbol,
+                        exc.__class__.__name__,
+                    )
+        return stats
+
+    def _safe_last_price(self, symbol: str) -> float | None:
+        try:
+            return self._get_last_price(symbol)
+        except Exception:
+            return None
+
+    def _asset_volume_for_symbol(self, assets: list[Any], symbol: str) -> float | None:
+        for asset in assets:
+            if broad_asset_symbol(asset) != symbol:
+                continue
+            for field_name in (
+                "average_volume",
+                "avg_volume",
+                "volume",
+                "last_volume",
+                "recent_volume",
+            ):
+                value = self._to_float(getattr(asset, field_name, None))
+                if value is not None:
+                    return value
+        return None
+
+    def _cap_broad_candidates(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        cap = max(
+            1,
+            min(
+                self.settings.broad_market_max_symbols,
+                self.settings.max_scanner_candidates_after_filters,
+            ),
+        )
+        ranked = sorted(
+            candidates,
+            key=lambda candidate: (
+                -self._candidate_dollar_volume(candidate),
+                -(self._to_float(candidate.get("volume")) or 0),
+                str(candidate.get("symbol", "")),
+            ),
+        )
+        return ranked[:cap]
+
+    def _candidate_dollar_volume(self, candidate: dict[str, Any]) -> float:
+        price = self._to_float(candidate.get("price")) or 0
+        volume = self._to_float(candidate.get("volume")) or 0
+        return price * volume
 
     def _get_last_price(self, symbol: str) -> float | None:
         from lumibot.entities import Asset

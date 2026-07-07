@@ -54,6 +54,7 @@ class Settings:
     dynamic_watchlist_enabled: bool
     broad_market_scan_enabled: bool
     broad_market_max_symbols: int
+    max_scanner_candidates_after_filters: int
     min_stock_price: float
     min_average_volume: float
     exclude_etfs: bool
@@ -106,6 +107,9 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
             default=False,
         ),
         broad_market_max_symbols=int(os.getenv("BROAD_MARKET_MAX_SYMBOLS", "1000")),
+        max_scanner_candidates_after_filters=int(
+            os.getenv("MAX_SCANNER_CANDIDATES_AFTER_FILTERS", "1000")
+        ),
         min_stock_price=float(os.getenv("MIN_STOCK_PRICE", "5")),
         min_average_volume=float(os.getenv("MIN_AVERAGE_VOLUME", "500000")),
         exclude_etfs=_parse_bool(os.getenv("EXCLUDE_ETFS"), default=True),
