@@ -55,9 +55,8 @@ class Settings:
     broad_market_scan_enabled: bool
     broad_market_max_symbols: int
     max_scanner_candidates_after_filters: int
-    broad_scan_batch_size: int
-    broad_scan_max_requests_per_cycle: int
-    broad_scan_batch_timeout_seconds: float
+    alpaca_data_feed: str
+    broad_scan_data_batch_size: int
     min_stock_price: float
     min_average_volume: float
     exclude_etfs: bool
@@ -113,13 +112,8 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         max_scanner_candidates_after_filters=int(
             os.getenv("MAX_SCANNER_CANDIDATES_AFTER_FILTERS", "1000")
         ),
-        broad_scan_batch_size=int(os.getenv("BROAD_SCAN_BATCH_SIZE", "100")),
-        broad_scan_max_requests_per_cycle=int(
-            os.getenv("BROAD_SCAN_MAX_REQUESTS_PER_CYCLE", "20")
-        ),
-        broad_scan_batch_timeout_seconds=float(
-            os.getenv("BROAD_SCAN_BATCH_TIMEOUT_SECONDS", "10")
-        ),
+        alpaca_data_feed=os.getenv("ALPACA_DATA_FEED", "iex"),
+        broad_scan_data_batch_size=int(os.getenv("BROAD_SCAN_DATA_BATCH_SIZE", "200")),
         min_stock_price=float(os.getenv("MIN_STOCK_PRICE", "5")),
         min_average_volume=float(os.getenv("MIN_AVERAGE_VOLUME", "500000")),
         exclude_etfs=_parse_bool(os.getenv("EXCLUDE_ETFS"), default=True),

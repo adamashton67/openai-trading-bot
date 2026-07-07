@@ -102,9 +102,8 @@ DATABASE_PATH=/data/trading_bot.db
 | `BROAD_MARKET_SCAN_ENABLED` | `false` | Uses Alpaca tradable US equity assets for a broader scanner before selecting the final watchlist. |
 | `BROAD_MARKET_MAX_SYMBOLS` | `1000` | Maximum liquid broad-scan candidates evaluated before final ranking. |
 | `MAX_SCANNER_CANDIDATES_AFTER_FILTERS` | `1000` | Maximum broad-scan candidates sent into indicator calculation after asset and price filters. |
-| `BROAD_SCAN_BATCH_SIZE` | `100` | Symbols requested per broad-scan batch market data call. |
-| `BROAD_SCAN_MAX_REQUESTS_PER_CYCLE` | `20` | Maximum broad-scan batch market data requests before falling back for the cycle. |
-| `BROAD_SCAN_BATCH_TIMEOUT_SECONDS` | `10` | Per-batch timeout for broad-scan market data calls. Timed-out batches are skipped safely. |
+| `ALPACA_DATA_FEED` | `iex` | Alpaca market data feed for broad scanner bars. |
+| `BROAD_SCAN_DATA_BATCH_SIZE` | `200` | Symbols requested per native Alpaca broad-scan bar batch. |
 | `MIN_STOCK_PRICE` | `5` | Minimum current price for broad-scan candidates. |
 | `MIN_AVERAGE_VOLUME` | `500000` | Minimum 20-day average volume for broad-scan candidates when available. |
 | `EXCLUDE_ETFS` | `true` | Excludes ETF-like assets from the broad scan where identifiable. |
@@ -161,7 +160,7 @@ When `INCLUDE_HISTORY_CONTEXT=true`, recent decisions, executions, and portfolio
 
 Dynamic watchlists are disabled by default. When `DYNAMIC_WATCHLIST_ENABLED=true`, the bot scans `SCANNER_UNIVERSE`, ranks symbols by volume, gain/loss movement, relative volume, volatility, and momentum, then sends the final capped watchlist to OpenAI. The risk manager and broker safety gates still apply, so the scanner cannot bypass configured trading controls.
 
-When `BROAD_MARKET_SCAN_ENABLED=true`, the scanner first pulls tradable US equity assets from Alpaca, filters out inactive, untradable, OTC, ETF-like, low-price, and low-volume candidates where possible, then ranks up to `BROAD_MARKET_MAX_SYMBOLS` liquid symbols. Only the final `WATCHLIST_SIZE` symbols and their indicators are sent to OpenAI. If broad scanning fails, the bot falls back to scanner v1; if that fails, it falls back to the static allowed symbols.
+When `BROAD_MARKET_SCAN_ENABLED=true`, the scanner first pulls tradable US equity assets from Alpaca, filters out inactive, untradable, OTC, ETF-like, low-price, and low-volume candidates where possible, then fetches native Alpaca bars in batches to rank candidates. Only the final `WATCHLIST_SIZE` symbols and their indicators are sent to OpenAI. If broad scanning fails, the bot falls back to scanner v1; if that fails, it falls back to the static allowed symbols.
 
 To test OpenAI with fake paper-trading context:
 

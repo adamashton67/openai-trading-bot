@@ -1,10 +1,8 @@
 """Broker integration layer for Lumibot and Alpaca Paper Trading."""
 
 import logging
-import signal
-import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from config import Settings
@@ -13,7 +11,6 @@ from watchlist_scanner import (
     DynamicWatchlistScanner,
     broad_asset_symbol,
     is_broad_scan_asset_candidate,
-    passes_broad_liquidity_filters,
 )
 
 
@@ -79,12 +76,15 @@ class BrokerClient:
         broker_factory: Any | None = None,
         order_factory: Any | None = None,
         execution_strategy_factory: Any | None = None,
+        data_client_factory: Any | None = None,
     ) -> None:
         self.settings = settings
         self._broker_factory = broker_factory
         self._order_factory = order_factory
         self._execution_strategy_factory = execution_strategy_factory
+        self._data_client_factory = data_client_factory
         self._execution_strategy = None
+        self._alpaca_data_client = None
         self._broker = None
         self._last_snapshot: BrokerSnapshot | None = None
         self._broker_available = True
@@ -290,113 +290,109 @@ class BrokerClient:
 
             stage = "beginning market data collection"
             logger.info("Broad scanner: collecting market data.")
+            candidate_symbols = self._cap_symbols_before_native_data(candidate_symbols, assets)
+            market_data["broad_capped_candidate_count"] = len(candidate_symbols)
+            logger.info(
+                "Broad scanner: capped %s symbols before native Alpaca data calls.",
+                len(candidate_symbols),
+            )
+            logger.info(
+                "Broad scanner: Alpaca native data batch size is %s.",
+                self.settings.broad_scan_data_batch_size,
+            )
 
             stage = "applying liquidity filters"
             logger.info("Broad scanner: applying liquidity filters.")
-            logger.info("Broad scanner: batch size is %s.", self.settings.broad_scan_batch_size)
-            preliminary_candidates = []
-            missing_price_symbols = []
-            batch_price_result = self._fetch_broad_latest_prices(candidate_symbols)
-            market_data["broad_batch_request_count"] = batch_price_result["request_count"]
-            market_data["broad_batch_timeout_count"] = batch_price_result["timeout_count"]
-            logger.info(
-                "Broad scanner: processed %s symbols across %s batch requests.",
-                batch_price_result["symbols_processed"],
-                batch_price_result["request_count"],
+            daily_bars_result = self._fetch_native_stock_bars(
+                candidate_symbols,
+                timeframe="day",
+                limit=60,
             )
+            market_data["broad_bar_request_count"] = daily_bars_result["request_count"]
             logger.info(
-                "Broad scanner: skipped %s symbols during batched price fetch.",
-                batch_price_result["symbols_skipped"],
+                "Broad scanner: made %s native daily bar requests.",
+                daily_bars_result["request_count"],
             )
 
+            preliminary_intelligence = {}
+            low_price_count = 0
+            low_volume_count = 0
+            missing_bar_count = 0
             for symbol in candidate_symbols:
-                price = batch_price_result["prices"].get(symbol)
-                if price is None:
-                    missing_price_symbols.append(symbol)
-                    continue
-                if price < self.settings.min_stock_price:
+                daily_bars = daily_bars_result["bars"].get(symbol)
+                if daily_bars is None:
+                    missing_bar_count += 1
                     continue
 
-                asset_volume = self._asset_volume_for_symbol(assets, symbol)
-                if asset_volume is not None and asset_volume < self.settings.min_average_volume:
+                indicators = calculate_market_indicators(symbol, None, daily_bars)
+                price = self._to_float(indicators.get("current_price"))
+                if price is None or price < self.settings.min_stock_price:
+                    low_price_count += 1
                     continue
 
-                preliminary_candidates.append(
-                    {
-                        "symbol": symbol,
-                        "price": price,
-                        "volume": asset_volume,
-                    }
-                )
+                average_volume = self._to_float(indicators.get("average_20d_volume"))
+                if average_volume is None or average_volume < self.settings.min_average_volume:
+                    low_volume_count += 1
+                    continue
 
-            logger.info("Broad scanner: %s symbols remain after price filters.", len(preliminary_candidates))
-            market_data["broad_price_filtered_count"] = len(preliminary_candidates)
-            if missing_price_symbols:
-                logger.info(
-                    "Broad scanner: skipped %s symbols with missing recent price data.",
-                    len(missing_price_symbols),
-                )
+                preliminary_intelligence[symbol] = indicators
 
-            capped_candidates = self._cap_broad_candidates(preliminary_candidates)
-            market_data["broad_capped_candidate_count"] = len(capped_candidates)
+            logger.info("Broad scanner: %s symbols have usable native daily data.", len(preliminary_intelligence))
             logger.info(
-                "Broad scanner: capped %s symbols for indicator calculation.",
-                len(capped_candidates),
+                "Broad scanner: %s symbols remain after liquidity filters.",
+                len(preliminary_intelligence),
             )
-
-            capped_symbols = [candidate["symbol"] for candidate in capped_candidates]
-            broad_universe_data = self._empty_market_data(capped_symbols)
-            for candidate in capped_candidates:
-                broad_universe_data["prices"][candidate["symbol"]] = {
-                    "last_price": candidate["price"],
-                }
-
-            self._collect_market_data_for_symbols(
-                capped_symbols,
-                broad_universe_data,
-                warn_on_missing=False,
-                collect_prices=False,
+            logger.info("Broad scanner: skipped %s symbols with missing bars.", missing_bar_count)
+            logger.info("Broad scanner: skipped %s symbols below minimum price.", low_price_count)
+            logger.info(
+                "Broad scanner: skipped %s symbols below minimum average volume.",
+                low_volume_count,
             )
-
-            liquid_symbols = []
-            insufficient_data_symbols = []
-            for symbol in capped_symbols:
-                indicators = broad_universe_data["market_intelligence"].get(symbol, {})
-                if not indicators:
-                    insufficient_data_symbols.append(symbol)
-                    continue
-                if not passes_broad_liquidity_filters(
-                    indicators,
-                    self.settings.min_stock_price,
-                    self.settings.min_average_volume,
-                ):
-                    continue
-                liquid_symbols.append(symbol)
-
-            logger.info("Broad scanner: %s symbols remain after liquidity filters.", len(liquid_symbols))
-            skipped_count = len(insufficient_data_symbols)
-            if skipped_count:
-                logger.info(
-                    "Broad scanner: skipped %s symbols due to insufficient data.",
-                    skipped_count,
-                )
+            market_data["broad_price_filtered_count"] = len(preliminary_intelligence)
 
             stage = "beginning ranking"
             logger.info("Broad scanner: beginning ranking.")
             scanner = DynamicWatchlistScanner(self.settings.watchlist_size)
-            selected = scanner.rank(liquid_symbols, broad_universe_data["market_intelligence"])
+            selected = scanner.rank(list(preliminary_intelligence), preliminary_intelligence)
             if not selected:
                 raise RuntimeError("Broad scanner returned no candidates.")
 
             stage = "finalizing watchlist"
+            final_symbols = [candidate.symbol for candidate in selected]
+            minute_bars_result = self._fetch_native_stock_bars(
+                final_symbols,
+                timeframe="minute",
+                limit=120,
+            )
+            market_data["broad_bar_request_count"] += minute_bars_result["request_count"]
+            logger.info(
+                "Broad scanner: made %s native minute bar requests for final symbols.",
+                minute_bars_result["request_count"],
+            )
+
+            broad_universe_data = self._empty_market_data(final_symbols)
+            for symbol in final_symbols:
+                daily_bars = daily_bars_result["bars"].get(symbol)
+                minute_bars = minute_bars_result["bars"].get(symbol)
+                indicators = calculate_market_indicators(symbol, minute_bars, daily_bars)
+                if indicators.get("current_price") is None:
+                    indicators = preliminary_intelligence[symbol]
+                broad_universe_data["market_intelligence"][symbol] = indicators
+                broad_universe_data["prices"][symbol] = {
+                    "last_price": indicators.get("current_price"),
+                }
+
             self._copy_selected_watchlist(market_data, broad_universe_data, selected)
             market_data["scanner_status"] = "broad_generated"
             market_data["scanner_mode"] = "broad_market"
-            market_data["broad_candidate_count"] = len(liquid_symbols)
+            market_data["broad_candidate_count"] = len(preliminary_intelligence)
             logger.info("Broad scanner: final watchlist size is %s.", len(selected))
             logger.info(
                 "Broad scanner: top selected symbols: %s.",
-                ", ".join(candidate.symbol for candidate in selected[:10]),
+                ", ".join(
+                    f"{candidate.symbol}({candidate.score}: {', '.join(candidate.reasons_added)})"
+                    for candidate in selected[:10]
+                ),
             )
             return market_data
         except Exception as exc:
@@ -456,158 +452,134 @@ class BrokerClient:
                 deduped.append(normalized_symbol)
         return deduped
 
-    def _fetch_broad_latest_prices(self, symbols: list[str]) -> dict[str, Any]:
-        batch_size = max(1, self.settings.broad_scan_batch_size)
-        max_requests = max(1, self.settings.broad_scan_max_requests_per_cycle)
-        prices: dict[str, float] = {}
+    def _cap_symbols_before_native_data(self, symbols: list[str], assets: list[Any]) -> list[str]:
+        cap = max(
+            1,
+            min(
+                self.settings.broad_market_max_symbols,
+                self.settings.max_scanner_candidates_after_filters,
+            ),
+        )
+        ranked = sorted(
+            symbols,
+            key=lambda symbol: (
+                -(self._asset_volume_for_symbol(assets, symbol) or 0),
+                symbol,
+            ),
+        )
+        return ranked[:cap]
+
+    def _fetch_native_stock_bars(
+        self,
+        symbols: list[str],
+        timeframe: str,
+        limit: int,
+    ) -> dict[str, Any]:
+        batch_size = max(1, self.settings.broad_scan_data_batch_size)
+        client = self._get_alpaca_data_client()
+        bars: dict[str, Any] = {}
         request_count = 0
-        processed_count = 0
-        timeout_count = 0
-
         for start in range(0, len(symbols), batch_size):
-            if request_count >= max_requests:
-                logger.info(
-                    "Broad scanner: max batch request cap reached at %s requests.",
-                    request_count,
-                )
-                break
-
             batch = symbols[start : start + batch_size]
             request_count += 1
-            processed_count += len(batch)
             logger.info(
-                "Broad scanner: requesting batch %s with %s symbols.",
+                "Broad scanner: requesting native %s bars batch %s with %s symbols.",
+                timeframe,
                 request_count,
                 len(batch),
             )
-            try:
-                batch_prices = self._get_latest_prices_batch(batch)
-                logger.info(
-                    "Broad scanner: completed batch %s with %s prices.",
-                    request_count,
-                    len(batch_prices),
-                )
-            except Exception as exc:
-                if self._is_rate_limit_error(exc):
-                    logger.warning(
-                        "Broad scanner: Alpaca rate limit hit after %s batch requests.",
-                        request_count,
-                    )
-                    raise
-                if isinstance(exc, TimeoutError):
-                    timeout_count += 1
-                    logger.warning(
-                        "Broad scanner: batch %s timed out after %.2f seconds.",
-                        request_count,
-                        self.settings.broad_scan_batch_timeout_seconds,
-                    )
-                    continue
-                logger.info(
-                    "Broad scanner: skipped one price batch safely: %s.",
-                    exc.__class__.__name__,
-                )
-                continue
-
-            prices.update(batch_prices)
+            response = client.get_stock_bars(
+                self._build_stock_bars_request(batch, timeframe, limit)
+            )
+            parsed_bars = self._parse_native_bars_response(response)
+            logger.info(
+                "Broad scanner: completed native %s bars batch %s with %s symbols.",
+                timeframe,
+                request_count,
+                len(parsed_bars),
+            )
+            bars.update(parsed_bars)
 
         return {
-            "prices": prices,
+            "bars": bars,
             "request_count": request_count,
-            "timeout_count": timeout_count,
-            "symbols_processed": processed_count,
-            "symbols_skipped": max(0, processed_count - len(prices)),
         }
 
-    def _get_latest_prices_batch(self, symbols: list[str]) -> dict[str, float]:
-        data_source = getattr(self._broker, "data_source", None)
-        for owner in (data_source, self._broker, getattr(self._broker, "api", None)):
-            if owner is None:
-                continue
-            for method_name in (
-                "get_last_prices",
-                "get_latest_prices",
-                "get_latest_quotes",
-            ):
-                if not hasattr(owner, method_name):
-                    continue
-                raw_prices = self._call_batched_price_method(
-                    getattr(owner, method_name),
-                    symbols,
-                )
-                parsed_prices = self._parse_batched_price_response(raw_prices)
-                if parsed_prices:
-                    return parsed_prices
-        raise AttributeError("Broker does not expose batched latest price data.")
+    def _get_alpaca_data_client(self) -> Any:
+        if self._alpaca_data_client is not None:
+            return self._alpaca_data_client
 
-    def _call_batched_price_method(self, method: Any, symbols: list[str]) -> Any:
-        timeout_seconds = self.settings.broad_scan_batch_timeout_seconds
-        if timeout_seconds <= 0 or threading.current_thread() is not threading.main_thread():
-            return method(symbols)
+        broker_data_client = getattr(self._broker, "native_data_client", None)
+        if broker_data_client is not None:
+            self._alpaca_data_client = broker_data_client
+            return self._alpaca_data_client
 
-        previous_handler = signal.getsignal(signal.SIGALRM)
+        if self._data_client_factory is not None:
+            self._alpaca_data_client = self._data_client_factory()
+            return self._alpaca_data_client
 
-        def _timeout_handler(signum: int, frame: Any) -> None:
-            raise TimeoutError("Broad scanner batch market data request timed out.")
+        from alpaca.data.historical import StockHistoricalDataClient
 
-        try:
-            signal.signal(signal.SIGALRM, _timeout_handler)
-            signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
-            return method(symbols)
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            signal.signal(signal.SIGALRM, previous_handler)
+        self._alpaca_data_client = StockHistoricalDataClient(
+            api_key=self.settings.alpaca_api_key,
+            secret_key=self.settings.alpaca_secret_key,
+        )
+        return self._alpaca_data_client
 
-    def _parse_batched_price_response(self, response: Any) -> dict[str, float]:
+    def _build_stock_bars_request(self, symbols: list[str], timeframe: str, limit: int) -> Any:
+        from alpaca.data.enums import DataFeed
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+
+        end = datetime.now(timezone.utc)
+        start = end - (timedelta(days=90) if timeframe == "day" else timedelta(days=5))
+        return StockBarsRequest(
+            symbol_or_symbols=symbols,
+            timeframe=TimeFrame.Day if timeframe == "day" else TimeFrame.Minute,
+            start=start,
+            end=end,
+            limit=limit,
+            feed=DataFeed(self.settings.alpaca_data_feed),
+        )
+
+    def _parse_native_bars_response(self, response: Any) -> dict[str, Any]:
         if response is None:
             return {}
+
+        if hasattr(response, "df"):
+            return self._bars_from_dataframe(response.df)
 
         if hasattr(response, "data"):
             response = response.data
 
         if isinstance(response, dict):
-            items = response.items()
-        else:
-            items = []
+            return {str(symbol).upper(): bars for symbol, bars in response.items() if bars is not None}
 
-        prices: dict[str, float] = {}
-        for symbol, value in items:
-            normalized_symbol = str(symbol).upper()
-            price = self._extract_price(value)
-            if price is not None:
-                prices[normalized_symbol] = price
-        return prices
+        return {}
 
-    def _extract_price(self, value: Any) -> float | None:
-        if isinstance(value, dict):
-            for field_name in (
-                "price",
-                "last_price",
-                "ask_price",
-                "bid_price",
-                "ap",
-                "bp",
-                "close",
-            ):
-                price = self._to_float(value.get(field_name))
-                if price is not None and price > 0:
-                    return price
-            return None
+    def _bars_from_dataframe(self, df: Any) -> dict[str, Any]:
+        if df is None or getattr(df, "empty", True):
+            return {}
 
-        for field_name in (
-            "price",
-            "last_price",
-            "ask_price",
-            "bid_price",
-            "ap",
-            "bp",
-            "close",
-        ):
-            price = self._to_float(getattr(value, field_name, None))
-            if price is not None and price > 0:
-                return price
+        if hasattr(df.index, "names") and "symbol" in [str(name).lower() for name in df.index.names]:
+            symbol_level = [
+                index
+                for index, name in enumerate(df.index.names)
+                if str(name).lower() == "symbol"
+            ][0]
+            return {
+                str(symbol).upper(): symbol_df.reset_index(level=symbol_level, drop=True).reset_index()
+                for symbol, symbol_df in df.groupby(level=symbol_level)
+            }
 
-        price = self._to_float(value)
-        return price if price is not None and price > 0 else None
+        if "symbol" in [str(column).lower() for column in df.columns]:
+            symbol_column = next(column for column in df.columns if str(column).lower() == "symbol")
+            return {
+                str(symbol).upper(): symbol_df.drop(columns=[symbol_column])
+                for symbol, symbol_df in df.groupby(symbol_column)
+            }
+
+        return {}
 
     def _is_rate_limit_error(self, exc: Exception) -> bool:
         status_code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
