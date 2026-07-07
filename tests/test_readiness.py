@@ -1996,6 +1996,46 @@ def test_broad_market_scan_applies_candidate_cap_before_indicators():
     assert len(snapshot.market_data["symbols"]) == 2
 
 
+def test_broad_market_scan_quality_orders_symbols_before_cap(caplog):
+    assets = [
+        types.SimpleNamespace(symbol="AAAW", status="active", tradable=True, asset_class="us_equity", exchange="BATS", average_volume=1000),
+        types.SimpleNamespace(symbol="BBBU", status="active", tradable=True, asset_class="us_equity", exchange="BATS", average_volume=1000),
+        types.SimpleNamespace(symbol="CCCR", status="active", tradable=True, asset_class="us_equity", exchange="BATS", average_volume=1000),
+        types.SimpleNamespace(symbol="MSFT", status="active", tradable=True, asset_class="us_equity", exchange="NYSE", average_volume=800000),
+        types.SimpleNamespace(symbol="AAPL", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ", average_volume=900000),
+        types.SimpleNamespace(symbol="NVDA", status="active", tradable=True, asset_class="us_equity", exchange="ARCA", average_volume=700000),
+    ]
+    fake_broker = MockDataBroker(
+        assets=assets,
+        daily_volumes={"AAPL": 900000, "MSFT": 800000, "NVDA": 700000},
+    )
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            broad_market_scan_enabled=True,
+            max_scanner_candidates_after_filters=3,
+            broad_market_max_symbols=3,
+            min_average_volume=10000,
+            watchlist_size=2,
+            allowed_symbols=["AAPL", "MSFT", "NVDA"],
+        ),
+        broker_factory=lambda config: fake_broker,
+    )
+
+    with caplog.at_level(logging.INFO, logger="broker"):
+        broker.connect()
+        snapshot = broker.collect_snapshot()
+
+    daily_requests = [
+        request for request in fake_broker.native_data_client.requests if "day" in request["timeframe"].lower()
+    ]
+    assert daily_requests[0]["symbols"] == ["AAPL", "MSFT", "NVDA"]
+    assert snapshot.market_data["broad_capped_candidate_count"] == 3
+    assert set(snapshot.market_data["symbols"]).issubset({"AAPL", "MSFT", "NVDA"})
+    assert "Broad scanner: first 20 symbols before quality ordering/cap: AAAW, BBBU, CCCR, MSFT, AAPL, NVDA" in caplog.text
+    assert "Broad scanner: first 20 symbols after quality ordering/cap: AAPL, MSFT, NVDA" in caplog.text
+
+
 def test_broad_market_scan_uses_native_alpaca_data_not_lumibot_prices():
     fake_broker = MockDataBroker(
         assets=[
@@ -2061,7 +2101,7 @@ def test_broad_market_scan_native_data_batching_works():
     daily_requests = [
         request for request in fake_broker.native_data_client.requests if "day" in request["timeframe"].lower()
     ]
-    assert [request["symbols"] for request in daily_requests] == [["AAPL", "AMD"], ["MSFT", "NVDA"]]
+    assert [request["symbols"] for request in daily_requests] == [["AAPL", "MSFT"], ["NVDA", "AMD"]]
     assert snapshot.market_data["broad_price_filtered_count"] == 4
     assert len(snapshot.market_data["symbols"]) == 2
 

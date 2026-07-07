@@ -290,11 +290,19 @@ class BrokerClient:
 
             stage = "beginning market data collection"
             logger.info("Broad scanner: collecting market data.")
+            logger.info(
+                "Broad scanner: first 20 symbols before quality ordering/cap: %s.",
+                ", ".join(candidate_symbols[:20]) or "none",
+            )
             candidate_symbols = self._cap_symbols_before_native_data(candidate_symbols, assets)
             market_data["broad_capped_candidate_count"] = len(candidate_symbols)
             logger.info(
                 "Broad scanner: capped %s symbols before native Alpaca data calls.",
                 len(candidate_symbols),
+            )
+            logger.info(
+                "Broad scanner: first 20 symbols after quality ordering/cap: %s.",
+                ", ".join(candidate_symbols[:20]) or "none",
             )
             logger.info(
                 "Broad scanner: Alpaca native data batch size is %s.",
@@ -460,14 +468,96 @@ class BrokerClient:
                 self.settings.max_scanner_candidates_after_filters,
             ),
         )
+        asset_by_symbol = {broad_asset_symbol(asset): asset for asset in assets}
         ranked = sorted(
             symbols,
-            key=lambda symbol: (
-                -(self._asset_volume_for_symbol(assets, symbol) or 0),
+            key=lambda symbol: self._broad_asset_quality_sort_key(
                 symbol,
+                asset_by_symbol.get(symbol),
             ),
         )
         return ranked[:cap]
+
+    def _broad_asset_quality_sort_key(self, symbol: str, asset: Any | None) -> tuple[Any, ...]:
+        exchange_priority = {
+            "NASDAQ": 0,
+            "NYSE": 1,
+            "ARCA": 2,
+            "AMEX": 3,
+        }
+        exchange = self._safe_asset_field(getattr(asset, "exchange", "")) if asset is not None else ""
+        exchange_value = str(exchange).upper()
+        if "." in exchange_value:
+            exchange_value = exchange_value.rsplit(".", 1)[-1]
+        exchange_score = exchange_priority.get(exchange_value, 9)
+        known_priority = self._known_liquid_common_symbol_priority().get(symbol, 999)
+        known_score = 0 if known_priority != 999 else 1
+        odd_suffix_score = 1 if self._looks_like_odd_suffix_symbol(symbol) else 0
+        dollar_volume = self._asset_volume_for_symbol([asset], symbol) if asset is not None else None
+        return (
+            odd_suffix_score,
+            exchange_score,
+            known_score,
+            known_priority,
+            -(dollar_volume or 0),
+            len(symbol),
+            symbol,
+        )
+
+    def _looks_like_odd_suffix_symbol(self, symbol: str) -> bool:
+        if symbol in self._known_liquid_common_symbols():
+            return False
+        return symbol.endswith(("WS", "W", "U", "R"))
+
+    def _known_liquid_common_symbols(self) -> set[str]:
+        return set(self._known_liquid_common_symbol_priority())
+
+    def _known_liquid_common_symbol_priority(self) -> dict[str, int]:
+        symbols = [
+            "AAPL",
+            "MSFT",
+            "NVDA",
+            "AMZN",
+            "GOOGL",
+            "GOOG",
+            "META",
+            "TSLA",
+            "AMD",
+            "AVGO",
+            "NFLX",
+            "COST",
+            "CRM",
+            "ADBE",
+            "ORCL",
+            "INTC",
+            "UBER",
+            "SHOP",
+            "PLTR",
+            "JPM",
+            "BAC",
+            "WFC",
+            "GS",
+            "V",
+            "MA",
+            "HD",
+            "WMT",
+            "PG",
+            "KO",
+            "PEP",
+            "MRK",
+            "PFE",
+            "UNH",
+            "XOM",
+            "CVX",
+            "BA",
+            "CAT",
+            "GE",
+            "SPY",
+            "QQQ",
+            "IWM",
+            "DIA",
+        ]
+        return {symbol: index for index, symbol in enumerate(symbols)}
 
     def _fetch_native_stock_bars(
         self,
