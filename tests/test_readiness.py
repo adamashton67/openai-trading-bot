@@ -1638,7 +1638,15 @@ class MockNativeAlpacaDataClient:
             symbols = [symbols]
         symbols = [str(symbol).upper() for symbol in symbols]
         timeframe = str(request.timeframe)
-        self.requests.append({"symbols": symbols, "timeframe": timeframe})
+        self.requests.append(
+            {
+                "symbols": symbols,
+                "timeframe": timeframe,
+                "start": request.start,
+                "end": request.end,
+                "limit": getattr(request, "limit", None),
+            }
+        )
 
         bars = {}
         for symbol in symbols:
@@ -1830,7 +1838,8 @@ def test_broad_market_scan_logs_major_stages(caplog):
     assert "Broad scanner: applying liquidity filters." in caplog.text
     assert "Broad scanner: Alpaca native data batch size is 200." in caplog.text
     assert "Broad scanner: requesting native day bars batch 1 with 3 symbols." in caplog.text
-    assert "Broad scanner: completed native day bars batch 1 with 3 symbols." in caplog.text
+    assert "Broad scanner: native day bars request range" in caplog.text
+    assert "Broad scanner: completed native day bars batch 1; requested 3 symbols, returned 3." in caplog.text
     assert "Broad scanner: 3 symbols have usable native daily data." in caplog.text
     assert "Broad scanner: 3 symbols remain after liquidity filters." in caplog.text
     assert "Broad scanner: beginning ranking." in caplog.text
@@ -1908,7 +1917,7 @@ def test_broad_market_scan_filters_assets_price_and_volume():
             broad_market_scan_enabled=True,
             min_stock_price=5,
             min_average_volume=500000,
-            watchlist_size=5,
+            watchlist_size=1,
             allowed_symbols=["AAPL", "LOWP", "LOWV"],
         ),
         broker_factory=lambda config: MockDataBroker(
@@ -2071,6 +2080,8 @@ def test_broad_market_scan_uses_native_alpaca_data_not_lumibot_prices():
     assert [request["symbols"] for request in daily_requests] == [["AAPL", "MSFT"], ["NVDA"]]
     assert len(minute_requests) == 1
     assert snapshot.market_data["broad_bar_request_count"] == 3
+    assert all(request["limit"] is None for request in daily_requests + minute_requests)
+    assert all(request["start"] < request["end"] for request in daily_requests + minute_requests)
 
 
 def test_broad_market_scan_native_data_batching_works():
@@ -2106,6 +2117,27 @@ def test_broad_market_scan_native_data_batching_works():
     assert len(snapshot.market_data["symbols"]) == 2
 
 
+def test_native_bar_parser_extracts_multiple_symbols_from_data_mapping():
+    broker = BrokerClient(make_settings())
+    response = types.SimpleNamespace(
+        data={
+            "AAPL": [
+                types.SimpleNamespace(open=100, high=102, low=99, close=101, volume=1000),
+                types.SimpleNamespace(open=101, high=103, low=100, close=102, volume=1100),
+            ],
+            "MSFT": [
+                types.SimpleNamespace(open=200, high=202, low=198, close=201, volume=2000),
+            ],
+        }
+    )
+
+    parsed = broker._parse_native_bars_response(response)
+
+    assert set(parsed) == {"AAPL", "MSFT"}
+    assert parsed["AAPL"][0]["close"] == 101
+    assert parsed["MSFT"][0]["volume"] == 2000
+
+
 def test_broad_market_scan_native_data_failure_falls_back_to_scanner_v1(caplog):
     fake_broker = MockDataBroker(
         assets=[
@@ -2133,6 +2165,37 @@ def test_broad_market_scan_native_data_failure_falls_back_to_scanner_v1(caplog):
     assert snapshot.market_data["scanner_status"] == "generated"
     assert snapshot.market_data["scanner_mode"] == "configured_universe"
     assert "native data unavailable" in caplog.text
+
+
+def test_broad_market_scan_falls_back_when_watchlist_too_small(caplog):
+    fake_broker = MockDataBroker(
+        assets=[
+            types.SimpleNamespace(symbol="AAPL", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+            types.SimpleNamespace(symbol="MSFT", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+        ],
+        native_data_client=MockNativeAlpacaDataClient(missing_symbols={"MSFT"}),
+        daily_volumes={"AAPL": 900000, "MSFT": 800000},
+    )
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            broad_market_scan_enabled=True,
+            scanner_universe=["AAPL", "MSFT"],
+            allowed_symbols=["AAPL", "MSFT"],
+            watchlist_size=2,
+            min_average_volume=10000,
+        ),
+        broker_factory=lambda config: fake_broker,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="broker"):
+        broker.connect()
+        snapshot = broker.collect_snapshot()
+
+    assert snapshot.market_data["broad_scan_failed"] is True
+    assert snapshot.market_data["scanner_status"] == "generated"
+    assert snapshot.market_data["scanner_mode"] == "configured_universe"
+    assert "fewer symbols than WATCHLIST_SIZE" in caplog.text
 
 
 def test_broad_market_scan_aggregates_insufficient_data_logs(caplog):

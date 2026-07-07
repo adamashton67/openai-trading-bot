@@ -364,6 +364,10 @@ class BrokerClient:
             selected = scanner.rank(list(preliminary_intelligence), preliminary_intelligence)
             if not selected:
                 raise RuntimeError("Broad scanner returned no candidates.")
+            if len(selected) < self.settings.watchlist_size:
+                raise RuntimeError(
+                    "Broad scanner returned fewer symbols than WATCHLIST_SIZE."
+                )
 
             stage = "finalizing watchlist"
             final_symbols = [candidate.symbol for candidate in selected]
@@ -578,14 +582,20 @@ class BrokerClient:
                 request_count,
                 len(batch),
             )
-            response = client.get_stock_bars(
-                self._build_stock_bars_request(batch, timeframe, limit)
+            request = self._build_stock_bars_request(batch, timeframe, limit)
+            logger.info(
+                "Broad scanner: native %s bars request range %s to %s.",
+                timeframe,
+                request.start,
+                request.end,
             )
+            response = client.get_stock_bars(request)
             parsed_bars = self._parse_native_bars_response(response)
             logger.info(
-                "Broad scanner: completed native %s bars batch %s with %s symbols.",
+                "Broad scanner: completed native %s bars batch %s; requested %s symbols, returned %s.",
                 timeframe,
                 request_count,
+                len(batch),
                 len(parsed_bars),
             )
             bars.update(parsed_bars)
@@ -621,14 +631,18 @@ class BrokerClient:
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
 
-        end = datetime.now(timezone.utc)
-        start = end - (timedelta(days=90) if timeframe == "day" else timedelta(days=5))
+        now = datetime.now(timezone.utc)
+        if timeframe == "day":
+            end = now - timedelta(days=1)
+            start = end - timedelta(days=120)
+        else:
+            end = now - timedelta(minutes=15)
+            start = end - timedelta(days=5)
         return StockBarsRequest(
             symbol_or_symbols=symbols,
             timeframe=TimeFrame.Day if timeframe == "day" else TimeFrame.Minute,
             start=start,
             end=end,
-            limit=limit,
             feed=DataFeed(self.settings.alpaca_data_feed),
         )
 
@@ -636,16 +650,65 @@ class BrokerClient:
         if response is None:
             return {}
 
-        if hasattr(response, "df"):
-            return self._bars_from_dataframe(response.df)
-
         if hasattr(response, "data"):
-            response = response.data
+            data = response.data
+            parsed_data = self._bars_from_symbol_mapping(data)
+            if parsed_data:
+                return parsed_data
+
+        if hasattr(response, "df"):
+            parsed_df = self._bars_from_dataframe(response.df)
+            if parsed_df:
+                return parsed_df
 
         if isinstance(response, dict):
-            return {str(symbol).upper(): bars for symbol, bars in response.items() if bars is not None}
+            return self._bars_from_symbol_mapping(response)
 
         return {}
+
+    def _bars_from_symbol_mapping(self, response: dict[Any, Any]) -> dict[str, Any]:
+        parsed = {}
+        for symbol, bars in response.items():
+            if bars is None:
+                continue
+            normalized_symbol = str(symbol).upper()
+            parsed_bars = self._native_bars_to_records(bars)
+            if parsed_bars:
+                parsed[normalized_symbol] = parsed_bars
+        return parsed
+
+    def _native_bars_to_records(self, bars: Any) -> list[dict[str, Any]]:
+        if hasattr(bars, "df"):
+            bars = bars.df
+        if hasattr(bars, "to_dict") and not isinstance(bars, dict):
+            try:
+                records = bars.to_dict("records")
+                if isinstance(records, list):
+                    return records
+            except TypeError:
+                pass
+        if isinstance(bars, dict):
+            return [bars]
+        try:
+            iterator = iter(bars)
+        except TypeError:
+            iterator = [bars]
+        records = []
+        for bar in iterator:
+            if isinstance(bar, dict):
+                records.append(bar)
+                continue
+            records.append(
+                {
+                    "timestamp": getattr(bar, "timestamp", None),
+                    "open": getattr(bar, "open", None),
+                    "high": getattr(bar, "high", None),
+                    "low": getattr(bar, "low", None),
+                    "close": getattr(bar, "close", None),
+                    "volume": getattr(bar, "volume", None),
+                }
+            )
+        return records
 
     def _bars_from_dataframe(self, df: Any) -> dict[str, Any]:
         if df is None or getattr(df, "empty", True):
