@@ -22,6 +22,47 @@ class BrokerSnapshot:
     market_data: dict[str, Any]
 
 
+class LumibotExecutionStrategyAdapter:
+    """Minimal strategy-owned order submission adapter for Lumibot brokers."""
+
+    def __init__(
+        self,
+        broker: Any,
+        name: str,
+        order_factory: Any | None = None,
+    ) -> None:
+        self.broker = broker
+        self.name = name
+        self._order_factory = order_factory
+
+    def create_order(self, symbol: str, action: str, quantity: int) -> Any:
+        """Create a market order with this adapter as the strategy owner."""
+        if self._order_factory is not None:
+            return self._order_factory(
+                symbol=symbol,
+                action=action,
+                quantity=quantity,
+                strategy=self.name,
+            )
+
+        from lumibot.entities import Order
+
+        return Order(
+            strategy=self.name,
+            asset=symbol,
+            quantity=quantity,
+            side=action.lower(),
+            order_type="market",
+            time_in_force="day",
+        )
+
+    def submit_order(self, order: Any) -> Any:
+        """Submit through the broker while preserving a strategy-owned order."""
+        if getattr(order, "strategy", None) is None:
+            setattr(order, "strategy", self.name)
+        return self.broker.submit_order(order)
+
+
 class BrokerClient:
     """Small broker facade that can later be swapped from Alpaca to IBKR."""
 
@@ -30,14 +71,18 @@ class BrokerClient:
         settings: Settings,
         broker_factory: Any | None = None,
         order_factory: Any | None = None,
+        execution_strategy_factory: Any | None = None,
     ) -> None:
         self.settings = settings
         self._broker_factory = broker_factory
         self._order_factory = order_factory
+        self._execution_strategy_factory = execution_strategy_factory
+        self._execution_strategy = None
         self._broker = None
         self._last_snapshot: BrokerSnapshot | None = None
         self._broker_available = True
         self._broker_unavailable_reason: str | None = None
+        self._execution_strategy_name = "openai_trading_bot_executor"
 
     def connect(self) -> None:
         """Initialize the broker connection.
@@ -340,9 +385,15 @@ class BrokerClient:
 
         try:
             broker = self._get_broker()
-            order = self._create_market_order(symbol=symbol, action=action, quantity=quantity)
+            execution_strategy = self._get_execution_strategy(broker)
+            order = self._create_market_order(
+                symbol=symbol,
+                action=action,
+                quantity=quantity,
+                execution_strategy=execution_strategy,
+            )
             logger.info("Submitting Alpaca paper market order: %s %s %s shares.", action, symbol, quantity)
-            broker_order = broker.submit_order(order)
+            broker_order = execution_strategy.submit_order(order)
         except Exception as exc:
             if not self._broker_available:
                 logger.info("Order execution rejected: Broker unavailable.")
@@ -444,6 +495,24 @@ class BrokerClient:
                 raise
         return self._broker
 
+    def _get_execution_strategy(self, broker: Any) -> Any:
+        if self._execution_strategy is not None:
+            return self._execution_strategy
+
+        if self._execution_strategy_factory is not None:
+            self._execution_strategy = self._execution_strategy_factory(
+                broker=broker,
+                name=self._execution_strategy_name,
+            )
+            return self._execution_strategy
+
+        self._execution_strategy = LumibotExecutionStrategyAdapter(
+            broker=broker,
+            name=self._execution_strategy_name,
+            order_factory=self._order_factory,
+        )
+        return self._execution_strategy
+
     def _mark_broker_unavailable(self, reason: str) -> None:
         self._broker = None
         self._broker_available = False
@@ -464,14 +533,24 @@ class BrokerClient:
             "PAPER": True,
         }
 
-    def _create_market_order(self, symbol: str, action: str, quantity: int) -> Any:
-        if self._order_factory is not None:
-            return self._order_factory(symbol=symbol, action=action, quantity=quantity)
+    def _create_market_order(
+        self,
+        symbol: str,
+        action: str,
+        quantity: int,
+        execution_strategy: Any,
+    ) -> Any:
+        if hasattr(execution_strategy, "create_order"):
+            return execution_strategy.create_order(
+                symbol=symbol,
+                action=action,
+                quantity=quantity,
+            )
 
         from lumibot.entities import Order
 
         return Order(
-            strategy=None,
+            strategy=self._execution_strategy_name,
             asset=symbol,
             quantity=quantity,
             side=action.lower(),

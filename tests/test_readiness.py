@@ -1,6 +1,7 @@
 """Pre-deployment readiness coverage for safety-critical bot behavior."""
 
 import json
+import logging
 import sqlite3
 from datetime import date, datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ import database
 import main
 from config import Settings, load_settings
 from broker import BrokerClient, BrokerSnapshot
+from logger_config import install_logging_compatibility_shim
 from notifications.discord_notifier import DiscordNotifier
 from notifications.notifier import DailySummaryNotifier
 from openai_logic import AIDecision, AIDecisionError, OpenAIDecisionClient, TradingContext
@@ -74,6 +76,26 @@ def make_settings(**overrides):
     }
     values.update(overrides)
     return Settings(**values)
+
+
+def test_logger_accepts_lumibot_color_kwarg(caplog):
+    install_logging_compatibility_shim()
+    logger = logging.getLogger("lumibot.test")
+
+    with caplog.at_level(logging.ERROR, logger="lumibot.test"):
+        logger.error("partial fill update failed", color="red")
+
+    assert "partial fill update failed" in caplog.text
+
+
+def test_normal_logging_still_works(caplog):
+    install_logging_compatibility_shim()
+    logger = logging.getLogger("bot.test")
+
+    with caplog.at_level(logging.INFO, logger="bot.test"):
+        logger.info("normal log %s", "works")
+
+    assert "normal log works" in caplog.text
 
 
 def test_config_loading_uses_safe_defaults(monkeypatch):
@@ -786,11 +808,12 @@ def test_risk_manager_rejects_allocation_above_max_limit():
     assert "exceeds maximum" in reason
 
 
-def broker_with_snapshot(settings, price=100, fake_broker=None):
+def broker_with_snapshot(settings, price=100, fake_broker=None, execution_strategy_factory=None):
     broker = BrokerClient(
         settings,
         broker_factory=lambda config: fake_broker,
         order_factory=lambda **kwargs: types.SimpleNamespace(**kwargs),
+        execution_strategy_factory=execution_strategy_factory,
     )
     broker._last_snapshot = BrokerSnapshot(
         account={"portfolio_value": 100000, "cash": 25000, "buying_power": 25000},
@@ -947,6 +970,29 @@ class MockLumibotBroker:
         if self.should_raise:
             raise RuntimeError("broker failed")
         return types.SimpleNamespace(identifier="paper-123", status="submitted")
+
+
+class MockExecutionStrategy:
+    def __init__(self, broker, name):
+        self.broker = broker
+        self.name = name
+        self.created_orders = []
+        self.submitted_orders = []
+
+    def create_order(self, symbol, action, quantity):
+        order = types.SimpleNamespace(
+            symbol=symbol,
+            action=action,
+            quantity=quantity,
+            strategy=self.name,
+            order_type="market",
+        )
+        self.created_orders.append(order)
+        return order
+
+    def submit_order(self, order):
+        self.submitted_orders.append(order)
+        return self.broker.submit_order(order)
 
 
 class MockAlpacaApi:
@@ -1382,13 +1428,24 @@ def test_market_snapshot_insert_failure_does_not_crash_trading_cycle(monkeypatch
 
 def test_broker_dry_run_blocks_execution():
     fake_broker = MockLumibotBroker()
-    broker = broker_with_snapshot(make_settings(dry_run=True), fake_broker=fake_broker)
+    strategy_created = {"value": False}
+
+    def strategy_factory(broker, name):
+        strategy_created["value"] = True
+        return MockExecutionStrategy(broker, name)
+
+    broker = broker_with_snapshot(
+        make_settings(dry_run=True),
+        fake_broker=fake_broker,
+        execution_strategy_factory=strategy_factory,
+    )
 
     result = broker.execute_order(approved_decision())
 
     assert result["executed"] is False
     assert "DRY_RUN" in result["reason"]
     assert fake_broker.submitted_orders == []
+    assert strategy_created["value"] is False
 
 
 def test_broker_paper_trading_false_blocks_execution():
@@ -1540,13 +1597,24 @@ def test_lazy_broker_initialisation_failure_returns_broker_unavailable():
 
 def test_broker_hold_does_not_call_lumibot():
     fake_broker = MockLumibotBroker()
-    broker = broker_with_snapshot(make_settings(), fake_broker=fake_broker)
+    strategy_created = {"value": False}
+
+    def strategy_factory(broker, name):
+        strategy_created["value"] = True
+        return MockExecutionStrategy(broker, name)
+
+    broker = broker_with_snapshot(
+        make_settings(),
+        fake_broker=fake_broker,
+        execution_strategy_factory=strategy_factory,
+    )
 
     result = broker.execute_order(approved_decision(action="HOLD", suggested_allocation_percent=0))
 
     assert result["executed"] is False
     assert result["reason"] == "HOLD decision. No order placed."
     assert fake_broker.submitted_orders == []
+    assert strategy_created["value"] is False
 
 
 def test_broker_unsupported_symbol_does_not_call_lumibot():
@@ -1608,25 +1676,65 @@ def test_broker_missing_price_is_rejected():
 
 def test_broker_buy_calls_mocked_lumibot_execution():
     fake_broker = MockLumibotBroker()
-    broker = broker_with_snapshot(make_settings(), price=100, fake_broker=fake_broker)
+    created_strategies = []
+
+    def strategy_factory(broker, name):
+        strategy = MockExecutionStrategy(broker, name)
+        created_strategies.append(strategy)
+        return strategy
+
+    broker = broker_with_snapshot(
+        make_settings(),
+        price=100,
+        fake_broker=fake_broker,
+        execution_strategy_factory=strategy_factory,
+    )
 
     result = broker.execute_order(approved_decision(action="BUY"))
 
     assert result["executed"] is True
     assert result["broker_order_id"] == "paper-123"
     assert result["quantity"] == 50
+    assert created_strategies[0].created_orders[0].action == "BUY"
+    assert created_strategies[0].submitted_orders[0].strategy == created_strategies[0].name
     assert fake_broker.submitted_orders[0].action == "BUY"
+    assert fake_broker.submitted_orders[0].strategy is not None
 
 
 def test_broker_sell_calls_mocked_lumibot_execution():
     fake_broker = MockLumibotBroker()
-    broker = broker_with_snapshot(make_settings(), price=100, fake_broker=fake_broker)
+    created_strategies = []
+
+    def strategy_factory(broker, name):
+        strategy = MockExecutionStrategy(broker, name)
+        created_strategies.append(strategy)
+        return strategy
+
+    broker = broker_with_snapshot(
+        make_settings(),
+        price=100,
+        fake_broker=fake_broker,
+        execution_strategy_factory=strategy_factory,
+    )
 
     result = broker.execute_order(approved_decision(action="SELL"))
 
     assert result["executed"] is True
     assert result["broker_order_id"] == "paper-123"
+    assert created_strategies[0].created_orders[0].action == "SELL"
+    assert created_strategies[0].submitted_orders[0].strategy == created_strategies[0].name
     assert fake_broker.submitted_orders[0].action == "SELL"
+    assert fake_broker.submitted_orders[0].strategy is not None
+
+
+def test_execution_order_is_not_strategy_none_for_fill_event_routing():
+    fake_broker = MockLumibotBroker()
+    broker = broker_with_snapshot(make_settings(), price=100, fake_broker=fake_broker)
+
+    result = broker.execute_order(approved_decision(action="BUY"))
+
+    assert result["executed"] is True
+    assert fake_broker.submitted_orders[0].strategy == "openai_trading_bot_executor"
 
 
 def test_broker_lumibot_exception_is_caught_safely():
