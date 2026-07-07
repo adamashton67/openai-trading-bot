@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -91,6 +91,50 @@ def insert_decision(
             return int(cursor.lastrowid)
     except Exception as exc:
         logger.error("Database decision insert failed safely: %s.", exc.__class__.__name__)
+        return None
+
+
+def insert_execution(
+    result: dict[str, Any],
+    decision_id: int | None = None,
+    timestamp: datetime | None = None,
+) -> int | None:
+    """Persist an execution result without interrupting the bot."""
+    if not _ensure_database_available():
+        return None
+
+    try:
+        with _connect(_database_path) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO executions (
+                    decision_id,
+                    timestamp,
+                    symbol,
+                    side,
+                    quantity,
+                    fill_price,
+                    status,
+                    broker_order_id,
+                    raw_response
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision_id,
+                    (timestamp or datetime.now()).isoformat(),
+                    str(result.get("symbol") or "").upper() or None,
+                    str(result.get("action") or result.get("side") or "").upper() or None,
+                    _to_int(result.get("quantity")),
+                    _to_float(result.get("fill_price") or result.get("price")),
+                    result.get("raw_status") or result.get("status") or result.get("reason"),
+                    result.get("broker_order_id"),
+                    _json_text(result),
+                ),
+            )
+            return int(cursor.lastrowid)
+    except Exception as exc:
+        logger.error("Database execution insert failed safely: %s.", exc.__class__.__name__)
         return None
 
 
@@ -217,6 +261,278 @@ def insert_watchlist_symbol(
         return None
 
 
+DAILY_STAT_COUNTERS = {
+    "cycle_count",
+    "ai_buy_count",
+    "ai_sell_count",
+    "ai_hold_count",
+    "risk_approved_count",
+    "risk_rejected_count",
+    "orders_submitted",
+    "orders_filled",
+    "orders_cancelled",
+    "order_failures",
+    "scanner_runs",
+    "scanner_failures",
+    "openai_requests",
+    "openai_failures",
+    "api_errors",
+    "realised_pl",
+    "runtime_seconds",
+}
+
+
+def increment_daily_stat(
+    trading_date: date | str,
+    field_name: str,
+    amount: int | float = 1,
+) -> None:
+    """Increment one persisted daily statistic without interrupting the bot."""
+    if field_name not in DAILY_STAT_COUNTERS:
+        logger.error("Database daily stat update skipped for unsupported field: %s.", field_name)
+        return
+    if not _ensure_database_available():
+        return
+
+    try:
+        date_text = _date_text(trading_date)
+        with _connect(_database_path) as connection:
+            _ensure_daily_stats_row(connection, date_text)
+            connection.execute(
+                f"""
+                UPDATE daily_statistics
+                SET {field_name} = COALESCE({field_name}, 0) + ?,
+                    updated_at = ?
+                WHERE date = ?
+                """,
+                (amount, datetime.now().isoformat(), date_text),
+            )
+    except Exception as exc:
+        logger.error("Database daily stat update failed safely: %s.", exc.__class__.__name__)
+
+
+def update_daily_scanner_stats(
+    trading_date: date | str,
+    market_data: dict[str, Any],
+) -> None:
+    """Persist scanner rollup fields for the trading report."""
+    if not _ensure_database_available():
+        return
+
+    try:
+        date_text = _date_text(trading_date)
+        symbols = market_data.get("symbols", []) if isinstance(market_data, dict) else []
+        dynamic_watchlist = market_data.get("dynamic_watchlist", []) if isinstance(market_data, dict) else []
+        top_symbols = []
+        if isinstance(dynamic_watchlist, list):
+            top_symbols = [
+                str(candidate.get("symbol", "")).upper()
+                for candidate in dynamic_watchlist[:10]
+                if isinstance(candidate, dict) and candidate.get("symbol")
+            ]
+
+        scanner_failed = bool(market_data.get("broad_scan_failed")) or market_data.get("scanner_status") in {
+            "fallback_static",
+            "no_candidates",
+        }
+
+        with _connect(_database_path) as connection:
+            _ensure_daily_stats_row(connection, date_text)
+            connection.execute(
+                """
+                UPDATE daily_statistics
+                SET scanner_runs = scanner_runs + ?,
+                    scanner_failures = scanner_failures + ?,
+                    scanner_mode = ?,
+                    symbols_scanned = ?,
+                    final_watchlist_size = ?,
+                    top_ranked_symbols = ?,
+                    updated_at = ?
+                WHERE date = ?
+                """,
+                (
+                    1 if market_data.get("dynamic_watchlist_enabled") else 0,
+                    1 if scanner_failed else 0,
+                    market_data.get("scanner_mode"),
+                    len(market_data.get("scanner_universe", []) or symbols)
+                    if isinstance(market_data.get("scanner_universe", []) or symbols, list)
+                    else None,
+                    len(symbols) if isinstance(symbols, list) else None,
+                    _json_text(top_symbols),
+                    datetime.now().isoformat(),
+                    date_text,
+                ),
+            )
+    except Exception as exc:
+        logger.error("Database scanner stat update failed safely: %s.", exc.__class__.__name__)
+
+
+def record_daily_execution_result(
+    trading_date: date | str,
+    result: dict[str, Any],
+) -> None:
+    """Update daily execution counters from a broker result."""
+    if not _ensure_database_available():
+        return
+
+    try:
+        date_text = _date_text(trading_date)
+        executed = bool(result.get("executed"))
+        status = str(result.get("raw_status") or result.get("status") or "").lower()
+        action = str(result.get("action") or "").upper()
+        realised_pl = _to_float(
+            result.get("realised_pl")
+            or result.get("realized_pl")
+            or result.get("profit_loss")
+            or result.get("pnl")
+            or result.get("realized_pnl")
+        )
+        with _connect(_database_path) as connection:
+            _ensure_daily_stats_row(connection, date_text)
+            connection.execute(
+                """
+                UPDATE daily_statistics
+                SET orders_submitted = orders_submitted + ?,
+                    orders_filled = orders_filled + ?,
+                    orders_cancelled = orders_cancelled + ?,
+                    order_failures = order_failures + ?,
+                    realised_pl = realised_pl + ?,
+                    largest_win = CASE
+                        WHEN ? IS NULL OR ? <= 0 THEN largest_win
+                        WHEN largest_win IS NULL OR ? > largest_win THEN ?
+                        ELSE largest_win
+                    END,
+                    largest_loss = CASE
+                        WHEN ? IS NULL OR ? >= 0 THEN largest_loss
+                        WHEN largest_loss IS NULL OR ? < largest_loss THEN ?
+                        ELSE largest_loss
+                    END,
+                    updated_at = ?
+                WHERE date = ?
+                """,
+                (
+                    1 if executed else 0,
+                    1 if executed and "fill" in status else 0,
+                    1 if "cancel" in status else 0,
+                    1 if action in {"BUY", "SELL"} and not executed else 0,
+                    realised_pl or 0,
+                    realised_pl,
+                    realised_pl,
+                    realised_pl,
+                    realised_pl,
+                    realised_pl,
+                    realised_pl,
+                    realised_pl,
+                    realised_pl,
+                    datetime.now().isoformat(),
+                    date_text,
+                ),
+            )
+    except Exception as exc:
+        logger.error("Database execution stat update failed safely: %s.", exc.__class__.__name__)
+
+
+def load_daily_report_data(trading_date: date | str) -> dict[str, Any]:
+    """Load persisted daily statistics and report inputs from SQLite."""
+    if not _ensure_database_available():
+        return {}
+
+    try:
+        date_text = _date_text(trading_date)
+        with _connect(_database_path) as connection:
+            connection.row_factory = sqlite3.Row
+            _ensure_daily_stats_row(connection, date_text)
+            stats = dict(
+                connection.execute(
+                    "SELECT * FROM daily_statistics WHERE date = ?",
+                    (date_text,),
+                ).fetchone()
+            )
+            decisions = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT timestamp, symbol, action, confidence, allocation_percent,
+                           reason, approved, approval_reason, executed
+                    FROM decisions
+                    WHERE substr(timestamp, 1, 10) = ?
+                    ORDER BY timestamp ASC, id ASC
+                    """,
+                    (date_text,),
+                ).fetchall()
+            ]
+            executions = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT timestamp, symbol, side, quantity, fill_price, status,
+                           broker_order_id, raw_response
+                    FROM executions
+                    WHERE substr(timestamp, 1, 10) = ?
+                    ORDER BY timestamp ASC, id ASC
+                    """,
+                    (date_text,),
+                ).fetchall()
+            ]
+            snapshots = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT timestamp, cash, buying_power, equity, portfolio_value,
+                           positions_count, raw_snapshot
+                    FROM portfolio_snapshots
+                    WHERE substr(timestamp, 1, 10) = ?
+                    ORDER BY timestamp ASC, id ASC
+                    """,
+                    (date_text,),
+                ).fetchall()
+            ]
+            watchlist_rows = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT symbol, reason_added, raw_metadata
+                    FROM watchlists
+                    WHERE date = ?
+                    ORDER BY id DESC
+                    LIMIT 10
+                    """,
+                    (date_text,),
+                ).fetchall()
+            ]
+        return {
+            "stats": stats,
+            "decisions": decisions,
+            "executions": executions,
+            "portfolio_snapshots": snapshots,
+            "watchlist_rows": watchlist_rows,
+        }
+    except Exception as exc:
+        logger.error("Database daily report load failed safely: %s.", exc.__class__.__name__)
+        return {}
+
+
+def archive_daily_statistics(trading_date: date | str) -> None:
+    """Mark a daily statistics row as archived after a successful report send."""
+    if not _ensure_database_available():
+        return
+
+    try:
+        date_text = _date_text(trading_date)
+        with _connect(_database_path) as connection:
+            _ensure_daily_stats_row(connection, date_text)
+            connection.execute(
+                """
+                UPDATE daily_statistics
+                SET archived_at = ?, updated_at = ?
+                WHERE date = ?
+                """,
+                (datetime.now().isoformat(), datetime.now().isoformat(), date_text),
+            )
+    except Exception as exc:
+        logger.error("Database daily statistics archive failed safely: %s.", exc.__class__.__name__)
+
+
 def _ensure_database_available() -> bool:
     if _database_available and _database_path is not None:
         return True
@@ -299,7 +615,46 @@ def _create_tables(connection: sqlite3.Connection) -> None:
             reason_added TEXT,
             raw_metadata TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS daily_statistics (
+            date TEXT PRIMARY KEY,
+            cycle_count INTEGER DEFAULT 0,
+            ai_buy_count INTEGER DEFAULT 0,
+            ai_sell_count INTEGER DEFAULT 0,
+            ai_hold_count INTEGER DEFAULT 0,
+            risk_approved_count INTEGER DEFAULT 0,
+            risk_rejected_count INTEGER DEFAULT 0,
+            orders_submitted INTEGER DEFAULT 0,
+            orders_filled INTEGER DEFAULT 0,
+            orders_cancelled INTEGER DEFAULT 0,
+            order_failures INTEGER DEFAULT 0,
+            scanner_runs INTEGER DEFAULT 0,
+            scanner_failures INTEGER DEFAULT 0,
+            openai_requests INTEGER DEFAULT 0,
+            openai_failures INTEGER DEFAULT 0,
+            api_errors INTEGER DEFAULT 0,
+            realised_pl REAL DEFAULT 0,
+            largest_win REAL,
+            largest_loss REAL,
+            runtime_seconds REAL DEFAULT 0,
+            scanner_mode TEXT,
+            symbols_scanned INTEGER,
+            final_watchlist_size INTEGER,
+            top_ranked_symbols TEXT,
+            archived_at TEXT,
+            updated_at TEXT
+        );
         """
+    )
+
+
+def _ensure_daily_stats_row(connection: sqlite3.Connection, date_text: str) -> None:
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO daily_statistics (date, updated_at)
+        VALUES (?, ?)
+        """,
+        (date_text, datetime.now().isoformat()),
     )
 
 
@@ -319,6 +674,15 @@ def _to_int_bool(value: bool | None) -> int | None:
     return 1 if value else 0
 
 
+def _to_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
 def _to_float(value: Any) -> float | None:
     if value in (None, ""):
         return None
@@ -326,3 +690,7 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _date_text(value: date | str) -> str:
+    return value.isoformat() if isinstance(value, date) else str(value)

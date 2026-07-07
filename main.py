@@ -79,6 +79,9 @@ def main() -> None:
         discord_notifier=discord_notifier,
         enabled=settings.discord_daily_summary_enabled,
         dry_run=args.dry_run,
+        paper_trading=settings.paper_trading,
+        bot_dry_run=settings.dry_run,
+        bot_version=settings.bot_version,
     )
     logger.info(
         "Discord daily summary enabled: %s",

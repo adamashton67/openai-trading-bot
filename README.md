@@ -41,7 +41,7 @@ Lumibot executes.
 - `BOT_ENABLED=false` by default.
 - `PAPER_TRADING=true` by default.
 - `DRY_RUN=true` by default.
-- The broker execution method is a placeholder and does not place orders yet.
+- Alpaca paper execution remains blocked unless all safety gates pass.
 - The AI decision layer validates OpenAI JSON before risk checks.
 - The bot avoids OpenAI calls when the US market is closed.
 - Discord daily summaries are disabled by default.
@@ -88,6 +88,7 @@ DATABASE_PATH=/data/trading_bot.db
 | `BOT_ENABLED` | `false` | Kill switch. Trading cycles are skipped unless this is true. |
 | `PAPER_TRADING` | `true` | Keeps the bot in paper-trading mode. |
 | `DRY_RUN` | `true` | Extra safety gate. Risk manager rejects trades unless this is false. |
+| `BOT_VERSION` | `local` | Optional label shown in Discord summaries, useful for Railway build or commit identifiers. |
 | `TRADING_INTERVAL_MINUTES` | `15` | How often to run a cycle during regular US market hours. |
 | `MARKET_TIMEZONE` | `America/New_York` | Timezone used for market checks. |
 | `OPENAI_API_KEY` | empty | OpenAI API key. |
@@ -150,9 +151,9 @@ Real Alpaca paper order submission is isolated in `broker.py` and remains blocke
 
 ## Persistent Storage
 
-`database.py` uses Python's built-in SQLite support to persist finalized AI decisions. Local development defaults to `trading_bot.db` in the project folder. Railway should use `DATABASE_PATH=/data/trading_bot.db` so records survive deploys and restarts.
+`database.py` uses Python's built-in SQLite support to persist finalized AI decisions, executions, portfolio snapshots, market snapshots, generated watchlists, and daily reporting statistics. Local development defaults to `trading_bot.db` in the project folder. Railway should use `DATABASE_PATH=/data/trading_bot.db` so records survive deploys and restarts.
 
-The database initializes automatically on startup and creates these tables for current and future analytics: `decisions`, `executions`, `portfolio_snapshots`, `market_snapshots`, and `watchlists`. If SQLite is unavailable, the bot logs the failure class and continues without database writes.
+The database initializes automatically on startup and creates these tables for current and future analytics: `decisions`, `executions`, `portfolio_snapshots`, `market_snapshots`, `watchlists`, and `daily_statistics`. If SQLite is unavailable, the bot logs the failure class and continues without database writes.
 
 When `INCLUDE_HISTORY_CONTEXT=true`, recent decisions, executions, and portfolio snapshots are loaded from SQLite and sent to OpenAI as context. This history is advisory only; Python validation, risk management, and execution gates remain authoritative.
 
@@ -196,7 +197,7 @@ This collects scanner data, logs the scanner counts and final selected symbols, 
 
 ## Discord Daily Summaries
 
-Daily summaries are generated after regular US market close and sent once per trading day. The bot stores simple local JSON journal files under `data/` so app restarts do not resend the same day's summary.
+Daily summaries are generated after regular US market close and sent once per trading day. SQLite stores persistent daily statistics for trading cycles, AI decisions, risk outcomes, scanner status, order status, runtime, and errors. The existing local JSON notification state under `data/` still prevents duplicate sends after app restarts.
 
 Add these variables locally and in Railway:
 
@@ -208,6 +209,7 @@ DISCORD_DAILY_SUMMARY_ENABLED=false
 Set `DISCORD_DAILY_SUMMARY_ENABLED=true` when you are ready to send real summaries. Do not put webhook URLs in Git or the README.
 
 The summary includes starting balance, ending balance, daily profit/loss, completed trades, top gain/loss trade when available, open positions, AI decision counts, and rejected trades.
+Long reports are split into multiple Discord messages when needed to stay below Discord's message size limit.
 
 To test with mock data:
 
@@ -223,6 +225,6 @@ python main.py --send-test-summary --dry-run
 
 ## Next Steps
 
-- Connect `broker.py` to Lumibot's Alpaca paper broker.
-- Add durable trade and decision logging.
-- Add tests for risk rules and scheduler behaviour.
+- Continue paper-trading validation on Railway before disabling `DRY_RUN`.
+- Review Discord summaries after several market sessions and tune reporting fields if needed.
+- Keep broad scanner and OpenAI prompt changes separate from execution safety changes.

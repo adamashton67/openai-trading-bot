@@ -87,6 +87,7 @@ def make_settings(**overrides):
         "data_dir": Path("data"),
         "discord_webhook_url": "",
         "discord_daily_summary_enabled": False,
+        "bot_version": "test",
     }
     values.update(overrides)
     return Settings(**values)
@@ -139,6 +140,7 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
         "EXECUTION_HISTORY_LIMIT",
         "PORTFOLIO_HISTORY_LIMIT",
         "INCLUDE_HISTORY_CONTEXT",
+        "BOT_VERSION",
     ]:
         monkeypatch.delenv(key, raising=False)
 
@@ -162,6 +164,7 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
     assert "AAPL" in settings.scanner_universe
     assert settings.include_history_context is True
     assert settings.decision_history_limit == 20
+    assert settings.bot_version == "local"
 
 
 def test_config_loading_reads_environment(monkeypatch):
@@ -186,6 +189,7 @@ def test_config_loading_reads_environment(monkeypatch):
     monkeypatch.setenv("EXECUTION_HISTORY_LIMIT", "8")
     monkeypatch.setenv("PORTFOLIO_HISTORY_LIMIT", "9")
     monkeypatch.setenv("INCLUDE_HISTORY_CONTEXT", "false")
+    monkeypatch.setenv("BOT_VERSION", "railway-build")
 
     settings = load_settings()
 
@@ -209,6 +213,7 @@ def test_config_loading_reads_environment(monkeypatch):
     assert settings.execution_history_limit == 8
     assert settings.portfolio_history_limit == 9
     assert settings.include_history_context is False
+    assert settings.bot_version == "railway-build"
 
 
 def test_database_path_defaults_to_local_file(monkeypatch):
@@ -250,6 +255,7 @@ def test_database_initialises_all_tables(tmp_path):
         "portfolio_snapshots",
         "market_snapshots",
         "watchlists",
+        "daily_statistics",
     }.issubset(table_names)
 
 
@@ -305,6 +311,54 @@ def test_database_raw_response_is_stored_as_json_text(tmp_path):
         ).fetchone()[0]
 
     assert json.loads(stored) == {"action": "HOLD", "symbol": "SPY"}
+
+
+def test_database_daily_statistics_persist_across_restarts(tmp_path):
+    database_path = tmp_path / "trading_bot.db"
+    trading_day = date(2026, 7, 6)
+    database.init_database(database_path)
+
+    database.increment_daily_stat(trading_day, "cycle_count")
+    database.increment_daily_stat(trading_day, "ai_buy_count", 2)
+    database.init_database(database_path)
+    report_data = database.load_daily_report_data(trading_day)
+
+    assert report_data["stats"]["cycle_count"] == 1
+    assert report_data["stats"]["ai_buy_count"] == 2
+
+
+def test_database_execution_stats_and_archive(tmp_path):
+    database_path = tmp_path / "trading_bot.db"
+    trading_day = date(2026, 7, 6)
+    database.init_database(database_path)
+
+    execution_id = database.insert_execution(
+        {
+            "symbol": "AAPL",
+            "action": "SELL",
+            "quantity": 2,
+            "fill_price": 101.5,
+            "raw_status": "filled",
+            "broker_order_id": "paper-1",
+            "profit_loss": 12.34,
+            "executed": True,
+        },
+        timestamp=datetime(2026, 7, 6, 15, 0),
+    )
+    database.record_daily_execution_result(
+        trading_day,
+        {"symbol": "AAPL", "action": "SELL", "raw_status": "filled", "profit_loss": 12.34, "executed": True},
+    )
+    database.archive_daily_statistics(trading_day)
+    report_data = database.load_daily_report_data(trading_day)
+
+    assert execution_id == 1
+    assert report_data["stats"]["orders_submitted"] == 1
+    assert report_data["stats"]["orders_filled"] == 1
+    assert report_data["stats"]["realised_pl"] == 12.34
+    assert report_data["stats"]["largest_win"] == 12.34
+    assert report_data["stats"]["archived_at"] is not None
+    assert report_data["executions"][0]["symbol"] == "AAPL"
 
 
 def test_database_market_snapshot_insert_succeeds(tmp_path):
@@ -3258,15 +3312,116 @@ def test_discord_summary_formatting_includes_required_sections(tmp_path):
         discord_notifier=None,
         enabled=False,
         dry_run=True,
+        paper_trading=True,
+        bot_dry_run=True,
+        bot_version="test-version",
     )
 
     message = notifier.format_summary(date(2026, 7, 6), notifier._mock_day_data())
 
-    assert "Daily Trading Summary - 2026-07-06" in message
-    assert "Starting Balance" in message
-    assert "Trades Completed" in message
-    assert "AI Decisions" in message
-    assert "Rejected Trades" in message
+    assert "OpenAI Trading Bot" in message
+    assert "Daily Summary" in message
+    assert "Date:** 2026-07-06" in message
+    assert "Account" in message
+    assert "Open Positions" in message
+    assert "Trades Today" in message
+    assert "Trading Statistics" in message
+    assert "Scanner" in message
+    assert "Top AI Decision" in message
+    assert "Performance" in message
+    assert "Bot Version: test-version" in message
+
+
+def test_discord_summary_uses_persisted_daily_statistics(tmp_path):
+    notifier = DailySummaryNotifier(
+        journal=TradingJournal(tmp_path),
+        discord_notifier=None,
+        enabled=False,
+        dry_run=True,
+    )
+    report_data = {
+        "stats": {
+            "cycle_count": 6,
+            "ai_buy_count": 2,
+            "ai_sell_count": 1,
+            "ai_hold_count": 3,
+            "risk_approved_count": 2,
+            "risk_rejected_count": 1,
+            "orders_submitted": 1,
+            "orders_filled": 1,
+            "orders_cancelled": 0,
+            "scanner_mode": "broad_market",
+            "symbols_scanned": 100,
+            "final_watchlist_size": 20,
+            "top_ranked_symbols": json.dumps(["AAPL", "MSFT"]),
+            "runtime_seconds": 125,
+        },
+        "portfolio_snapshots": [
+            {
+                "portfolio_value": 100000,
+                "cash": 25000,
+                "buying_power": 25000,
+                "raw_snapshot": json.dumps({"positions": []}),
+            },
+            {
+                "portfolio_value": 100500,
+                "cash": 26000,
+                "buying_power": 26000,
+                "raw_snapshot": json.dumps(
+                    {
+                        "positions": [
+                            {
+                                "symbol": "AAPL",
+                                "quantity": 2,
+                                "average_price": 100,
+                                "market_value": 220,
+                            }
+                        ]
+                    }
+                ),
+            },
+        ],
+        "decisions": [
+            {
+                "symbol": "AAPL",
+                "action": "BUY",
+                "confidence": 0.91,
+                "reason": "Strong supplied indicators.",
+            }
+        ],
+        "executions": [
+            {
+                "timestamp": "2026-07-06T15:00:00",
+                "symbol": "AAPL",
+                "side": "BUY",
+                "quantity": 2,
+                "fill_price": 110,
+                "status": "filled",
+                "raw_response": json.dumps({"profit_loss": 20}),
+            }
+        ],
+    }
+
+    message = notifier.format_summary(date(2026, 7, 6), {}, report_data)
+
+    assert "Trading Cycles: 6" in message
+    assert "AI BUY decisions: 2" in message
+    assert "Scanner mode: broad_market" in message
+    assert "Top 10 ranked symbols: AAPL, MSFT" in message
+    assert "Symbol: AAPL" in message
+    assert "Win Rate: +100.00%" in message
+
+
+def test_discord_summary_splits_long_messages(tmp_path):
+    notifier = DailySummaryNotifier(
+        journal=TradingJournal(tmp_path),
+        discord_notifier=None,
+        enabled=False,
+    )
+    chunks = notifier._split_message("\n".join([f"line {index}" for index in range(500)]), limit=200)
+
+    assert len(chunks) > 1
+    assert all(len(chunk) <= 200 for chunk in chunks)
 
 
 def test_discord_send_failure_returns_false_without_raising(monkeypatch):

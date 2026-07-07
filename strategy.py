@@ -1,6 +1,7 @@
 """Trading strategy orchestration for AI suggestions and risk checks."""
 
 import logging
+import time
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -37,78 +38,96 @@ class TradingStrategy:
     def run_cycle(self) -> None:
         """Run one complete trading cycle."""
         logger.info("Starting trading cycle.")
-
-        snapshot = self.broker.collect_snapshot()
+        cycle_started_at = time.monotonic()
         current_time = datetime.now(ZoneInfo(self.settings.market_timezone))
-        history_context = self._load_history_context(current_time)
-        snapshot.market_data["history_context"] = history_context
-        self._record_portfolio_snapshot(snapshot, current_time)
-        self._record_market_snapshots(snapshot, current_time)
-        self._record_dynamic_watchlist(snapshot, current_time)
-        if self.journal is not None:
-            self.journal.record_balance_snapshot(
-                trading_day=current_time.date(),
-                account=snapshot.account,
-                positions=snapshot.positions,
-                timestamp=current_time,
-            )
+        database.increment_daily_stat(current_time.date(), "cycle_count")
 
-        decision = self.get_ai_decision(snapshot)
-        logger.info("AI decision returned: %s", decision)
-        if self.journal is not None:
-            self.journal.record_ai_decision(
-                trading_day=current_time.date(),
-                decision=decision,
-                timestamp=current_time,
-            )
-
-        decision_for_cycle = self._decision_with_cycle_universe(decision, snapshot)
-        approved, reason = self.risk_manager.validate(decision_for_cycle)
-        final_watchlist_reason = self._final_watchlist_rejection(decision_for_cycle, snapshot)
-        if final_watchlist_reason:
-            approved, reason = False, final_watchlist_reason
-
-        if not approved:
-            logger.info("Trading cycle skipped by risk manager: %s", reason)
-            if self.journal is not None and decision.get("action") != "HOLD":
-                self.journal.record_rejected_trade(
+        try:
+            snapshot = self.broker.collect_snapshot()
+            database.update_daily_scanner_stats(current_time.date(), snapshot.market_data)
+            history_context = self._load_history_context(current_time)
+            snapshot.market_data["history_context"] = history_context
+            self._record_portfolio_snapshot(snapshot, current_time)
+            self._record_market_snapshots(snapshot, current_time)
+            self._record_dynamic_watchlist(snapshot, current_time)
+            if self.journal is not None:
+                self.journal.record_balance_snapshot(
                     trading_day=current_time.date(),
-                    decision=decision,
-                    reason=reason,
+                    account=snapshot.account,
+                    positions=snapshot.positions,
                     timestamp=current_time,
                 )
+
+            decision = self.get_ai_decision(snapshot)
+            logger.info("AI decision returned: %s", decision)
+            self._record_daily_ai_decision(current_time, decision)
+            if self.journal is not None:
+                self.journal.record_ai_decision(
+                    trading_day=current_time.date(),
+                    decision=decision,
+                    timestamp=current_time,
+                )
+
+            decision_for_cycle = self._decision_with_cycle_universe(decision, snapshot)
+            approved, reason = self.risk_manager.validate(decision_for_cycle)
+            final_watchlist_reason = self._final_watchlist_rejection(decision_for_cycle, snapshot)
+            if final_watchlist_reason:
+                approved, reason = False, final_watchlist_reason
+            database.increment_daily_stat(
+                current_time.date(),
+                "risk_approved_count" if approved else "risk_rejected_count",
+            )
+
+            if not approved:
+                logger.info("Trading cycle skipped by risk manager: %s", reason)
+                if self.journal is not None and decision.get("action") != "HOLD":
+                    self.journal.record_rejected_trade(
+                        trading_day=current_time.date(),
+                        decision=decision,
+                        reason=reason,
+                        timestamp=current_time,
+                    )
+                self._record_database_decision(
+                    decision=decision,
+                    approved=False,
+                    approval_reason=reason,
+                    executed=False,
+                    timestamp=current_time,
+                )
+                return
+
+            result = self.broker.execute_order(decision_for_cycle)
+            logger.info("Execution result: %s", result)
+            database.record_daily_execution_result(current_time.date(), result)
+            if self.journal is not None:
+                self.journal.record_trade_result(
+                    trading_day=current_time.date(),
+                    decision=decision,
+                    result=result,
+                    timestamp=current_time,
+                )
+                if not result.get("executed"):
+                    self.journal.record_rejected_trade(
+                        trading_day=current_time.date(),
+                        decision=decision,
+                        reason=result.get("reason", "Execution rejected."),
+                        timestamp=current_time,
+                    )
             self._record_database_decision(
                 decision=decision,
-                approved=False,
+                approved=True,
                 approval_reason=reason,
-                executed=False,
+                executed=bool(result.get("executed")),
                 timestamp=current_time,
             )
-            return
-
-        result = self.broker.execute_order(decision_for_cycle)
-        logger.info("Execution result: %s", result)
-        if self.journal is not None:
-            self.journal.record_trade_result(
-                trading_day=current_time.date(),
-                decision=decision,
-                result=result,
-                timestamp=current_time,
+            if result.get("executed"):
+                database.insert_execution(result, timestamp=current_time)
+        finally:
+            database.increment_daily_stat(
+                current_time.date(),
+                "runtime_seconds",
+                round(time.monotonic() - cycle_started_at, 3),
             )
-            if not result.get("executed"):
-                self.journal.record_rejected_trade(
-                    trading_day=current_time.date(),
-                    decision=decision,
-                    reason=result.get("reason", "Execution rejected."),
-                    timestamp=current_time,
-                )
-        self._record_database_decision(
-            decision=decision,
-            approved=True,
-            approval_reason=reason,
-            executed=bool(result.get("executed")),
-            timestamp=current_time,
-        )
 
     def get_ai_decision(self, snapshot: BrokerSnapshot) -> dict[str, Any]:
         """Ask OpenAI for a validated suggestion and return it for risk checks."""
@@ -126,10 +145,12 @@ class TradingStrategy:
         self._last_ai_raw_response = None
 
         try:
+            database.increment_daily_stat(context.current_datetime.date(), "openai_requests")
             ai_client = self._get_ai_client()
             decision = ai_client.get_decision(context)
             self._last_ai_raw_response = ai_client.last_raw_response
         except AIDecisionError as exc:
+            database.increment_daily_stat(context.current_datetime.date(), "openai_failures")
             logger.warning("AI decision unavailable. Falling back to HOLD: %s", exc)
             return {
                 "symbol": self._fallback_hold_symbol(),
@@ -140,6 +161,16 @@ class TradingStrategy:
             }
 
         return decision.to_risk_manager_dict()
+
+    def _record_daily_ai_decision(self, current_time: datetime, decision: dict[str, Any]) -> None:
+        action = str(decision.get("action", "")).upper()
+        field_name = {
+            "BUY": "ai_buy_count",
+            "SELL": "ai_sell_count",
+            "HOLD": "ai_hold_count",
+        }.get(action)
+        if field_name:
+            database.increment_daily_stat(current_time.date(), field_name)
 
     def _record_database_decision(
         self,

@@ -70,6 +70,7 @@ class Settings:
     data_dir: Path
     discord_webhook_url: str
     discord_daily_summary_enabled: bool
+    bot_version: str
 
     @property
     def trading_interval_seconds(self) -> int:
@@ -135,6 +136,7 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
             os.getenv("DISCORD_DAILY_SUMMARY_ENABLED"),
             default=False,
         ),
+        bot_version=os.getenv("BOT_VERSION", "local"),
     )
 
 
