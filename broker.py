@@ -326,6 +326,7 @@ class BrokerClient:
             low_price_count = 0
             low_volume_count = 0
             missing_bar_count = 0
+            partial_intraday_indicator_count = 0
             for symbol in candidate_symbols:
                 daily_bars = daily_bars_result["bars"].get(symbol)
                 if daily_bars is None:
@@ -333,6 +334,11 @@ class BrokerClient:
                     continue
 
                 indicators = calculate_market_indicators(symbol, None, daily_bars)
+                if any(
+                    indicators.get(field_name) is None
+                    for field_name in ("5m_change_percent", "15m_change_percent", "1h_change_percent")
+                ):
+                    partial_intraday_indicator_count += 1
                 price = self._to_float(indicators.get("current_price"))
                 if price is None or price < self.settings.min_stock_price:
                     low_price_count += 1
@@ -356,6 +362,11 @@ class BrokerClient:
                 "Broad scanner: skipped %s symbols below minimum average volume.",
                 low_volume_count,
             )
+            if partial_intraday_indicator_count:
+                logger.info(
+                    "Market indicators: skipped/partial indicators for %s symbols due to insufficient intraday bars.",
+                    partial_intraday_indicator_count,
+                )
             market_data["broad_price_filtered_count"] = len(preliminary_intelligence)
 
             stage = "beginning ranking"

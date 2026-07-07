@@ -46,7 +46,7 @@ def calculate_market_indicators(
         return indicators
 
     if minute_df.empty and daily_df.empty:
-        logger.warning("No bars available for %s; indicators are null.", symbol)
+        logger.debug("No bars available for %s; indicators are null.", symbol)
         return indicators
 
     close_source = minute_df if not minute_df.empty else daily_df
@@ -127,7 +127,7 @@ def _period_change_percent(
     label: str,
 ) -> float | None:
     if df.empty or len(df) <= periods_back:
-        logger.warning("Insufficient %s bars for %s change.", label, symbol)
+        logger.debug("Insufficient %s bars for %s change.", label, symbol)
         return None
 
     current = _to_float(df["close"].iloc[-1])
@@ -142,14 +142,14 @@ def _day_change_percent(minute_df: pd.DataFrame, daily_df: pd.DataFrame, symbol:
         return _percent_change(current, opening_value)
 
     if len(daily_df) <= 1:
-        logger.warning("Insufficient daily bars for %s day change.", symbol)
+        logger.debug("Insufficient daily bars for %s day change.", symbol)
         return None
     return _percent_change(current, _to_float(daily_df["close"].iloc[-2]))
 
 
 def _average_volume(df: pd.DataFrame, window: int, symbol: str) -> float | None:
     if df.empty or len(df) < window:
-        logger.warning("Insufficient daily bars for %s average %sd volume.", symbol, window)
+        logger.debug("Insufficient daily bars for %s average %sd volume.", symbol, window)
         return None
 
     return _to_float(df["volume"].tail(window).mean())
@@ -159,21 +159,21 @@ def _relative_volume(volume: Any, average_volume: Any, symbol: str) -> float | N
     volume_value = _to_float(volume)
     average_value = _to_float(average_volume)
     if volume_value is None or average_value is None or average_value <= 0:
-        logger.warning("Insufficient volume data for %s relative volume.", symbol)
+        logger.debug("Insufficient volume data for %s relative volume.", symbol)
         return None
     return volume_value / average_value
 
 
 def _ema(df: pd.DataFrame, span: int, symbol: str) -> float | None:
     if df.empty or len(df) < span:
-        logger.warning("Insufficient bars for %s EMA%s.", symbol, span)
+        logger.debug("Insufficient bars for %s EMA%s.", symbol, span)
         return None
     return _to_float(df["close"].ewm(span=span, adjust=False).mean().iloc[-1])
 
 
 def _rsi(df: pd.DataFrame, period: int, symbol: str) -> float | None:
     if df.empty or len(df) <= period:
-        logger.warning("Insufficient bars for %s RSI%s.", symbol, period)
+        logger.debug("Insufficient bars for %s RSI%s.", symbol, period)
         return None
 
     delta = df["close"].diff()
@@ -194,12 +194,12 @@ def _rsi(df: pd.DataFrame, period: int, symbol: str) -> float | None:
 
 def _vwap(df: pd.DataFrame, symbol: str) -> float | None:
     if df.empty or not {"high", "low", "close", "volume"}.issubset(df.columns):
-        logger.warning("Insufficient bars for %s VWAP.", symbol)
+        logger.debug("Insufficient bars for %s VWAP.", symbol)
         return None
 
     total_volume = _to_float(df["volume"].sum())
     if total_volume is None or total_volume <= 0:
-        logger.warning("Insufficient volume for %s VWAP.", symbol)
+        logger.debug("Insufficient volume for %s VWAP.", symbol)
         return None
 
     typical_price = (df["high"] + df["low"] + df["close"]) / 3

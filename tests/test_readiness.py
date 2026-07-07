@@ -1357,6 +1357,23 @@ def test_missing_bars_do_not_crash_indicator_calculation():
     assert indicators["RSI14"] is None
 
 
+def test_insufficient_indicator_bars_do_not_log_warning(caplog):
+    minute_bars = make_mock_bars(length=2, start_price=100, volume=1000)
+    daily_bars = make_mock_bars(length=2, start_price=90, volume=10000)
+
+    with caplog.at_level(logging.DEBUG, logger="market_indicators"):
+        indicators = calculate_market_indicators("AAPL", minute_bars, daily_bars)
+
+    assert indicators["symbol"] == "AAPL"
+    assert indicators["5m_change_percent"] is None
+    assert "Insufficient 5m bars for AAPL change." in caplog.text
+    assert not [
+        record
+        for record in caplog.records
+        if record.name == "market_indicators" and record.levelno >= logging.WARNING
+    ]
+
+
 def test_dynamic_scanner_creates_ranked_watchlist():
     scanner = DynamicWatchlistScanner(watchlist_size=3)
     ranked = scanner.rank(
@@ -2227,6 +2244,10 @@ def test_broad_market_scan_aggregates_insufficient_data_logs(caplog):
 
     assert snapshot.market_data["scanner_status"] == "broad_generated"
     assert "Broad scanner: skipped 1 symbols with missing bars." in caplog.text
+    assert (
+        "Market indicators: skipped/partial indicators for 2 symbols due to insufficient intraday bars."
+        in caplog.text
+    )
     assert "Could not calculate market indicators for MSFT" not in caplog.text
 
 
