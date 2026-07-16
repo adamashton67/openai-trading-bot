@@ -144,12 +144,12 @@ class BrokerClient:
         return [
             {
                 "symbol": str(getattr(position, "symbol", "")).upper(),
-                "quantity": abs(self._to_float(getattr(position, "qty", None)) or 0),
+                "quantity": self._to_float(getattr(position, "qty", None)) or 0,
                 "market_value": self._to_float(getattr(position, "market_value", None)),
                 "average_price": self._to_float(getattr(position, "avg_entry_price", None)),
             }
             for position in broker_positions
-            if (self._to_float(getattr(position, "qty", None)) or 0) != 0
+            if (self._to_float(getattr(position, "qty", None)) or 0) > 0
         ]
 
     def get_current_price(self, symbol: str) -> float | None:
@@ -1135,7 +1135,46 @@ class BrokerClient:
             logger.info("Order execution rejected: %s", reason)
             return self._build_execution_result(approved_decision, False, reason)
 
-        requested_quantity = self._calculate_quantity(approved_decision, price)
+        buy_risk_details: dict[str, Any] = {}
+        if action == "BUY":
+            buy_failure, buy_risk_details = self._buy_guard_failure(approved_decision, price)
+            if buy_failure:
+                logger.info(
+                    "BUY portfolio validation rejected: current_positions=%s projected_positions=%s "
+                    "max_positions=%s current_invested_percent=%.2f projected_invested_percent=%.2f "
+                    "max_invested_percent=%.2f reason=%s",
+                    buy_risk_details.get("current_open_position_count"),
+                    buy_risk_details.get("projected_open_position_count"),
+                    self.settings.max_open_positions,
+                    buy_risk_details.get("current_invested_percent", 0.0),
+                    buy_risk_details.get("projected_invested_percent", 0.0),
+                    self.settings.max_total_invested_percent,
+                    buy_failure,
+                )
+                return self._build_execution_result(
+                    approved_decision,
+                    False,
+                    buy_failure,
+                    portfolio_limit_rejection=True,
+                    **buy_risk_details,
+                )
+            logger.info(
+                "BUY portfolio validation approved: current_positions=%s projected_positions=%s "
+                "max_positions=%s current_invested_percent=%.2f projected_invested_percent=%.2f "
+                "max_invested_percent=%.2f",
+                buy_risk_details["current_open_position_count"],
+                buy_risk_details["projected_open_position_count"],
+                self.settings.max_open_positions,
+                buy_risk_details["current_invested_percent"],
+                buy_risk_details["projected_invested_percent"],
+                self.settings.max_total_invested_percent,
+            )
+
+        requested_quantity = self._calculate_quantity(
+            approved_decision,
+            price,
+            portfolio_value=buy_risk_details.get("portfolio_value"),
+        )
         held_quantity = None
         cost_basis_per_share = None
         if action == "SELL":
@@ -1161,12 +1200,6 @@ class BrokerClient:
                     error_reason=reason,
                     requested_quantity=requested_quantity,
                 )
-        else:
-            position_failure = self._position_guard_failure(approved_decision, price)
-            if position_failure:
-                logger.info("Order execution rejected: %s", position_failure)
-                return self._build_execution_result(approved_decision, False, position_failure)
-
         quantity = requested_quantity
         if action == "SELL" and held_quantity is not None:
             quantity = min(float(requested_quantity), held_quantity)
@@ -1351,9 +1384,18 @@ class BrokerClient:
 
         return None
 
-    def _calculate_quantity(self, decision: dict[str, Any], latest_price: float) -> int:
+    def _calculate_quantity(
+        self,
+        decision: dict[str, Any],
+        latest_price: float,
+        *,
+        portfolio_value: float | None = None,
+    ) -> int:
         snapshot = self._last_snapshot
-        portfolio_value = self._to_float(snapshot.account.get("portfolio_value")) if snapshot else None
+        if portfolio_value is None:
+            portfolio_value = (
+                self._to_float(snapshot.account.get("portfolio_value")) if snapshot else None
+            )
         allocation = self._to_float(decision.get("suggested_allocation_percent"))
         if portfolio_value is None or portfolio_value <= 0 or allocation is None:
             return 0
@@ -1373,57 +1415,209 @@ class BrokerClient:
             list,
         )
 
-    def _position_guard_failure(self, decision: dict[str, Any], latest_price: float) -> str | None:
-        action = str(decision.get("action", "")).upper()
+    def _buy_guard_failure(
+        self,
+        decision: dict[str, Any],
+        latest_price: float,
+    ) -> tuple[str | None, dict[str, Any]]:
+        """Validate all BUY exposure limits from one broker-current risk snapshot."""
         symbol = str(decision.get("symbol", "")).upper()
-        current_market_value = self._current_position_market_value(symbol, latest_price)
-
-        if action == "SELL" and current_market_value <= 0:
-            return f"No existing {symbol} position to sell."
-
-        if action != "BUY":
-            return None
-
-        snapshot = self._last_snapshot
-        portfolio_value = self._to_float(snapshot.account.get("portfolio_value")) if snapshot else None
         allocation = self._to_float(decision.get("suggested_allocation_percent"))
+        try:
+            portfolio_value, positions, open_buy_orders = self._refresh_buy_risk_state()
+        except RuntimeError as exc:
+            return str(exc), {}
+
         if portfolio_value is None or portfolio_value <= 0 or allocation is None:
-            return "Portfolio value or allocation unavailable for position limit check."
+            return "Portfolio value is missing or non-positive; BUY rejected safely.", {}
 
-        requested_notional = portfolio_value * (allocation / 100)
-        projected_market_value = current_market_value + requested_notional
-        max_market_value = portfolio_value * (self.settings.max_position_allocation_percent / 100)
+        price_cache = {symbol: latest_price}
+        held_values: dict[str, float] = {}
+        for position in positions:
+            position_symbol = self._risk_value(position, "symbol", default="").upper()
+            quantity = self._to_float(self._risk_value(position, "qty", "quantity")) or 0
+            if not position_symbol or quantity <= 0:
+                continue
+            market_value = self._to_float(self._risk_value(position, "market_value"))
+            if market_value is None:
+                position_price = self._risk_latest_price(position_symbol, price_cache)
+                if position_price is None or position_price <= 0:
+                    return (
+                        f"Current market value is unavailable for {position_symbol}; BUY rejected safely.",
+                        {},
+                    )
+                market_value = quantity * position_price
+            held_values[position_symbol] = held_values.get(position_symbol, 0.0) + abs(market_value)
 
-        if projected_market_value > max_market_value:
+        pending_symbols: set[str] = set()
+        pending_values: dict[str, float] = {}
+        pending_value = 0.0
+        for order in open_buy_orders:
+            order_symbol = self._risk_value(order, "symbol", default="").upper()
+            if not order_symbol:
+                continue
+            pending_symbols.add(order_symbol)
+            order_value = self._pending_buy_value(order, portfolio_value, price_cache)
+            pending_values[order_symbol] = pending_values.get(order_symbol, 0.0) + order_value
+            pending_value += order_value
+
+        held_symbols = set(held_values)
+        current_count = len(held_symbols)
+        projected_symbols = held_symbols | pending_symbols | {symbol}
+        projected_count = len(projected_symbols)
+        invested_value = sum(held_values.values())
+        requested_notional = portfolio_value * allocation / 100
+        projected_invested_value = invested_value + pending_value + requested_notional
+        current_percent = invested_value / portfolio_value * 100
+        projected_percent = projected_invested_value / portfolio_value * 100
+        details = {
+            "portfolio_value": portfolio_value,
+            "current_open_position_count": current_count,
+            "projected_open_position_count": projected_count,
+            "current_invested_percent": current_percent,
+            "projected_invested_percent": projected_percent,
+            "pending_buy_value": pending_value,
+            "requested_order_value": requested_notional,
+        }
+
+        if projected_count > self.settings.max_open_positions:
+            if current_count >= self.settings.max_open_positions and symbol not in held_symbols:
+                reason = (
+                    f"Maximum open positions reached: {current_count}/"
+                    f"{self.settings.max_open_positions}."
+                )
+            else:
+                reason = (
+                    f"Projected open positions {projected_count} exceeds maximum "
+                    f"{self.settings.max_open_positions}."
+                )
+            return reason, details
+
+        current_symbol_value = held_values.get(symbol, 0.0) + pending_values.get(symbol, 0.0)
+        projected_symbol_percent = (current_symbol_value + requested_notional) / portfolio_value * 100
+        if projected_symbol_percent > self.settings.max_position_allocation_percent:
             return (
                 f"Projected {symbol} allocation exceeds maximum "
-                f"{self.settings.max_position_allocation_percent:.2f}%."
+                f"{self.settings.max_position_allocation_percent:.2f}%.",
+                details,
             )
 
-        return None
+        if projected_percent > self.settings.max_total_invested_percent:
+            return (
+                f"Projected invested allocation {projected_percent:.1f}% exceeds maximum "
+                f"{self.settings.max_total_invested_percent:.1f}%.",
+                details,
+            )
+        return None, details
 
-    def _current_position_market_value(self, symbol: str, latest_price: float) -> float:
+    def _refresh_buy_risk_state(self) -> tuple[float | None, list[Any], list[Any]]:
+        """Fetch current account, long positions, and pending BUYs where supported."""
+        api = getattr(self._broker, "api", None)
         snapshot = self._last_snapshot
-        if snapshot is None:
-            return 0.0
-
-        for position in snapshot.positions or []:
-            if str(position.get("symbol", "")).upper() != symbol:
-                continue
-
-            market_value = self._to_float(position.get("market_value"))
-            if market_value is not None:
-                return abs(market_value)
-
-            quantity = self._to_float(
-                position.get("quantity")
-                or position.get("qty")
-                or position.get("shares")
+        if api is not None and hasattr(api, "get_account"):
+            try:
+                account = api.get_account()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not refresh broker portfolio value: {self._safe_exception_message(exc)}"
+                ) from exc
+            portfolio_value = self._to_float(
+                self._risk_value(account, "portfolio_value", "equity")
             )
-            if quantity is not None:
-                return abs(quantity * latest_price)
+        else:
+            account = snapshot.account if snapshot else {}
+            portfolio_value = self._to_float(
+                account.get("portfolio_value") or account.get("equity")
+            )
 
-        return 0.0
+        if api is not None and hasattr(api, "get_all_positions"):
+            try:
+                positions = list(api.get_all_positions() or [])
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not refresh broker positions: {self._safe_exception_message(exc)}"
+                ) from exc
+        else:
+            positions = list(snapshot.positions if snapshot else [])
+
+        open_buy_orders: list[Any] = []
+        if api is not None and hasattr(api, "get_orders"):
+            try:
+                try:
+                    orders = api.get_orders(status="open")
+                except TypeError:
+                    orders = api.get_orders()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not inspect open BUY orders: {self._safe_exception_message(exc)}"
+                ) from exc
+            open_statuses = {"new", "accepted", "pending_new", "partially_filled", "held", "open"}
+            for order in orders or []:
+                side = self._risk_value(order, "side", default="")
+                side = getattr(side, "value", side)
+                status = self._broker_order_status(order) or ""
+                if str(side).lower() == "buy" and status in open_statuses:
+                    open_buy_orders.append(order)
+        return portfolio_value, positions, open_buy_orders
+
+    def _pending_buy_value(
+        self,
+        order: Any,
+        portfolio_value: float,
+        price_cache: dict[str, float | None],
+    ) -> float:
+        """Value remaining BUY exposure, reserving a full symbol cap if unknowable."""
+        total_quantity = self._to_float(self._risk_value(order, "qty", "quantity"))
+        filled_quantity = self._broker_filled_quantity(order) or 0.0
+        remaining_quantity = (
+            max(0.0, total_quantity - filled_quantity)
+            if total_quantity is not None
+            else None
+        )
+        notional = self._to_float(self._risk_value(order, "notional"))
+        if notional is not None and notional > 0:
+            if total_quantity and remaining_quantity is not None:
+                return notional * remaining_quantity / total_quantity
+            return notional
+        if remaining_quantity is not None and remaining_quantity > 0:
+            order_price = self._to_float(
+                self._risk_value(order, "limit_price", "stop_price")
+            )
+            if order_price is None:
+                order_symbol = self._risk_value(order, "symbol", default="").upper()
+                order_price = self._risk_latest_price(order_symbol, price_cache)
+            if order_price is not None and order_price > 0:
+                return remaining_quantity * order_price
+        return portfolio_value * self.settings.max_position_allocation_percent / 100
+
+    def _risk_latest_price(
+        self,
+        symbol: str,
+        price_cache: dict[str, float | None],
+    ) -> float | None:
+        if symbol in price_cache:
+            return price_cache[symbol]
+        price = None
+        if self._broker is not None and hasattr(self._broker, "get_last_price"):
+            try:
+                price = self._get_last_price(symbol)
+            except Exception as exc:
+                logger.warning(
+                    "Could not fetch current price for BUY validation: symbol=%s error=%s",
+                    symbol,
+                    exc.__class__.__name__,
+                )
+        if price is None:
+            price = self._latest_price(symbol)
+        price_cache[symbol] = price
+        return price
+
+    def _risk_value(self, value: Any, *names: str, default: Any = None) -> Any:
+        for name in names:
+            candidate = value.get(name) if isinstance(value, dict) else getattr(value, name, None)
+            if candidate not in (None, ""):
+                return candidate
+        return default
 
     def _refresh_sell_position(self, symbol: str) -> tuple[float | None, float | None, str | None]:
         """Return broker-current quantity and average entry immediately before a SELL."""

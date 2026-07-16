@@ -47,6 +47,8 @@ def make_settings(**overrides):
         "alpaca_secret_key": "test-alpaca-secret",
         "alpaca_paper_base_url": "https://paper-api.alpaca.markets",
         "max_position_allocation_percent": 5,
+        "max_open_positions": 10,
+        "max_total_invested_percent": 60,
         "min_confidence": 0.7,
         "allowed_symbols": ["AAPL", "MSFT"],
         "dynamic_watchlist_enabled": False,

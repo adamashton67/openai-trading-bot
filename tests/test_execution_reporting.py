@@ -213,6 +213,8 @@ def _settings():
         dynamic_watchlist_enabled=False,
         allowed_symbols=["TTD"],
         max_position_allocation_percent=5,
+        max_open_positions=10,
+        max_total_invested_percent=60,
         alpaca_api_key="safe-key",
         alpaca_secret_key="safe-secret",
     )

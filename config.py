@@ -51,6 +51,8 @@ class Settings:
     alpaca_secret_key: str
     alpaca_paper_base_url: str
     max_position_allocation_percent: float
+    max_open_positions: int
+    max_total_invested_percent: float
     min_confidence: float
     allowed_symbols: list[str]
     dynamic_watchlist_enabled: bool
@@ -73,6 +75,15 @@ class Settings:
     discord_webhook_url: str
     discord_daily_summary_enabled: bool
     bot_version: str
+
+    def __post_init__(self) -> None:
+        """Reject unsafe or nonsensical portfolio-limit configuration."""
+        if self.max_open_positions < 1:
+            raise ValueError("MAX_OPEN_POSITIONS must be at least 1.")
+        if not 0 < self.max_total_invested_percent <= 100:
+            raise ValueError(
+                "MAX_TOTAL_INVESTED_PERCENT must be greater than 0 and no more than 100."
+            )
 
     @property
     def trading_interval_seconds(self) -> int:
@@ -111,6 +122,10 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         ),
         max_position_allocation_percent=float(
             os.getenv("MAX_POSITION_ALLOCATION_PERCENT", "5")
+        ),
+        max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "10")),
+        max_total_invested_percent=float(
+            os.getenv("MAX_TOTAL_INVESTED_PERCENT", "60")
         ),
         min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.70")),
         allowed_symbols=_parse_symbols(os.getenv("ALLOWED_SYMBOLS")),

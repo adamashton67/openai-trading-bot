@@ -99,6 +99,8 @@ DATABASE_PATH=/data/trading_bot.db
 | `ALPACA_SECRET_KEY` | empty | Alpaca secret key. |
 | `ALPACA_PAPER_BASE_URL` | `https://paper-api.alpaca.markets` | Alpaca paper endpoint. |
 | `MAX_POSITION_ALLOCATION_PERCENT` | `5` | Starter risk limit per suggested trade. |
+| `MAX_OPEN_POSITIONS` | `10` | Maximum distinct held or pending-entry symbols after a new BUY. |
+| `MAX_TOTAL_INVESTED_PERCENT` | `60` | Maximum portfolio percentage invested after held positions, pending BUYs, and a new BUY. |
 | `MIN_CONFIDENCE` | `0.70` | Minimum AI confidence before a trade can pass risk checks. |
 | `ALLOWED_SYMBOLS` | sample symbols | Optional comma-separated symbol allowlist. |
 | `DYNAMIC_WATCHLIST_ENABLED` | `false` | Enables the scanner-built analysis watchlist during each trading cycle. |
@@ -150,6 +152,10 @@ risk_manager_input = decision.to_risk_manager_dict()
 The AI layer never executes trades and never bypasses the risk manager.
 
 Real Alpaca paper order submission is isolated in `broker.py` and remains blocked unless `BOT_ENABLED=true`, `PAPER_TRADING=true`, `DRY_RUN=false`, market data includes a valid latest price, and the risk manager approves the decision.
+
+Before every new BUY, the execution layer refreshes broker account equity, long positions, and open BUY orders. It rejects entries that would exceed `MAX_OPEN_POSITIONS`, `MAX_TOTAL_INVESTED_PERCENT`, or the existing per-symbol allocation cap. Pending BUY notional is used when available; otherwise remaining quantity is valued at a current price. If neither is available, the guard conservatively reserves one full `MAX_POSITION_ALLOCATION_PERCENT` allocation rather than ignoring the pending exposure.
+
+These portfolio limits apply only to new BUY exposure. They never force-close existing positions, even when the portfolio is already above a configured limit. HOLD, OpenAI SELL, partial-profit exits, trailing-stop exits, reconciliation, and reporting remain unaffected, and all exits remain permitted by these BUY limits.
 
 ## Persistent Storage
 

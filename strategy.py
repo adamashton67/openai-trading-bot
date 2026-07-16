@@ -104,6 +104,8 @@ class TradingStrategy:
 
             result = self.broker.execute_order(decision_for_cycle)
             logger.info("Execution result: %s", result)
+            if result.get("portfolio_limit_rejection"):
+                database.increment_daily_stat(current_time.date(), "risk_rejected_count")
             if str(result.get("action", "")).upper() in {"BUY", "SELL"}:
                 if str(result.get("action", "")).upper() == "SELL":
                     result.setdefault("exit_source", "openai")
