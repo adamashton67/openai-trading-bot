@@ -155,7 +155,10 @@ def insert_execution(
                     _to_float(result.get("fill_price") or result.get("average_fill_price")),
                     _to_float(result.get("filled_quantity")),
                     _to_float(result.get("average_fill_price") or result.get("fill_price")),
-                    result.get("raw_status") or result.get("status") or result.get("reason"),
+                    result.get("raw_status")
+                    or result.get("broker_status")
+                    or result.get("status")
+                    or result.get("reason"),
                     broker_order_id,
                     result.get("broker_status") or result.get("raw_status") or result.get("status"),
                     _to_float(result.get("cost_basis_per_share")),
@@ -478,7 +481,9 @@ def load_daily_report_data(trading_date: date | str) -> dict[str, Any]:
                     SELECT timestamp, symbol, side, quantity, submitted_price,
                            fill_price, filled_quantity, average_fill_price,
                            status, broker_status, broker_order_id, realised_pl,
-                           cost_basis_per_share, error_reason, raw_response
+                           cost_basis_per_share, error_reason, reconciliation_status,
+                           reconciliation_attempts, reconciliation_error,
+                           reconciliation_last_attempt_at, raw_response
                     FROM executions
                     WHERE substr(timestamp, 1, 10) = ?
                     ORDER BY timestamp ASC, id ASC
@@ -557,6 +562,8 @@ def load_reconcilable_executions() -> list[dict[str, Any]]:
                 SELECT * FROM executions
                 WHERE broker_order_id IS NOT NULL
                   AND COALESCE(duplicate_prevented, 0) = 0
+                  AND lower(COALESCE(reconciliation_status, 'pending')) NOT IN
+                      ('historical_unavailable', 'reconciliation_unavailable', 'reconciled')
                   AND lower(COALESCE(broker_status, status, '')) NOT IN
                       ('filled', 'cancelled', 'canceled', 'rejected', 'expired')
                 ORDER BY id
@@ -581,7 +588,30 @@ def reconcile_execution(execution_id: int, broker_result: dict[str, Any]) -> boo
                 return False
             payload = dict(broker_result)
             payload["reconciled_at"] = datetime.now().isoformat()
+            broker_status = str(
+                payload.get("broker_status") or payload.get("status") or ""
+            ).lower()
+            terminal_statuses = {
+                "filled",
+                "cancelled",
+                "canceled",
+                "rejected",
+                "expired",
+            }
+            payload["reconciliation_status"] = (
+                "reconciled" if broker_status in terminal_statuses else "pending"
+            )
             _update_execution_row(connection, execution_id, payload)
+            connection.execute(
+                """
+                UPDATE executions
+                SET reconciliation_attempts = COALESCE(reconciliation_attempts, 0) + 1,
+                    reconciliation_error = NULL,
+                    reconciliation_last_attempt_at = ?
+                WHERE id = ?
+                """,
+                (payload["reconciled_at"], execution_id),
+            )
             _record_execution_pl(connection, execution_id)
             execution_date = connection.execute(
                 "SELECT substr(timestamp, 1, 10) FROM executions WHERE id = ?", (execution_id,)
@@ -590,6 +620,45 @@ def reconcile_execution(execution_id: int, broker_result: dict[str, Any]) -> boo
         return True
     except Exception as exc:
         logger.error("Database execution reconciliation failed safely: %s.", exc.__class__.__name__)
+        return False
+
+
+def record_reconciliation_unavailable(
+    execution_id: int,
+    reason: str,
+    *,
+    terminal: bool,
+) -> bool:
+    """Record a lookup failure separately without altering the original execution result."""
+    if not _ensure_database_available():
+        return False
+    try:
+        now = datetime.now().isoformat()
+        with _connect(_database_path) as connection:
+            row = connection.execute(
+                "SELECT reconciliation_attempts FROM executions WHERE id = ?", (execution_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            attempts = int(row[0] or 0) + 1
+            status = "historical_unavailable" if terminal else "retry_pending"
+            if not terminal and attempts >= 3:
+                status = "reconciliation_unavailable"
+            connection.execute(
+                """
+                UPDATE executions
+                SET reconciliation_status = ?, reconciliation_attempts = ?,
+                    reconciliation_error = ?, reconciliation_last_attempt_at = ?
+                WHERE id = ?
+                """,
+                (status, attempts, str(reason)[:500], now, execution_id),
+            )
+        return True
+    except Exception as exc:
+        logger.error(
+            "Database reconciliation failure update failed safely: %s.",
+            exc.__class__.__name__,
+        )
         return False
 
 
@@ -677,6 +746,10 @@ def _create_tables(connection: sqlite3.Connection) -> None:
             realised_pl REAL,
             error_reason TEXT,
             reconciled_at TEXT,
+            reconciliation_status TEXT DEFAULT 'pending',
+            reconciliation_attempts INTEGER DEFAULT 0,
+            reconciliation_error TEXT,
+            reconciliation_last_attempt_at TEXT,
             realised_pl_recorded INTEGER DEFAULT 0,
             accounted_filled_quantity REAL DEFAULT 0,
             duplicate_prevented INTEGER DEFAULT 0,
@@ -762,6 +835,10 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
         "realised_pl": "REAL",
         "error_reason": "TEXT",
         "reconciled_at": "TEXT",
+        "reconciliation_status": "TEXT DEFAULT 'pending'",
+        "reconciliation_attempts": "INTEGER DEFAULT 0",
+        "reconciliation_error": "TEXT",
+        "reconciliation_last_attempt_at": "TEXT",
         "realised_pl_recorded": "INTEGER DEFAULT 0",
         "accounted_filled_quantity": "REAL DEFAULT 0",
         "duplicate_prevented": "INTEGER DEFAULT 0",
@@ -810,6 +887,7 @@ def _update_execution_row(
         "cost_basis_per_share": _to_float(result.get("cost_basis_per_share")),
         "error_reason": _text_or_none(result.get("error_reason")),
         "reconciled_at": result.get("reconciled_at"),
+        "reconciliation_status": _text_or_none(result.get("reconciliation_status")),
     }
     assignments = []
     parameters: list[Any] = []

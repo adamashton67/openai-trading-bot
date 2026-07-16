@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from uuid import UUID
 
 from config import Settings
 from market_indicators import calculate_market_indicators
@@ -1329,18 +1330,64 @@ class BrokerClient:
         """Refresh pending persisted executions from native Alpaca order state."""
         import database
 
-        counts = {"reconciled": 0, "skipped": 0, "errors": 0}
+        counts = {"reconciled": 0, "historical_matches": 0, "unavailable": 0, "errors": 0}
         api = getattr(self._broker, "api", None)
         if api is None:
             logger.warning("Execution reconciliation skipped because Alpaca API is unavailable.")
             return counts
         getter = getattr(api, "get_order_by_id", None) or getattr(api, "get_order", None)
-        if getter is None:
-            logger.warning("Execution reconciliation skipped because order lookup is unavailable.")
-            return counts
         for execution in database.load_reconcilable_executions():
+            order = None
+            direct_not_found = getter is None
             try:
-                order = getter(execution["broker_order_id"])
+                if getter is not None:
+                    order = getter(self._canonical_order_id(execution["broker_order_id"]))
+            except Exception as exc:
+                if self._is_order_not_found(exc):
+                    direct_not_found = True
+                else:
+                    counts["errors"] += 1
+                    database.record_reconciliation_unavailable(
+                        int(execution["id"]),
+                        f"{exc.__class__.__name__}: {self._safe_exception_message(exc)}",
+                        terminal=False,
+                    )
+                    logger.warning(
+                        "Execution reconciliation lookup failed safely for order %s: %s: %s",
+                        execution.get("broker_order_id"),
+                        exc.__class__.__name__,
+                        self._safe_exception_message(exc),
+                    )
+                    continue
+
+            if order is None and direct_not_found:
+                order, history_available = self._find_historical_order(api, execution)
+                if order is not None:
+                    counts["historical_matches"] += 1
+                elif history_available:
+                    counts["unavailable"] += 1
+                    database.record_reconciliation_unavailable(
+                        int(execution["id"]),
+                        "Order was not returned by direct lookup or Alpaca historical order queries.",
+                        terminal=True,
+                    )
+                    logger.info(
+                        "Execution order %s marked historical_unavailable after direct and historical lookup.",
+                        execution.get("broker_order_id"),
+                    )
+                    continue
+                else:
+                    counts["errors"] += 1
+                    database.record_reconciliation_unavailable(
+                        int(execution["id"]),
+                        "Alpaca historical order lookup was unavailable.",
+                        terminal=False,
+                    )
+                    continue
+
+            if order is None:
+                continue
+            try:
                 broker_result = {
                     "broker_order_id": self._broker_order_id(order) or execution["broker_order_id"],
                     "broker_status": self._broker_order_status(order),
@@ -1351,7 +1398,7 @@ class BrokerClient:
                 if database.reconcile_execution(int(execution["id"]), broker_result):
                     counts["reconciled"] += 1
                 else:
-                    counts["skipped"] += 1
+                    counts["errors"] += 1
             except Exception as exc:
                 counts["errors"] += 1
                 logger.warning(
@@ -1360,6 +1407,100 @@ class BrokerClient:
                 )
         logger.info("Execution reconciliation result: %s", counts)
         return counts
+
+    def _find_historical_order(
+        self,
+        api: Any,
+        execution: dict[str, Any],
+    ) -> tuple[Any | None, bool]:
+        """Query closed/all native Alpaca orders and match normalized UUIDs."""
+        get_orders = getattr(api, "get_orders", None)
+        if get_orders is None:
+            return None, False
+
+        target_id = self._normalized_order_id(execution.get("broker_order_id"))
+        successful_query = False
+        for status_name in ("all", "closed"):
+            try:
+                orders = self._query_historical_orders(get_orders, execution, status_name)
+                successful_query = True
+            except Exception as exc:
+                logger.warning(
+                    "Historical Alpaca order query failed safely: status=%s exception=%s message=%s",
+                    status_name,
+                    exc.__class__.__name__,
+                    self._safe_exception_message(exc),
+                )
+                continue
+            for order in self._flatten_broker_orders(orders):
+                if self._normalized_order_id(self._broker_order_id(order)) == target_id:
+                    return order, True
+        return None, successful_query
+
+    def _query_historical_orders(
+        self,
+        get_orders: Any,
+        execution: dict[str, Any],
+        status_name: str,
+    ) -> list[Any]:
+        """Use alpaca-py's native historical filter, with a compatibility fallback for mocks/older clients."""
+        try:
+            from alpaca.trading.enums import QueryOrderStatus
+            from alpaca.trading.requests import GetOrdersRequest
+
+            timestamp = self._parse_execution_timestamp(execution.get("timestamp"))
+            request = GetOrdersRequest(
+                status=QueryOrderStatus.ALL if status_name == "all" else QueryOrderStatus.CLOSED,
+                limit=500,
+                after=timestamp - timedelta(days=2) if timestamp else None,
+                until=timestamp + timedelta(days=2) if timestamp else None,
+                symbols=[str(execution["symbol"]).upper()] if execution.get("symbol") else None,
+            )
+            result = get_orders(filter=request)
+        except TypeError:
+            result = get_orders(status=status_name)
+        if isinstance(result, dict):
+            result = result.get("orders", [])
+        return list(result or [])
+
+    def _flatten_broker_orders(self, orders: list[Any]) -> list[Any]:
+        flattened = []
+        for order in orders:
+            flattened.append(order)
+            legs = order.get("legs") if isinstance(order, dict) else getattr(order, "legs", None)
+            if legs:
+                flattened.extend(self._flatten_broker_orders(list(legs)))
+        return flattened
+
+    def _canonical_order_id(self, value: Any) -> str:
+        text = str(value or "").strip()
+        try:
+            return str(UUID(text))
+        except (ValueError, AttributeError):
+            return text
+
+    def _normalized_order_id(self, value: Any) -> str:
+        return self._canonical_order_id(value).replace("-", "").lower()
+
+    def _is_order_not_found(self, exc: Exception) -> bool:
+        status_code = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+        code = getattr(exc, "code", None)
+        message = str(exc).lower()
+        return (
+            str(status_code) == "404"
+            or str(code) == "404"
+            or "404" in message
+            or "order not found" in message
+        )
+
+    def _parse_execution_timestamp(self, value: Any) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
 
     def _latest_price(self, symbol: str) -> float | None:
         if self._last_snapshot is None:
@@ -1480,6 +1621,13 @@ class BrokerClient:
         return result
 
     def _broker_order_id(self, broker_order: Any) -> str | None:
+        if isinstance(broker_order, dict):
+            value = (
+                broker_order.get("identifier")
+                or broker_order.get("id")
+                or broker_order.get("order_id")
+            )
+            return str(value) if value else None
         value = (
             getattr(broker_order, "identifier", None)
             or getattr(broker_order, "id", None)
@@ -1488,18 +1636,30 @@ class BrokerClient:
         return str(value) if value else None
 
     def _broker_order_status(self, broker_order: Any) -> str | None:
-        value = getattr(broker_order, "status", None)
+        value = (
+            broker_order.get("status")
+            if isinstance(broker_order, dict)
+            else getattr(broker_order, "status", None)
+        )
         if hasattr(value, "value"):
             value = value.value
         return str(value).lower() if value else None
 
     def _broker_filled_quantity(self, broker_order: Any) -> float | None:
+        if isinstance(broker_order, dict):
+            return self._to_float(broker_order.get("filled_qty") or broker_order.get("filled_quantity"))
         return self._to_float(
             getattr(broker_order, "filled_qty", None)
             or getattr(broker_order, "filled_quantity", None)
         )
 
     def _broker_average_fill_price(self, broker_order: Any) -> float | None:
+        if isinstance(broker_order, dict):
+            return self._to_float(
+                broker_order.get("filled_avg_price")
+                or broker_order.get("average_fill_price")
+                or broker_order.get("avg_fill_price")
+            )
         return self._to_float(
             getattr(broker_order, "filled_avg_price", None)
             or getattr(broker_order, "average_fill_price", None)
@@ -1507,12 +1667,20 @@ class BrokerClient:
         )
 
     def _broker_rejection_message(self, broker_order: Any) -> str | None:
-        value = (
-            getattr(broker_order, "reject_reason", None)
-            or getattr(broker_order, "rejection_reason", None)
-            or getattr(broker_order, "error_message", None)
-            or getattr(broker_order, "message", None)
-        )
+        if isinstance(broker_order, dict):
+            value = (
+                broker_order.get("reject_reason")
+                or broker_order.get("rejection_reason")
+                or broker_order.get("error_message")
+                or broker_order.get("message")
+            )
+        else:
+            value = (
+                getattr(broker_order, "reject_reason", None)
+                or getattr(broker_order, "rejection_reason", None)
+                or getattr(broker_order, "error_message", None)
+                or getattr(broker_order, "message", None)
+            )
         if value in (None, ""):
             return None
         return " ".join(str(value).split())[:500]
