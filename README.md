@@ -90,6 +90,8 @@ DATABASE_PATH=/data/trading_bot.db
 | `DRY_RUN` | `true` | Extra safety gate. Risk manager rejects trades unless this is false. |
 | `BOT_VERSION` | `local` | Optional label shown in Discord summaries, useful for Railway build or commit identifiers. |
 | `TRADING_INTERVAL_MINUTES` | `15` | How often to run a cycle during regular US market hours. |
+| `POSITION_MANAGEMENT_ENABLED` | `false` | Enables broker-only deterministic management of existing positions. |
+| `POSITION_MANAGEMENT_INTERVAL_MINUTES` | `5` | How often to manage open positions without scanning or calling OpenAI. |
 | `MARKET_TIMEZONE` | `America/New_York` | Timezone used for market checks. |
 | `OPENAI_API_KEY` | empty | OpenAI API key. |
 | `OPENAI_MODEL` | `gpt-5-mini` | Placeholder model setting for future AI logic. |
@@ -125,7 +127,7 @@ DATABASE_PATH=/data/trading_bot.db
 3. Check whether `BOT_ENABLED` is true.
 4. Check whether the US market is open.
 5. If the market is closed, sleep and do not call OpenAI.
-6. If the market is open, run a trading cycle every 15 minutes.
+6. If the market is open, manage positions every 5 minutes when enabled and run the existing trading cycle every 15 minutes.
 7. Collect broker/account/position/market data.
 8. Call the AI decision function.
 9. Pass the AI decision through the risk manager.
@@ -153,7 +155,7 @@ Real Alpaca paper order submission is isolated in `broker.py` and remains blocke
 
 `database.py` uses Python's built-in SQLite support to persist finalized AI decisions, executions, portfolio snapshots, market snapshots, generated watchlists, and daily reporting statistics. Local development defaults to `trading_bot.db` in the project folder. Railway should use `DATABASE_PATH=/data/trading_bot.db` so records survive deploys and restarts.
 
-The database initializes automatically on startup and creates these tables for current and future analytics: `decisions`, `executions`, `portfolio_snapshots`, `market_snapshots`, `watchlists`, and `daily_statistics`. If SQLite is unavailable, the bot logs the failure class and continues without database writes.
+The database initializes automatically on startup and creates these tables for current and future analytics: `decisions`, `executions`, `portfolio_snapshots`, `market_snapshots`, `watchlists`, `daily_statistics`, and `position_management`. Additive migrations preserve existing rows. If SQLite is unavailable, the bot logs the failure class and continues without database writes.
 
 When `INCLUDE_HISTORY_CONTEXT=true`, recent decisions, executions, and portfolio snapshots are loaded from SQLite and sent to OpenAI as context. This history is advisory only; Python validation, risk management, and execution gates remain authoritative.
 
@@ -186,6 +188,24 @@ python main.py --single-cycle
 ```
 
 This initialises the normal settings, database, broker, risk manager, and strategy, runs exactly one cycle, then exits. It respects `DRY_RUN` and the existing risk/execution safety gates.
+
+## Deterministic Position Management
+
+When enabled, `position_manager.py` refreshes broker holdings and current Alpaca prices every five minutes without running the broad scanner or invoking OpenAI. At a 3% gain it sells half of the original position once. After that order is broker-confirmed as filled, it retains the post-sale high and exits the remaining broker-held quantity at an exact 2% pullback. OpenAI SELL orders remain valid, and both paths inspect broker-current holdings and covering open SELL orders before submission.
+
+For whole-share positions, half is rounded down to a whole share (for example, 3 shares sells 1). Fractional positions round down to six decimal places. The sale is capped to current holdings, and if the result would be zero or consume the entire position, no partial sale is made; the full position enters trailing management instead. Legacy holdings record whether their original quantity was recovered from confirmed executions or adopted as a conservative current-quantity baseline.
+
+Run one management pass, respecting the configured `DRY_RUN` value:
+
+```bash
+python main.py --run-position-management-once
+```
+
+Run the diagnostic form only while `DRY_RUN=true`:
+
+```bash
+python main.py --test-position-manager
+```
 
 To test only the watchlist scanner:
 

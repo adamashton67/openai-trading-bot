@@ -141,9 +141,11 @@ def insert_execution(
                     error_reason,
                     reconciled_at,
                     duplicate_prevented,
+                    exit_source,
+                    exit_reason,
                     raw_response
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     decision_id,
@@ -165,6 +167,8 @@ def insert_execution(
                     _text_or_none(result.get("error_reason")),
                     result.get("reconciled_at"),
                     1 if result.get("duplicate_prevented") else 0,
+                    _text_or_none(result.get("exit_source")),
+                    _text_or_none(result.get("exit_reason")),
                     _json_text(result),
                 ),
             )
@@ -483,7 +487,8 @@ def load_daily_report_data(trading_date: date | str) -> dict[str, Any]:
                            status, broker_status, broker_order_id, realised_pl,
                            cost_basis_per_share, error_reason, reconciliation_status,
                            reconciliation_attempts, reconciliation_error,
-                           reconciliation_last_attempt_at, raw_response
+                           reconciliation_last_attempt_at, exit_source, exit_reason,
+                           raw_response
                     FROM executions
                     WHERE substr(timestamp, 1, 10) = ?
                     ORDER BY timestamp ASC, id ASC
@@ -517,12 +522,47 @@ def load_daily_report_data(trading_date: date | str) -> dict[str, Any]:
                     (date_text,),
                 ).fetchall()
             ]
+            managed_positions = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT symbol, opened_at, original_quantity, current_quantity,
+                           cost_basis_per_share, partial_profit_taken,
+                           partial_profit_filled_quantity, partial_profit_fill_price,
+                           trailing_high_price, trailing_stop_price,
+                           trailing_stop_activated, status, closed_at, last_checked_at
+                    FROM position_management
+                    WHERE lower(COALESCE(status, '')) != 'closed'
+                    ORDER BY symbol
+                    """
+                ).fetchall()
+            ]
+            exit_source_summary = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT COALESCE(exit_source, 'manual/reconciliation') AS exit_source,
+                           COUNT(*) AS execution_count,
+                           SUM(CASE WHEN lower(COALESCE(broker_status, status, '')) = 'filled'
+                                    THEN 1 ELSE 0 END) AS filled_count,
+                           COALESCE(SUM(realised_pl), 0) AS realised_pl
+                    FROM executions
+                    WHERE substr(timestamp, 1, 10) = ?
+                      AND upper(COALESCE(side, '')) = 'SELL'
+                    GROUP BY COALESCE(exit_source, 'manual/reconciliation')
+                    ORDER BY exit_source
+                    """,
+                    (date_text,),
+                ).fetchall()
+            ]
         return {
             "stats": stats,
             "decisions": decisions,
             "executions": executions,
             "portfolio_snapshots": snapshots,
             "watchlist_rows": watchlist_rows,
+            "position_management": managed_positions,
+            "exit_source_summary": exit_source_summary,
         }
     except Exception as exc:
         logger.error("Database daily report load failed safely: %s.", exc.__class__.__name__)
@@ -691,6 +731,187 @@ def repair_historical_realised_pl() -> dict[str, int]:
     return counts
 
 
+POSITION_MANAGEMENT_FIELDS = {
+    "opened_at",
+    "original_quantity",
+    "current_quantity",
+    "cost_basis_per_share",
+    "partial_profit_target_percent",
+    "partial_profit_trigger_price",
+    "partial_profit_taken",
+    "partial_profit_quantity",
+    "partial_profit_order_id",
+    "partial_profit_filled_quantity",
+    "partial_profit_fill_price",
+    "partial_profit_taken_at",
+    "trailing_stop_percent",
+    "trailing_high_price",
+    "trailing_stop_price",
+    "trailing_stop_activated",
+    "final_exit_order_id",
+    "final_exit_filled_quantity",
+    "closed_at",
+    "status",
+    "last_checked_at",
+    "raw_metadata",
+}
+
+
+def load_active_position_management(symbol: str | None = None) -> list[dict[str, Any]]:
+    """Load active deterministic position-management records."""
+    if not _ensure_database_available():
+        return []
+    try:
+        with _connect(_database_path) as connection:
+            connection.row_factory = sqlite3.Row
+            query = "SELECT * FROM position_management WHERE lower(status) != 'closed'"
+            parameters: tuple[Any, ...] = ()
+            if symbol:
+                query += " AND symbol = ?"
+                parameters = (symbol.upper(),)
+            query += " ORDER BY id"
+            return [dict(row) for row in connection.execute(query, parameters).fetchall()]
+    except Exception as exc:
+        logger.error("Position-management state load failed safely: %s.", exc.__class__.__name__)
+        return []
+
+
+def create_position_management(record: dict[str, Any]) -> dict[str, Any] | None:
+    """Create one active state row, returning the existing row on a race."""
+    if not _ensure_database_available():
+        return None
+    symbol = str(record.get("symbol") or "").upper()
+    if not symbol:
+        return None
+    values = {
+        key: (_json_text(value) if key == "raw_metadata" else value)
+        for key, value in record.items()
+        if key in POSITION_MANAGEMENT_FIELDS
+    }
+    values.setdefault("opened_at", datetime.now().isoformat())
+    values.setdefault("last_checked_at", datetime.now().isoformat())
+    values.setdefault("status", "open")
+    try:
+        with _connect(_database_path) as connection:
+            columns = ["symbol", *values.keys()]
+            placeholders = ", ".join("?" for _ in columns)
+            connection.execute(
+                f"INSERT INTO position_management ({', '.join(columns)}) VALUES ({placeholders})",
+                [symbol, *values.values()],
+            )
+        rows = load_active_position_management(symbol)
+        return rows[-1] if rows else None
+    except sqlite3.IntegrityError:
+        rows = load_active_position_management(symbol)
+        return rows[-1] if rows else None
+    except Exception as exc:
+        logger.error("Position-management state insert failed safely: %s.", exc.__class__.__name__)
+        return None
+
+
+def update_position_management(symbol: str, **changes: Any) -> bool:
+    """Update the active state row for a symbol without destructive replacement."""
+    if not _ensure_database_available():
+        return False
+    values = {
+        key: (_json_text(value) if key == "raw_metadata" else value)
+        for key, value in changes.items()
+        if key in POSITION_MANAGEMENT_FIELDS
+    }
+    if not values:
+        return True
+    try:
+        with _connect(_database_path) as connection:
+            assignments = ", ".join(f"{key} = ?" for key in values)
+            cursor = connection.execute(
+                f"UPDATE position_management SET {assignments} "
+                "WHERE symbol = ? AND lower(status) != 'closed'",
+                [*values.values(), symbol.upper()],
+            )
+            return cursor.rowcount > 0
+    except Exception as exc:
+        logger.error("Position-management state update failed safely: %s.", exc.__class__.__name__)
+        return False
+
+
+def close_position_management(symbol: str, *, closed_at: datetime | None = None) -> bool:
+    """Close stale state after broker holdings reach zero."""
+    timestamp = (closed_at or datetime.now()).isoformat()
+    return update_position_management(
+        symbol,
+        current_quantity=0,
+        closed_at=timestamp,
+        status="closed",
+        last_checked_at=timestamp,
+    )
+
+
+def load_execution_by_order_id(order_id: str | None) -> dict[str, Any] | None:
+    """Load a persisted execution used to drive management-order state."""
+    if not order_id or not _ensure_database_available():
+        return None
+    try:
+        with _connect(_database_path) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT * FROM executions WHERE broker_order_id = ? ORDER BY id DESC LIMIT 1",
+                (str(order_id),),
+            ).fetchone()
+            return dict(row) if row else None
+    except Exception as exc:
+        logger.error("Execution lookup failed safely: %s.", exc.__class__.__name__)
+        return None
+
+
+def infer_original_position_quantity(symbol: str, current_quantity: float) -> tuple[float, dict[str, Any]]:
+    """Conservatively recover pre-exit quantity from broker-confirmed SELL fills.
+
+    Legacy rows may predate this bot's execution ledger. In that case the current
+    broker quantity is an explicit management baseline, not asserted as the true
+    historical original quantity.
+    """
+    metadata: dict[str, Any] = {"adopted_legacy_position": True}
+    if not _ensure_database_available():
+        metadata["original_quantity_source"] = "broker_current_conservative_baseline"
+        return current_quantity, metadata
+    try:
+        with _connect(_database_path) as connection:
+            latest_buy = connection.execute(
+                """
+                SELECT MAX(timestamp)
+                FROM executions
+                WHERE symbol = ? AND upper(COALESCE(side, '')) = 'BUY'
+                  AND lower(COALESCE(broker_status, status, '')) = 'filled'
+                """,
+                (symbol.upper(),),
+            ).fetchone()[0]
+            if not latest_buy:
+                metadata["original_quantity_source"] = "broker_current_conservative_baseline"
+                metadata["historical_original_unknown"] = True
+                return current_quantity, metadata
+            sold = connection.execute(
+                """
+                SELECT COALESCE(SUM(filled_quantity), 0)
+                FROM executions
+                WHERE symbol = ? AND upper(COALESCE(side, '')) = 'SELL'
+                  AND timestamp >= ?
+                  AND lower(COALESCE(broker_status, status, '')) IN
+                      ('filled', 'partially_filled', 'partial_fill')
+                """,
+                (symbol.upper(), latest_buy),
+            ).fetchone()[0]
+        sold_quantity = float(sold or 0)
+        if sold_quantity > 0:
+            metadata["original_quantity_source"] = "broker_current_plus_confirmed_sell_fills"
+            metadata["recovered_prior_sell_quantity"] = sold_quantity
+            return current_quantity + sold_quantity, metadata
+    except Exception as exc:
+        logger.warning("Legacy quantity inference failed safely for %s: %s.", symbol, exc.__class__.__name__)
+    metadata["original_quantity_source"] = "broker_current_conservative_baseline"
+    metadata["historical_original_unknown"] = True
+    return current_quantity, metadata
+
+
 def _ensure_database_available() -> bool:
     if _database_available and _database_path is not None:
         return True
@@ -819,6 +1040,33 @@ def _create_tables(connection: sqlite3.Connection) -> None:
             archived_at TEXT,
             updated_at TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS position_management (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            opened_at TEXT NOT NULL,
+            original_quantity REAL,
+            current_quantity REAL NOT NULL,
+            cost_basis_per_share REAL NOT NULL,
+            partial_profit_target_percent REAL NOT NULL DEFAULT 3.0,
+            partial_profit_trigger_price REAL NOT NULL,
+            partial_profit_taken INTEGER NOT NULL DEFAULT 0,
+            partial_profit_quantity REAL,
+            partial_profit_order_id TEXT,
+            partial_profit_filled_quantity REAL DEFAULT 0,
+            partial_profit_fill_price REAL,
+            partial_profit_taken_at TEXT,
+            trailing_stop_percent REAL NOT NULL DEFAULT 2.0,
+            trailing_high_price REAL,
+            trailing_stop_price REAL,
+            trailing_stop_activated INTEGER NOT NULL DEFAULT 0,
+            final_exit_order_id TEXT,
+            final_exit_filled_quantity REAL DEFAULT 0,
+            closed_at TEXT,
+            status TEXT NOT NULL DEFAULT 'open',
+            last_checked_at TEXT,
+            raw_metadata TEXT
+        );
         """
     )
     _migrate_schema(connection)
@@ -842,15 +1090,49 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
         "realised_pl_recorded": "INTEGER DEFAULT 0",
         "accounted_filled_quantity": "REAL DEFAULT 0",
         "duplicate_prevented": "INTEGER DEFAULT 0",
+        "exit_source": "TEXT",
+        "exit_reason": "TEXT",
     }
     daily_columns = {
         "winning_trades": "INTEGER DEFAULT 0",
         "losing_trades": "INTEGER DEFAULT 0",
     }
+    position_management_columns = {
+        "opened_at": "TEXT",
+        "original_quantity": "REAL",
+        "current_quantity": "REAL",
+        "cost_basis_per_share": "REAL",
+        "partial_profit_target_percent": "REAL DEFAULT 3.0",
+        "partial_profit_trigger_price": "REAL",
+        "partial_profit_taken": "INTEGER DEFAULT 0",
+        "partial_profit_quantity": "REAL",
+        "partial_profit_order_id": "TEXT",
+        "partial_profit_filled_quantity": "REAL DEFAULT 0",
+        "partial_profit_fill_price": "REAL",
+        "partial_profit_taken_at": "TEXT",
+        "trailing_stop_percent": "REAL DEFAULT 2.0",
+        "trailing_high_price": "REAL",
+        "trailing_stop_price": "REAL",
+        "trailing_stop_activated": "INTEGER DEFAULT 0",
+        "final_exit_order_id": "TEXT",
+        "final_exit_filled_quantity": "REAL DEFAULT 0",
+        "closed_at": "TEXT",
+        "status": "TEXT DEFAULT 'open'",
+        "last_checked_at": "TEXT",
+        "raw_metadata": "TEXT",
+    }
     _add_missing_columns(connection, "executions", execution_columns)
     _add_missing_columns(connection, "daily_statistics", daily_columns)
+    _add_missing_columns(connection, "position_management", position_management_columns)
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_broker_order_id ON executions(broker_order_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_executions_exit_source ON executions(exit_source)"
+    )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_position_management_active_symbol "
+        "ON position_management(symbol) WHERE lower(status) != 'closed'"
     )
 
 

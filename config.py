@@ -42,6 +42,8 @@ class Settings:
     paper_trading: bool
     dry_run: bool
     trading_interval_minutes: int
+    position_management_enabled: bool
+    position_management_interval_minutes: int
     market_timezone: str
     openai_api_key: str
     openai_model: str
@@ -77,6 +79,11 @@ class Settings:
         """Return the polling interval in seconds."""
         return self.trading_interval_minutes * 60
 
+    @property
+    def position_management_interval_seconds(self) -> int:
+        """Return the deterministic position-management interval in seconds."""
+        return self.position_management_interval_minutes * 60
+
 
 def load_settings(env_file: str | Path | None = None) -> Settings:
     """Load settings from `.env` locally and environment variables in Railway."""
@@ -87,6 +94,12 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         paper_trading=_parse_bool(os.getenv("PAPER_TRADING"), default=True),
         dry_run=_parse_bool(os.getenv("DRY_RUN"), default=True),
         trading_interval_minutes=int(os.getenv("TRADING_INTERVAL_MINUTES", "15")),
+        position_management_enabled=_parse_bool(
+            os.getenv("POSITION_MANAGEMENT_ENABLED"), default=False
+        ),
+        position_management_interval_minutes=max(
+            1, int(os.getenv("POSITION_MANAGEMENT_INTERVAL_MINUTES", "5"))
+        ),
         market_timezone=os.getenv("MARKET_TIMEZONE", "America/New_York"),
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
         openai_model=os.getenv("OPENAI_MODEL", "gpt-5-mini"),

@@ -38,6 +38,8 @@ def make_settings(**overrides):
         "paper_trading": True,
         "dry_run": False,
         "trading_interval_minutes": 15,
+        "position_management_enabled": False,
+        "position_management_interval_minutes": 5,
         "market_timezone": "America/New_York",
         "openai_api_key": "test-key",
         "openai_model": "test-model",
@@ -141,6 +143,8 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
         "PORTFOLIO_HISTORY_LIMIT",
         "INCLUDE_HISTORY_CONTEXT",
         "BOT_VERSION",
+        "POSITION_MANAGEMENT_ENABLED",
+        "POSITION_MANAGEMENT_INTERVAL_MINUTES",
     ]:
         monkeypatch.delenv(key, raising=False)
 
@@ -165,6 +169,8 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
     assert settings.include_history_context is True
     assert settings.decision_history_limit == 20
     assert settings.bot_version == "local"
+    assert settings.position_management_enabled is False
+    assert settings.position_management_interval_minutes == 5
 
 
 def test_config_loading_reads_environment(monkeypatch):
@@ -190,6 +196,8 @@ def test_config_loading_reads_environment(monkeypatch):
     monkeypatch.setenv("PORTFOLIO_HISTORY_LIMIT", "9")
     monkeypatch.setenv("INCLUDE_HISTORY_CONTEXT", "false")
     monkeypatch.setenv("BOT_VERSION", "railway-build")
+    monkeypatch.setenv("POSITION_MANAGEMENT_ENABLED", "true")
+    monkeypatch.setenv("POSITION_MANAGEMENT_INTERVAL_MINUTES", "7")
 
     settings = load_settings()
 
@@ -214,6 +222,8 @@ def test_config_loading_reads_environment(monkeypatch):
     assert settings.portfolio_history_limit == 9
     assert settings.include_history_context is False
     assert settings.bot_version == "railway-build"
+    assert settings.position_management_enabled is True
+    assert settings.position_management_interval_minutes == 7
 
 
 def test_database_path_defaults_to_local_file(monkeypatch):

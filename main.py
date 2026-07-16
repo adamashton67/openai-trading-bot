@@ -64,6 +64,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Safely repair historical realised P/L where fill and cost data exists.",
     )
+    parser.add_argument(
+        "--test-position-manager",
+        action="store_true",
+        help="Run one position-management diagnostic; requires configured DRY_RUN=true.",
+    )
+    parser.add_argument(
+        "--run-position-management-once",
+        action="store_true",
+        help="Manage open positions once without scanning or calling OpenAI.",
+    )
     return parser.parse_args()
 
 
@@ -163,11 +173,31 @@ def main() -> None:
         risk_manager=risk_manager,
         journal=journal,
     )
-
     if args.single_cycle:
         logger.info("Running one trading cycle via --single-cycle.")
         strategy.run_cycle()
         logger.info("Single trading cycle complete. Exiting.")
+        return
+
+    from position_manager import PositionManager
+    from scheduler import CycleLock
+
+    position_manager = PositionManager(settings=settings, broker=broker)
+    cycle_lock_path = settings.data_dir / "trading-cycle.lock"
+
+    if args.test_position_manager or args.run_position_management_once:
+        if args.test_position_manager and not settings.dry_run:
+            logger.error("--test-position-manager requires DRY_RUN=true; no orders were attempted.")
+            return
+        if not scheduler.is_market_open():
+            logger.info("US market is closed. Position-management command skipped.")
+            return
+        with CycleLock(cycle_lock_path) as cycle_lock:
+            if not cycle_lock.acquired:
+                logger.warning("Position-management command skipped because another cycle is running.")
+                return
+            result = position_manager.run_once()
+        logger.info("Position-management command complete: %s", result)
         return
 
     while True:
@@ -187,14 +217,28 @@ def main() -> None:
                 scheduler.sleep_between_cycles()
                 continue
 
-            strategy.run_cycle()
-            scheduler.sleep_between_cycles()
+            position_due = scheduler.position_management_due()
+            trading_due = scheduler.trading_cycle_due()
+            if position_due or trading_due:
+                with CycleLock(cycle_lock_path) as cycle_lock:
+                    if not cycle_lock.acquired:
+                        logger.info("Scheduled cycle skipped because another process is running a cycle.")
+                    else:
+                        if position_due:
+                            position_manager.run_once()
+                        if trading_due:
+                            strategy.run_cycle()
+                if position_due:
+                    scheduler.mark_position_management_run()
+                if trading_due:
+                    scheduler.mark_trading_cycle_run()
+            scheduler.sleep_until_next_cycle()
         except KeyboardInterrupt:
             logger.info("Shutdown requested. Stopping bot.")
             break
         except Exception:
             logger.exception("Unhandled error during bot loop.")
-            scheduler.sleep_between_cycles()
+            scheduler.sleep_until_next_cycle()
 
 
 if __name__ == "__main__":

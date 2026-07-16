@@ -264,6 +264,42 @@ def test_covering_open_sell_prevents_duplicate_submission():
     assert fake.submitted_orders == []
 
 
+def _mechanical_sell(client, quantity=5):
+    return client.execute_position_management_sell(
+        "TTD",
+        quantity,
+        observed_price=110,
+        cost_basis_per_share=100,
+        exit_source="trailing_stop",
+        exit_reason="TRAILING_STOP_2_PERCENT",
+    )
+
+
+def test_mechanical_sell_requires_current_position_and_caps_to_holdings():
+    missing_client, missing_fake, _ = _client(_FakeApi(quantity=0))
+    missing = _mechanical_sell(missing_client)
+    assert missing["executed"] is False
+    assert missing["currently_held_quantity"] == 0
+    assert missing_fake.submitted_orders == []
+
+    capped_client, capped_fake, _ = _client(_FakeApi(quantity=2))
+    capped = _mechanical_sell(capped_client)
+    assert capped["quantity"] == 2
+    assert capped_fake.submitted_orders[0].quantity == 2
+
+
+def test_open_mechanical_or_openai_sell_prevents_cross_path_duplicate():
+    open_sell = types.SimpleNamespace(
+        id="mechanical-open", symbol="TTD", side="sell", status="accepted", qty="5", filled_qty="0"
+    )
+    client, fake, decision = _client(_FakeApi(quantity=5, orders=[open_sell]))
+    mechanical_result = _mechanical_sell(client)
+    openai_result = client.execute_order(decision)
+    assert mechanical_result["duplicate_prevented"] is True
+    assert openai_result["duplicate_prevented"] is True
+    assert fake.submitted_orders == []
+
+
 def test_alpaca_rejection_reason_and_context_are_persisted(tmp_path):
     path = tmp_path / "trading.db"
     database.init_database(path)

@@ -142,6 +142,23 @@ class DailySummaryNotifier:
         scanner_symbols = self._scanner_top_symbols(stats, report_data.get("watchlist_rows", []))
         runtime = self._format_runtime(self._to_float(stats.get("runtime_seconds")))
         error_lines = self._format_error_lines(stats)
+        partial_profit_count = sum(
+            1
+            for row in executions
+            if str(row.get("exit_source") or "").lower() == "partial_profit"
+            and str(row.get("broker_status") or row.get("status") or "").lower() == "filled"
+        )
+        trailing_stop_count = sum(
+            1
+            for row in executions
+            if str(row.get("exit_source") or "").lower() == "trailing_stop"
+            and str(row.get("broker_status") or row.get("status") or "").lower() == "filled"
+        )
+        mechanical_realised_pl = sum(
+            self._to_float(row.get("realised_pl")) or 0
+            for row in executions
+            if str(row.get("exit_source") or "").lower() in {"partial_profit", "trailing_stop"}
+        )
         lines = [
             "==========================",
             "**🤖 OpenAI Trading Bot**",
@@ -175,6 +192,11 @@ class DailySummaryNotifier:
             f"- Orders filled: {self._stat_int(stats, 'orders_filled')}",
             f"- Orders cancelled: {self._stat_int(stats, 'orders_cancelled')}",
             f"- Current open positions: {len(open_positions)}",
+            "",
+            "**Position Management**",
+            f"- Partial profits taken: {partial_profit_count}",
+            f"- Trailing stops triggered: {trailing_stop_count}",
+            f"- Realised P/L from mechanical exits: {self._format_signed_money(mechanical_realised_pl)}",
             "",
             "**Scanner**",
             f"- Scanner mode: {stats.get('scanner_mode') or 'N/A'}",

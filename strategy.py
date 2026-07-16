@@ -105,6 +105,9 @@ class TradingStrategy:
             result = self.broker.execute_order(decision_for_cycle)
             logger.info("Execution result: %s", result)
             if str(result.get("action", "")).upper() in {"BUY", "SELL"}:
+                if str(result.get("action", "")).upper() == "SELL":
+                    result.setdefault("exit_source", "openai")
+                    result.setdefault("exit_reason", str(decision.get("reason") or "OPENAI_SELL"))
                 database.insert_execution(result, timestamp=current_time)
             database.record_daily_execution_result(current_time.date(), result)
             if self.journal is not None:

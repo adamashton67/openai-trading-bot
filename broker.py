@@ -135,6 +135,161 @@ class BrokerClient:
         self._log_snapshot_gaps(snapshot)
         return snapshot
 
+    def refresh_open_positions(self) -> list[dict[str, Any]]:
+        """Return broker-current holdings without running market scans."""
+        api = getattr(self._broker, "api", None)
+        if api is None or not hasattr(api, "get_all_positions"):
+            raise RuntimeError("Alpaca positions API is unavailable")
+        broker_positions = api.get_all_positions()
+        return [
+            {
+                "symbol": str(getattr(position, "symbol", "")).upper(),
+                "quantity": abs(self._to_float(getattr(position, "qty", None)) or 0),
+                "market_value": self._to_float(getattr(position, "market_value", None)),
+                "average_price": self._to_float(getattr(position, "avg_entry_price", None)),
+            }
+            for position in broker_positions
+            if (self._to_float(getattr(position, "qty", None)) or 0) != 0
+        ]
+
+    def get_current_price(self, symbol: str) -> float | None:
+        """Fetch a current broker/data price without collecting scanner indicators."""
+        if self._broker is None:
+            return None
+        return self._get_last_price(symbol.upper())
+
+    def find_covering_open_sell(self, symbol: str, quantity: float) -> dict[str, Any] | None:
+        """Return concise metadata for an open SELL covering the intended quantity."""
+        order = self._covering_open_sell_order(symbol.upper(), float(quantity))
+        if order is None:
+            return None
+        return {
+            "broker_order_id": self._broker_order_id(order),
+            "broker_status": self._broker_order_status(order),
+            "remaining_quantity": max(
+                0.0,
+                (self._to_float(getattr(order, "qty", None) or getattr(order, "quantity", None)) or 0)
+                - (self._broker_filled_quantity(order) or 0),
+            ),
+        }
+
+    def execute_position_management_sell(
+        self,
+        symbol: str,
+        quantity: float,
+        *,
+        observed_price: float,
+        cost_basis_per_share: float,
+        exit_source: str,
+        exit_reason: str,
+    ) -> dict[str, Any]:
+        """Submit a deterministic quantity-based SELL without AI or entry risk checks."""
+        decision = {"symbol": symbol.upper(), "action": "SELL", "reason": exit_reason}
+        details = {"exit_source": exit_source, "exit_reason": exit_reason}
+        if not self.settings.bot_enabled:
+            return self._build_execution_result(
+                decision, False, "BOT_ENABLED is false.", quantity=quantity, **details
+            )
+        if not self.settings.paper_trading:
+            return self._build_execution_result(
+                decision,
+                False,
+                "PAPER_TRADING is false. Live trading is not implemented.",
+                quantity=quantity,
+                **details,
+            )
+        if self.settings.dry_run:
+            return self._build_execution_result(
+                decision, False, "DRY_RUN is true. No order placed.", quantity=quantity, **details
+            )
+
+        held_quantity, broker_cost_basis, refresh_error = self._refresh_sell_position(symbol.upper())
+        if refresh_error:
+            return self._build_execution_result(
+                decision, False, refresh_error, quantity=quantity, error_reason=refresh_error, **details
+            )
+        if held_quantity is None or held_quantity <= 0:
+            reason = f"No existing {symbol.upper()} position to sell."
+            return self._build_execution_result(
+                decision, False, reason, quantity=0, currently_held_quantity=0, **details
+            )
+
+        capped_quantity = min(float(quantity), held_quantity)
+        if capped_quantity <= 0:
+            return self._build_execution_result(
+                decision, False, "Calculated quantity is 0. No order placed.", quantity=0, **details
+            )
+        if capped_quantity.is_integer():
+            capped_quantity = int(capped_quantity)
+
+        covering = self._covering_open_sell_order(symbol.upper(), float(capped_quantity))
+        if covering is not None:
+            reason = f"Existing open SELL order already covers {symbol.upper()}."
+            return self._build_execution_result(
+                decision,
+                False,
+                reason,
+                quantity=capped_quantity,
+                broker_order_id=self._broker_order_id(covering),
+                raw_status=self._broker_order_status(covering),
+                duplicate_prevented=True,
+                currently_held_quantity=held_quantity,
+                cost_basis_per_share=broker_cost_basis or cost_basis_per_share,
+                error_reason=reason,
+                **details,
+            )
+
+        try:
+            broker = self._get_broker()
+            execution_strategy = self._get_execution_strategy(broker)
+            order = self._create_market_order(
+                symbol=symbol.upper(),
+                action="SELL",
+                quantity=capped_quantity,
+                execution_strategy=execution_strategy,
+            )
+            broker_order = execution_strategy.submit_order(order)
+        except Exception as exc:
+            safe_message = self._safe_exception_message(exc)
+            logger.warning(
+                "Mechanical SELL failed safely: symbol=%s quantity=%s source=%s exception=%s message=%s",
+                symbol.upper(), capped_quantity, exit_source, exc.__class__.__name__, safe_message,
+            )
+            return self._build_execution_result(
+                decision,
+                False,
+                "Broker order submission failed.",
+                quantity=capped_quantity,
+                currently_held_quantity=held_quantity,
+                cost_basis_per_share=broker_cost_basis or cost_basis_per_share,
+                error_reason=safe_message,
+                **details,
+            )
+
+        status = self._broker_order_status(broker_order)
+        executed = status not in {"rejected", "error", "cancelled", "canceled", "expired"}
+        reason = (
+            "Mechanical SELL submitted to Alpaca Paper Trading."
+            if executed
+            else "Alpaca rejected or closed the mechanical SELL before acceptance."
+        )
+        return self._build_execution_result(
+            decision,
+            executed,
+            reason,
+            quantity=capped_quantity,
+            broker_order_id=self._broker_order_id(broker_order),
+            raw_status=status,
+            broker_status=status,
+            currently_held_quantity=held_quantity,
+            submitted_price=observed_price,
+            filled_quantity=self._broker_filled_quantity(broker_order),
+            average_fill_price=self._broker_average_fill_price(broker_order),
+            cost_basis_per_share=broker_cost_basis or cost_basis_per_share,
+            error_reason=self._broker_rejection_message(broker_order),
+            **details,
+        )
+
     def _collect_account_data(self) -> dict[str, Any]:
         account = {
             "broker": "alpaca",
