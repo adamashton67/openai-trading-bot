@@ -186,6 +186,7 @@ class DailySummaryNotifier:
             self._format_top_decision(top_decision),
             "",
             "**Performance**",
+            f"- Realised P/L: {self._format_signed_money(self._to_float(stats.get('realised_pl')))}",
             f"- Win Rate: {self._format_percent(performance['win_rate'])}",
             f"- Average Winner: {self._format_signed_money(performance['average_winner'])}",
             f"- Average Loser: {self._format_signed_money(performance['average_loser'])}",
@@ -340,6 +341,7 @@ class DailySummaryNotifier:
         return self._to_float(
             result.get("profit_loss")
             or result.get("pnl")
+            or result.get("realised_pl")
             or result.get("realized_pl")
             or result.get("realized_pnl")
         )
@@ -358,6 +360,7 @@ class DailySummaryNotifier:
                         "symbol": row.get("symbol"),
                         "quantity": row.get("quantity"),
                         "fill_price": row.get("fill_price"),
+                        "realised_pl": row.get("realised_pl"),
                     },
                 }
             )

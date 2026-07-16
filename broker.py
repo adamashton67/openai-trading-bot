@@ -753,8 +753,13 @@ class BrokerClient:
         return "429" in message or "too many requests" in message or "rate limit" in message
 
     def _safe_exception_message(self, exc: Exception) -> str:
-        message = str(exc).strip()
-        return message if message else "<empty>"
+        message = " ".join(str(exc).strip().split())
+        if not message:
+            return "<empty>"
+        for secret in (self.settings.alpaca_api_key, self.settings.alpaca_secret_key):
+            if secret:
+                message = message.replace(secret, "<redacted>")
+        return message[:500]
 
     def _safe_asset_samples(self, assets: list[Any], limit: int = 3) -> list[dict[str, Any]]:
         samples = []
@@ -974,15 +979,42 @@ class BrokerClient:
             logger.info("Order execution rejected: %s", reason)
             return self._build_execution_result(approved_decision, False, reason)
 
-        position_failure = self._position_guard_failure(
-            approved_decision,
-            price,
-        )
-        if position_failure:
-            logger.info("Order execution rejected: %s", position_failure)
-            return self._build_execution_result(approved_decision, False, position_failure)
+        requested_quantity = self._calculate_quantity(approved_decision, price)
+        held_quantity = None
+        cost_basis_per_share = None
+        if action == "SELL":
+            held_quantity, cost_basis_per_share, refresh_error = self._refresh_sell_position(symbol)
+            if refresh_error:
+                logger.warning("SELL position validation failed safely for %s: %s", symbol, refresh_error)
+                return self._build_execution_result(
+                    approved_decision,
+                    False,
+                    refresh_error,
+                    currently_held_quantity=held_quantity,
+                    error_reason=refresh_error,
+                    requested_quantity=requested_quantity,
+                )
+            if held_quantity is None or held_quantity <= 0:
+                reason = f"No existing {symbol} position to sell."
+                logger.info("Order execution rejected: %s", reason)
+                return self._build_execution_result(
+                    approved_decision,
+                    False,
+                    reason,
+                    currently_held_quantity=held_quantity or 0,
+                    error_reason=reason,
+                    requested_quantity=requested_quantity,
+                )
+        else:
+            position_failure = self._position_guard_failure(approved_decision, price)
+            if position_failure:
+                logger.info("Order execution rejected: %s", position_failure)
+                return self._build_execution_result(approved_decision, False, position_failure)
 
-        quantity = self._calculate_quantity(approved_decision, price)
+        quantity = requested_quantity
+        if action == "SELL" and held_quantity is not None:
+            quantity = min(float(requested_quantity), held_quantity)
+            quantity = int(quantity) if float(quantity).is_integer() else quantity
         if quantity <= 0:
             reason = "Calculated quantity is 0. No order placed."
             logger.info("Order execution rejected: %s", reason)
@@ -991,7 +1023,29 @@ class BrokerClient:
                 False,
                 reason,
                 quantity=quantity,
+                requested_quantity=requested_quantity,
+                currently_held_quantity=held_quantity,
             )
+
+        if action == "SELL":
+            covering_order = self._covering_open_sell_order(symbol, float(quantity))
+            if covering_order is not None:
+                order_id = self._broker_order_id(covering_order)
+                reason = f"Existing open SELL order already covers {symbol}."
+                logger.info("Order execution rejected: %s Broker order ID: %s", reason, order_id)
+                return self._build_execution_result(
+                    approved_decision,
+                    False,
+                    reason,
+                    quantity=quantity,
+                    requested_quantity=requested_quantity,
+                    currently_held_quantity=held_quantity,
+                    broker_order_id=order_id,
+                    raw_status=self._broker_order_status(covering_order),
+                    error_reason=reason,
+                    cost_basis_per_share=cost_basis_per_share,
+                    duplicate_prevented=True,
+                )
 
         try:
             broker = self._get_broker()
@@ -1005,6 +1059,7 @@ class BrokerClient:
             logger.info("Submitting Alpaca paper market order: %s %s %s shares.", action, symbol, quantity)
             broker_order = execution_strategy.submit_order(order)
         except Exception as exc:
+            safe_message = self._safe_exception_message(exc)
             if not self._broker_available:
                 logger.info("Order execution rejected: Broker unavailable.")
                 return self._build_execution_result(
@@ -1013,15 +1068,78 @@ class BrokerClient:
                     "Broker unavailable",
                     quantity=quantity,
                     raw_status=exc.__class__.__name__,
+                    requested_quantity=requested_quantity,
+                    currently_held_quantity=held_quantity,
+                    exception_class=exc.__class__.__name__,
+                    error_reason=safe_message,
+                    cost_basis_per_share=cost_basis_per_share,
                 )
 
-            logger.warning("Broker order submission failed safely: %s.", exc.__class__.__name__)
+            if action == "SELL" and "subscriber" in safe_message.lower() and "not found" in safe_message.lower():
+                recovered_order = self._covering_open_sell_order(symbol, float(quantity))
+                if recovered_order is not None:
+                    logger.warning(
+                        "Lumibot event routing reported a missing subscriber, but Alpaca order %s is %s.",
+                        self._broker_order_id(recovered_order), self._broker_order_status(recovered_order),
+                    )
+                    return self._build_execution_result(
+                        approved_decision,
+                        True,
+                        "Alpaca order found after Lumibot event-routing warning.",
+                        quantity=quantity,
+                        broker_order_id=self._broker_order_id(recovered_order),
+                        raw_status=self._broker_order_status(recovered_order),
+                        broker_status=self._broker_order_status(recovered_order),
+                        requested_quantity=requested_quantity,
+                        currently_held_quantity=held_quantity,
+                        submitted_price=price,
+                        filled_quantity=self._broker_filled_quantity(recovered_order),
+                        average_fill_price=self._broker_average_fill_price(recovered_order),
+                        cost_basis_per_share=cost_basis_per_share,
+                    )
+
+            logger.warning(
+                "Broker order submission failed safely: symbol=%s side=%s requested=%s held=%s "
+                "exception=%s message=%s",
+                symbol, action, requested_quantity, held_quantity, exc.__class__.__name__, safe_message,
+            )
             return self._build_execution_result(
                 approved_decision,
                 False,
                 "Broker order submission failed.",
                 quantity=quantity,
                 raw_status=exc.__class__.__name__,
+                requested_quantity=requested_quantity,
+                currently_held_quantity=held_quantity,
+                exception_class=exc.__class__.__name__,
+                error_reason=safe_message,
+                cost_basis_per_share=cost_basis_per_share,
+            )
+
+        broker_status = self._broker_order_status(broker_order)
+        if broker_status in {"rejected", "error", "cancelled", "canceled", "expired"}:
+            rejection = self._broker_rejection_message(broker_order) or f"Alpaca order status: {broker_status}."
+            logger.warning(
+                "Alpaca order was not accepted: symbol=%s side=%s requested=%s held=%s "
+                "order_id=%s status=%s message=%s",
+                symbol, action, requested_quantity, held_quantity,
+                self._broker_order_id(broker_order), broker_status, rejection,
+            )
+            return self._build_execution_result(
+                approved_decision,
+                False,
+                "Alpaca rejected or closed the order before acceptance.",
+                quantity=quantity,
+                broker_order_id=self._broker_order_id(broker_order),
+                raw_status=broker_status,
+                broker_status=broker_status,
+                requested_quantity=requested_quantity,
+                currently_held_quantity=held_quantity,
+                submitted_price=price,
+                filled_quantity=self._broker_filled_quantity(broker_order),
+                average_fill_price=self._broker_average_fill_price(broker_order),
+                cost_basis_per_share=cost_basis_per_share,
+                error_reason=rejection,
             )
 
         logger.info("Alpaca paper order submitted for %s %s.", action, symbol)
@@ -1031,7 +1149,14 @@ class BrokerClient:
             "Order submitted to Alpaca Paper Trading.",
             quantity=quantity,
             broker_order_id=self._broker_order_id(broker_order),
-            raw_status=self._broker_order_status(broker_order),
+            raw_status=broker_status,
+            broker_status=broker_status,
+            requested_quantity=requested_quantity,
+            currently_held_quantity=held_quantity,
+            submitted_price=price,
+            filled_quantity=self._broker_filled_quantity(broker_order),
+            average_fill_price=self._broker_average_fill_price(broker_order),
+            cost_basis_per_share=cost_basis_per_share,
         )
 
     def _execution_guard_failure(self, decision: dict[str, Any]) -> str | None:
@@ -1144,6 +1269,98 @@ class BrokerClient:
 
         return 0.0
 
+    def _refresh_sell_position(self, symbol: str) -> tuple[float | None, float | None, str | None]:
+        """Return broker-current quantity and average entry immediately before a SELL."""
+        broker = self._broker
+        api = getattr(broker, "api", None) if broker is not None else None
+        if api is not None and hasattr(api, "get_all_positions"):
+            try:
+                positions = api.get_all_positions()
+            except Exception as exc:
+                message = self._safe_exception_message(exc)
+                return None, None, f"Could not refresh broker position for {symbol}: {message}"
+            for position in positions:
+                if str(getattr(position, "symbol", "")).upper() == symbol:
+                    return (
+                        abs(self._to_float(getattr(position, "qty", None)) or 0),
+                        self._to_float(getattr(position, "avg_entry_price", None)),
+                        None,
+                    )
+            return 0.0, None, None
+
+        snapshot = self._last_snapshot
+        for position in snapshot.positions if snapshot else []:
+            if str(position.get("symbol", "")).upper() == symbol:
+                return (
+                    abs(self._to_float(position.get("quantity") or position.get("qty")) or 0),
+                    self._to_float(position.get("average_price") or position.get("avg_entry_price")),
+                    None,
+                )
+        return 0.0, None, None
+
+    def _covering_open_sell_order(self, symbol: str, requested_quantity: float) -> Any | None:
+        """Find an accepted/open SELL that already covers the intended quantity."""
+        api = getattr(self._broker, "api", None)
+        if api is None or not hasattr(api, "get_orders"):
+            return None
+        try:
+            try:
+                orders = api.get_orders(status="open")
+            except TypeError:
+                orders = api.get_orders()
+        except Exception as exc:
+            logger.warning("Could not inspect open SELL orders safely: %s.", exc.__class__.__name__)
+            return None
+        open_statuses = {"new", "accepted", "pending_new", "partially_filled", "held", "open"}
+        for order in orders or []:
+            order_symbol = str(getattr(order, "symbol", "")).upper()
+            side = getattr(order, "side", "")
+            side = getattr(side, "value", side)
+            status = self._broker_order_status(order) or ""
+            if order_symbol != symbol or str(side).lower() != "sell" or status not in open_statuses:
+                continue
+            total = self._to_float(getattr(order, "qty", None) or getattr(order, "quantity", None)) or 0
+            filled = self._broker_filled_quantity(order) or 0
+            if max(0.0, total - filled) >= requested_quantity:
+                return order
+        return None
+
+    def reconcile_executions(self) -> dict[str, int]:
+        """Refresh pending persisted executions from native Alpaca order state."""
+        import database
+
+        counts = {"reconciled": 0, "skipped": 0, "errors": 0}
+        api = getattr(self._broker, "api", None)
+        if api is None:
+            logger.warning("Execution reconciliation skipped because Alpaca API is unavailable.")
+            return counts
+        getter = getattr(api, "get_order_by_id", None) or getattr(api, "get_order", None)
+        if getter is None:
+            logger.warning("Execution reconciliation skipped because order lookup is unavailable.")
+            return counts
+        for execution in database.load_reconcilable_executions():
+            try:
+                order = getter(execution["broker_order_id"])
+                broker_result = {
+                    "broker_order_id": self._broker_order_id(order) or execution["broker_order_id"],
+                    "broker_status": self._broker_order_status(order),
+                    "filled_quantity": self._broker_filled_quantity(order),
+                    "average_fill_price": self._broker_average_fill_price(order),
+                    "error_reason": self._broker_rejection_message(order),
+                }
+                if database.reconcile_execution(int(execution["id"]), broker_result):
+                    counts["reconciled"] += 1
+                else:
+                    counts["skipped"] += 1
+            except Exception as exc:
+                counts["errors"] += 1
+                logger.warning(
+                    "Execution reconciliation failed safely for order %s: %s: %s",
+                    execution.get("broker_order_id"), exc.__class__.__name__, self._safe_exception_message(exc),
+                )
+        logger.info("Execution reconciliation result: %s", counts)
+        return counts
+
     def _latest_price(self, symbol: str) -> float | None:
         if self._last_snapshot is None:
             return None
@@ -1240,13 +1457,14 @@ class BrokerClient:
         decision: dict[str, Any],
         executed: bool,
         reason: str,
-        quantity: int | None = None,
+        quantity: int | float | None = None,
         broker_order_id: str | None = None,
         raw_status: str | None = None,
+        **details: Any,
     ) -> dict[str, Any]:
         action = str(decision.get("action", "")).upper()
         symbol = str(decision.get("symbol", "")).upper()
-        return {
+        result = {
             "executed": executed,
             "reason": reason,
             "symbol": symbol,
@@ -1258,6 +1476,8 @@ class BrokerClient:
             "raw_status": raw_status,
             "decision": decision,
         }
+        result.update({key: value for key, value in details.items() if value is not None})
+        return result
 
     def _broker_order_id(self, broker_order: Any) -> str | None:
         value = (
@@ -1269,7 +1489,33 @@ class BrokerClient:
 
     def _broker_order_status(self, broker_order: Any) -> str | None:
         value = getattr(broker_order, "status", None)
-        return str(value) if value else None
+        if hasattr(value, "value"):
+            value = value.value
+        return str(value).lower() if value else None
+
+    def _broker_filled_quantity(self, broker_order: Any) -> float | None:
+        return self._to_float(
+            getattr(broker_order, "filled_qty", None)
+            or getattr(broker_order, "filled_quantity", None)
+        )
+
+    def _broker_average_fill_price(self, broker_order: Any) -> float | None:
+        return self._to_float(
+            getattr(broker_order, "filled_avg_price", None)
+            or getattr(broker_order, "average_fill_price", None)
+            or getattr(broker_order, "avg_fill_price", None)
+        )
+
+    def _broker_rejection_message(self, broker_order: Any) -> str | None:
+        value = (
+            getattr(broker_order, "reject_reason", None)
+            or getattr(broker_order, "rejection_reason", None)
+            or getattr(broker_order, "error_message", None)
+            or getattr(broker_order, "message", None)
+        )
+        if value in (None, ""):
+            return None
+        return " ".join(str(value).split())[:500]
 
     def _to_float(self, value: Any) -> float | None:
         if value in (None, ""):

@@ -5,7 +5,7 @@ import logging
 from dataclasses import replace
 
 from config import load_settings, missing_required_values
-from database import init_database
+from database import init_database, repair_historical_realised_pl
 from logger_config import configure_logging
 from notifications.discord_notifier import DiscordNotifier
 from notifications.notifier import DailySummaryNotifier
@@ -54,6 +54,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Temporarily cap broad scanner candidates for fast scanner testing.",
     )
+    parser.add_argument(
+        "--reconcile-executions",
+        action="store_true",
+        help="Refresh pending executions from Alpaca and exit.",
+    )
+    parser.add_argument(
+        "--repair-realised-pl",
+        action="store_true",
+        help="Safely repair historical realised P/L where fill and cost data exists.",
+    )
     return parser.parse_args()
 
 
@@ -67,6 +77,11 @@ def main() -> None:
     logger.info("Paper trading mode: %s", settings.paper_trading)
     logger.info("Dry-run mode: %s", settings.dry_run)
     init_database()
+
+    if args.repair_realised_pl:
+        result = repair_historical_realised_pl()
+        logger.info("Historical realised P/L repair complete: %s", result)
+        return
 
     journal = TradingJournal(settings.data_dir)
     discord_notifier = (
@@ -126,6 +141,10 @@ def main() -> None:
 
     broker = BrokerClient(settings)
     broker.connect()
+
+    if args.reconcile_executions:
+        broker.reconcile_executions()
+        return
 
     if args.test_scanner:
         from scanner_test import run_scanner_test
