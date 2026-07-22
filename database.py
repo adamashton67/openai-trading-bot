@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -922,14 +923,27 @@ def _ensure_database_available() -> bool:
     return False
 
 
-def _connect(path: Path | None) -> sqlite3.Connection:
+@contextlib.contextmanager
+def _connect(path: Path | None):
+    """Open a SQLite connection that always commits/rolls back and closes.
+
+    Used as `with _connect(path) as connection:` everywhere in this module.
+    Returning a context manager here (instead of a raw sqlite3.Connection)
+    guarantees the connection is closed on every exit path, since
+    sqlite3.Connection's own context manager only commits or rolls back and
+    never closes.
+    """
     if path is None:
         raise sqlite3.OperationalError("database path is unavailable")
 
     connection = sqlite3.connect(path)
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA foreign_keys=ON")
-    return connection
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA foreign_keys=ON")
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 def _create_tables(connection: sqlite3.Connection) -> None:

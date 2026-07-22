@@ -42,7 +42,10 @@ class RiskManager:
             return False, f"Confidence {confidence:.2f} is below minimum {self.settings.min_confidence:.2f}."
 
         allocation = float(decision.get("suggested_allocation_percent", 0))
-        if allocation <= 0:
+        if action == "sell":
+            if allocation < 0:
+                return False, "Suggested allocation must be 0 or greater for SELL."
+        elif allocation <= 0:
             return False, "Suggested allocation must be greater than 0."
 
         if allocation > self.settings.max_position_allocation_percent:

@@ -24,6 +24,10 @@ Strict trading constraints:
 - Never suggest trades outside regular US market hours.
 - Respect all provided risk rules.
 - Never suggest exceeding max allocation limits.
+- The max allocation limit applies to sizing NEW BUY positions only.
+- Do not recommend a BUY for a symbol whose existing position already meets or exceeds the max allocation limit.
+- Do not recommend a SELL solely because an existing position's value has grown above the max allocation limit through price appreciation. That is acceptable and is not a reason to sell.
+- Only recommend SELL for genuine technical or risk reasons, such as bearish signals, stop-loss conditions, or profit-taking.
 - confidence is required for BUY, SELL, and HOLD.
 - confidence must always be a number between 0 and 1.
 - confidence must never be null.
@@ -32,6 +36,11 @@ Strict trading constraints:
 - Keep the reason concise and grounded only in the supplied data.
 - If there is no suitable trade, return HOLD.
 - If action is HOLD, suggested_allocation_percent must be 0.
+
+Meaning of suggested_allocation_percent by action:
+- For BUY: the target position size as a percentage of portfolio value (how large the position should be after the buy).
+- For SELL: the target REMAINING allocation percentage after the sell. Use 0 to fully exit the position. For example, if a position is currently worth 8% of the portfolio and you want to reduce it to 4%, use 4. The bot sells only the difference.
+- For HOLD: must be 0.
 - For BUY or SELL decisions, stop_loss_percent and take_profit_percent may be positive numbers.
 - For HOLD decisions, stop_loss_percent must be null.
 - For HOLD decisions, take_profit_percent must be null.
@@ -44,6 +53,17 @@ Required JSON response format:
   "confidence": 0.72,
   "suggested_allocation_percent": 5,
   "reason": "Concise reason for the decision.",
+  "stop_loss_percent": 3,
+  "take_profit_percent": 6
+}
+
+For a SELL response, suggested_allocation_percent is the target remaining allocation after the sell (0 = fully exit):
+{
+  "symbol": "AAPL",
+  "action": "SELL",
+  "confidence": 0.68,
+  "suggested_allocation_percent": 0,
+  "reason": "Concise technical or risk-based reason for exiting.",
   "stop_loss_percent": 3,
   "take_profit_percent": 6
 }

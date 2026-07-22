@@ -247,19 +247,35 @@ def test_sell_without_current_broker_position_is_rejected_before_submission():
     assert fake.submitted_orders == []
 
 
-def test_sell_quantity_is_capped_to_current_holdings():
+def test_sell_with_target_below_holding_computes_partial_sell():
+    client, fake, decision = _client(_FakeApi(quantity=8))
+    result = client.execute_order(decision)
+    assert result["requested_quantity"] == 3
+    assert result["quantity"] == 3
+    assert fake.submitted_orders[0].quantity == 3
+
+
+def test_sell_with_zero_target_allocation_exits_entire_position():
+    client, fake, decision = _client(_FakeApi(quantity=8), allocation=0)
+    result = client.execute_order(decision)
+    assert result["executed"] is True
+    assert result["quantity"] == 8
+    assert fake.submitted_orders[0].quantity == 8
+
+
+def test_sell_with_target_at_or_above_current_allocation_places_no_order():
     client, fake, decision = _client(_FakeApi(quantity=2))
     result = client.execute_order(decision)
-    assert result["requested_quantity"] == 5
-    assert result["quantity"] == 2
-    assert fake.submitted_orders[0].quantity == 2
+    assert result["executed"] is False
+    assert "quantity is 0" in result["reason"]
+    assert fake.submitted_orders == []
 
 
 def test_covering_open_sell_prevents_duplicate_submission():
     open_sell = types.SimpleNamespace(
         id="open-1", symbol="TTD", side="sell", status="accepted", qty="5", filled_qty="0"
     )
-    client, fake, decision = _client(_FakeApi(quantity=5, orders=[open_sell]))
+    client, fake, decision = _client(_FakeApi(quantity=5, orders=[open_sell]), allocation=0)
     result = client.execute_order(decision)
     assert result["executed"] is False
     assert result["broker_order_id"] == "open-1"
@@ -294,7 +310,7 @@ def test_open_mechanical_or_openai_sell_prevents_cross_path_duplicate():
     open_sell = types.SimpleNamespace(
         id="mechanical-open", symbol="TTD", side="sell", status="accepted", qty="5", filled_qty="0"
     )
-    client, fake, decision = _client(_FakeApi(quantity=5, orders=[open_sell]))
+    client, fake, decision = _client(_FakeApi(quantity=5, orders=[open_sell]), allocation=0)
     mechanical_result = _mechanical_sell(client)
     openai_result = client.execute_order(decision)
     assert mechanical_result["duplicate_prevented"] is True
@@ -305,7 +321,9 @@ def test_open_mechanical_or_openai_sell_prevents_cross_path_duplicate():
 def test_alpaca_rejection_reason_and_context_are_persisted(tmp_path):
     path = tmp_path / "trading.db"
     database.init_database(path)
-    client, _, decision = _client(_FakeApi(quantity=5), rejection="insufficient qty available")
+    client, _, decision = _client(
+        _FakeApi(quantity=5), rejection="insufficient qty available", allocation=0
+    )
     result = client.execute_order(decision)
     execution_id = database.insert_execution(result, timestamp=datetime(2026, 7, 16, 14, 30))
     with sqlite3.connect(path) as connection:
@@ -334,6 +352,7 @@ def test_lumibot_missing_subscriber_is_not_treated_as_alpaca_failure():
     client, _, decision = _client(
         api,
         rejection="Subscriber openai_trading_bot_executor not found",
+        allocation=0,
     )
     result = client.execute_order(decision)
     assert result["executed"] is True

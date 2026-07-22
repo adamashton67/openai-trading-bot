@@ -3110,7 +3110,7 @@ def test_broker_allows_sell_with_existing_position():
         market_data={"prices": {"AAPL": {"last_price": 100}}},
     )
 
-    result = broker.execute_order(approved_decision(action="SELL"))
+    result = broker.execute_order(approved_decision(action="SELL", suggested_allocation_percent=0))
 
     assert result["executed"] is True
     assert fake_broker.submitted_orders[0].action == "SELL"
@@ -3210,7 +3210,7 @@ def test_broker_sell_calls_mocked_lumibot_execution():
         market_data={"prices": {"AAPL": {"last_price": 100}}},
     )
 
-    result = broker.execute_order(approved_decision(action="SELL"))
+    result = broker.execute_order(approved_decision(action="SELL", suggested_allocation_percent=0))
 
     assert result["executed"] is True
     assert result["broker_order_id"] == "paper-123"

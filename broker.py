@@ -1170,11 +1170,6 @@ class BrokerClient:
                 self.settings.max_total_invested_percent,
             )
 
-        requested_quantity = self._calculate_quantity(
-            approved_decision,
-            price,
-            portfolio_value=buy_risk_details.get("portfolio_value"),
-        )
         held_quantity = None
         cost_basis_per_share = None
         if action == "SELL":
@@ -1187,7 +1182,7 @@ class BrokerClient:
                     refresh_error,
                     currently_held_quantity=held_quantity,
                     error_reason=refresh_error,
-                    requested_quantity=requested_quantity,
+                    requested_quantity=None,
                 )
             if held_quantity is None or held_quantity <= 0:
                 reason = f"No existing {symbol} position to sell."
@@ -1198,8 +1193,15 @@ class BrokerClient:
                     reason,
                     currently_held_quantity=held_quantity or 0,
                     error_reason=reason,
-                    requested_quantity=requested_quantity,
+                    requested_quantity=None,
                 )
+            requested_quantity = self._calculate_sell_quantity(approved_decision, price, held_quantity)
+        else:
+            requested_quantity = self._calculate_quantity(
+                approved_decision,
+                price,
+                portfolio_value=buy_risk_details.get("portfolio_value"),
+            )
         quantity = requested_quantity
         if action == "SELL" and held_quantity is not None:
             quantity = min(float(requested_quantity), held_quantity)
@@ -1373,7 +1375,12 @@ class BrokerClient:
             return f"{symbol or 'Missing symbol'} is not in ALLOWED_SYMBOLS."
 
         allocation = self._to_float(decision.get("suggested_allocation_percent"))
-        if allocation is None or allocation <= 0:
+        if allocation is None:
+            return "Suggested allocation must be greater than 0."
+        if action == "SELL":
+            if allocation < 0:
+                return "Suggested allocation must be 0 or greater for SELL."
+        elif allocation <= 0:
             return "Suggested allocation must be greater than 0."
 
         if allocation > self.settings.max_position_allocation_percent:
@@ -1402,6 +1409,33 @@ class BrokerClient:
 
         notional = portfolio_value * (allocation / 100)
         return int(notional // latest_price)
+
+    def _calculate_sell_quantity(
+        self,
+        decision: dict[str, Any],
+        latest_price: float,
+        held_quantity: float,
+    ) -> float:
+        """Shares to sell so the remaining position matches the target allocation.
+
+        For SELL decisions suggested_allocation_percent is the target remaining
+        allocation after the sell, where 0 means fully exit the position.
+        """
+        allocation = self._to_float(decision.get("suggested_allocation_percent"))
+        if allocation is None or allocation < 0:
+            return 0
+        if allocation == 0:
+            return held_quantity
+
+        snapshot = self._last_snapshot
+        portfolio_value = (
+            self._to_float(snapshot.account.get("portfolio_value")) if snapshot else None
+        )
+        if portfolio_value is None or portfolio_value <= 0:
+            return 0
+
+        target_shares = int(portfolio_value * (allocation / 100) // latest_price)
+        return max(0.0, held_quantity - target_shares)
 
     def _allowed_symbols_for_decision(self, decision: dict[str, Any]) -> list[str]:
         cycle_symbols = decision.get("cycle_allowed_symbols")

@@ -102,6 +102,11 @@ Decision rules:
 - Never suggest a trade outside the final dynamic watchlist when dynamic watchlist data is supplied.
 - Never suggest a trade outside regular US market hours.
 - Do not exceed the supplied max allocation limits.
+- The max allocation limit applies to sizing NEW BUY positions only.
+- Do not recommend a BUY for a symbol whose existing position already meets or exceeds the max allocation limit.
+- Do not recommend a SELL solely because an existing position's value has grown above the max allocation limit through price appreciation. Only recommend SELL for genuine technical or risk reasons such as bearish signals, stop-loss conditions, or profit-taking.
+- For BUY, suggested_allocation_percent is the target position size as a percentage of portfolio value.
+- For SELL, suggested_allocation_percent is the target REMAINING allocation percentage after the sell. Use 0 to fully exit the position.
 - Return JSON only.
 - Do not include Markdown outside the JSON response.
 - Do not include comments in the JSON.
@@ -113,6 +118,17 @@ Required output format:
   "confidence": 0.72,
   "suggested_allocation_percent": 5,
   "reason": "Concise reason for the decision.",
+  "stop_loss_percent": 3,
+  "take_profit_percent": 6
+}
+
+For SELL responses, keep the same JSON keys. suggested_allocation_percent is the target remaining allocation after the sell (0 = fully exit):
+{
+  "symbol": "AAPL",
+  "action": "SELL",
+  "confidence": 0.68,
+  "suggested_allocation_percent": 0,
+  "reason": "Concise technical or risk-based reason for exiting.",
   "stop_loss_percent": 3,
   "take_profit_percent": 6
 }
