@@ -89,7 +89,7 @@ DATABASE_PATH=/data/trading_bot.db
 | `PAPER_TRADING` | `true` | Keeps the bot in paper-trading mode. |
 | `DRY_RUN` | `true` | Extra safety gate. Risk manager rejects trades unless this is false. |
 | `BOT_VERSION` | `local` | Optional label shown in Discord summaries, useful for Railway build or commit identifiers. |
-| `TRADING_INTERVAL_MINUTES` | `15` | How often to run a cycle during regular US market hours. |
+| `TRADING_INTERVAL_MINUTES` | `10` | How often to run a cycle during regular US market hours. |
 | `POSITION_MANAGEMENT_ENABLED` | `false` | Enables broker-only deterministic management of existing positions. |
 | `POSITION_MANAGEMENT_INTERVAL_MINUTES` | `5` | How often to manage open positions without scanning or calling OpenAI. |
 | `MARKET_TIMEZONE` | `America/New_York` | Timezone used for market checks. |
@@ -129,7 +129,7 @@ DATABASE_PATH=/data/trading_bot.db
 3. Check whether `BOT_ENABLED` is true.
 4. Check whether the US market is open.
 5. If the market is closed, sleep and do not call OpenAI.
-6. If the market is open, manage positions every 5 minutes when enabled and run the existing trading cycle every 15 minutes.
+6. If the market is open, manage positions every 5 minutes when enabled and run the existing trading cycle every 10 minutes.
 7. Collect broker/account/position/market data.
 8. Call the AI decision function.
 9. Pass the AI decision through the risk manager.
@@ -200,6 +200,14 @@ This initialises the normal settings, database, broker, risk manager, and strate
 When enabled, `position_manager.py` refreshes broker holdings and current Alpaca prices every five minutes without running the broad scanner or invoking OpenAI. At a 3% gain it sells half of the original position once. After that order is broker-confirmed as filled, it retains the post-sale high and exits the remaining broker-held quantity at an exact 2% pullback. OpenAI SELL orders remain valid, and both paths inspect broker-current holdings and covering open SELL orders before submission.
 
 For whole-share positions, half is rounded down to a whole share (for example, 3 shares sells 1). Fractional positions round down to six decimal places. The sale is capped to current holdings, and if the result would be zero or consume the entire position, no partial sale is made; the full position enters trailing management instead. Legacy holdings record whether their original quantity was recovered from confirmed executions or adopted as a conservative current-quantity baseline.
+
+Before a position ever reaches the 3% partial-profit target, three additional deterministic exits protect against losers and stagnant capital:
+
+- **Hard stop-loss (`STOP_LOSS_PERCENT`, 2%)**: closes the entire position immediately if it is down 2% or more, independent of the AI's discretionary SELL judgement.
+- **Time-stop / dead-zone (`TIME_STOP_HOURS`, 2 hours; `TIME_STOP_BAND_PERCENT`, ±1%)**: closes the entire position if it has been open 2 hours or more and is sitting within ±1% of cost basis, so capital is not left idle in a trade that is not clearly heading toward the stop-loss or the profit target.
+- **EOD flatten (`EOD_FLATTEN_BUFFER_MINUTES`, 15 minutes)**: force-closes every open position 15 minutes before today's actual NYSE close (using the market calendar, so early-close days are respected), regardless of gain, loss, or trailing state. This check runs first and overrides every other exit path.
+
+Once the partial profit is taken and trailing management activates, the 2% trailing stop owns loss control for the remaining shares; the stop-loss and time-stop checks no longer apply. Each exit path records its own `status` (`stop_loss_submitted`, `time_stop_submitted`, `eod_flatten_submitted`) and `exit_source`/`exit_reason` pair, consistent with the existing `partial_profit` and `trailing_stop` conventions.
 
 Run one management pass, respecting the configured `DRY_RUN` value:
 

@@ -125,6 +125,7 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
         "DRY_RUN",
         "OPENAI_API_KEY",
         "OPENAI_MODEL",
+        "TRADING_INTERVAL_MINUTES",
         "ALPACA_API_KEY",
         "ALPACA_SECRET_KEY",
         "DISCORD_WEBHOOK_URL",
@@ -155,6 +156,7 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
     assert settings.bot_enabled is False
     assert settings.paper_trading is True
     assert settings.dry_run is True
+    assert settings.trading_interval_minutes == 10
     assert settings.discord_daily_summary_enabled is False
     assert settings.openai_model == "gpt-5-mini"
     assert settings.dynamic_watchlist_enabled is False

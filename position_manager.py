@@ -3,34 +3,41 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import database
 from config import Settings
+from scheduler import MarketScheduler
 
 
 logger = logging.getLogger(__name__)
 
 PARTIAL_TARGET_PERCENT = Decimal("3.0")
 TRAILING_STOP_PERCENT = Decimal("2.0")
+STOP_LOSS_PERCENT = Decimal("2.0")
+TIME_STOP_HOURS = 2
+TIME_STOP_BAND_PERCENT = Decimal("1.0")
+EOD_FLATTEN_BUFFER_MINUTES = 15
 FRACTIONAL_QUANTUM = Decimal("0.000001")
 OPEN_ORDER_STATUSES = {"new", "accepted", "pending_new", "partially_filled", "partial_fill", "held", "open"}
 
 
 class PositionManager:
-    """Apply partial-profit and post-partial trailing rules to broker holdings."""
+    """Apply deterministic partial-profit, trailing, stop-loss, time-stop, and EOD-flatten exits to broker holdings."""
 
-    def __init__(self, settings: Settings, broker: Any) -> None:
+    def __init__(self, settings: Settings, broker: Any, scheduler: MarketScheduler) -> None:
         self.settings = settings
         self.broker = broker
+        self.scheduler = scheduler
 
     def run_once(self) -> dict[str, int]:
         """Reconcile state and manage each current position independently."""
         counts = {"checked": 0, "submitted": 0, "skipped": 0, "closed": 0, "errors": 0}
         now = datetime.now(ZoneInfo(self.settings.market_timezone))
+        flatten_deadline = self._flatten_deadline(now)
         try:
             reconcile = getattr(self.broker, "reconcile_executions", None)
             if callable(reconcile):
@@ -56,12 +63,20 @@ class PositionManager:
         logger.info("Position management checking %s open positions.", len(positions_by_symbol))
         for symbol, position in positions_by_symbol.items():
             try:
-                self._manage_symbol(symbol, position, now, counts)
+                self._manage_symbol(symbol, position, now, counts, flatten_deadline)
             except Exception as exc:
                 counts["errors"] += 1
                 logger.warning("Position management skipped %s safely: %s.", symbol, exc.__class__.__name__)
         logger.info("Position management run complete: %s", counts)
         return counts
+
+    def _flatten_deadline(self, now: datetime) -> datetime | None:
+        """Return today's EOD-flatten cutoff, or None if today has no regular session."""
+        market_hours = self.scheduler.market_hours(now)
+        if market_hours is None:
+            return None
+        _, market_close = market_hours
+        return market_close - timedelta(minutes=EOD_FLATTEN_BUFFER_MINUTES)
 
     def _manage_symbol(
         self,
@@ -69,6 +84,7 @@ class PositionManager:
         position: dict[str, Any],
         now: datetime,
         counts: dict[str, int],
+        flatten_deadline: datetime | None,
     ) -> None:
         quantity = self._decimal(position.get("quantity"))
         cost_basis = self._decimal(position.get("average_price"))
@@ -122,6 +138,9 @@ class PositionManager:
             symbol, self._money(cost_basis), self._money(price), self._percent(gain_percent),
         )
 
+        if self._manage_eod_flatten(state, quantity, cost_basis, price, gain_percent, now, counts, flatten_deadline):
+            return
+
         if bool(state.get("trailing_stop_activated")):
             self._manage_trailing(state, quantity, cost_basis, price, now, counts)
             return
@@ -135,6 +154,8 @@ class PositionManager:
             self._manage_trailing(self._state(symbol) or state, quantity, cost_basis, price, now, counts)
             return
         if gain_percent < PARTIAL_TARGET_PERCENT:
+            if self._manage_stop_loss_and_time_stop(state, quantity, cost_basis, price, gain_percent, now, counts):
+                return
             logger.info("Position management %s: partial target pending.", symbol)
             return
 
@@ -230,30 +251,172 @@ class PositionManager:
         )
         if price > stop:
             return
-        result = self._submit_sell(
+        self._submit_full_exit(
             symbol,
             quantity,
-            price,
             cost_basis,
+            price,
             source="trailing_stop",
             reason="TRAILING_STOP_2_PERCENT",
+            status="final_exit_submitted",
             now=now,
+            counts=counts,
         )
+
+    def _manage_eod_flatten(
+        self,
+        state: dict[str, Any],
+        quantity: Decimal,
+        cost_basis: Decimal,
+        price: Decimal,
+        gain_percent: Decimal,
+        now: datetime,
+        counts: dict[str, int],
+        flatten_deadline: datetime | None,
+    ) -> bool:
+        """Force-close any open position once the EOD flatten deadline has passed.
+
+        This overrides every other exit path: trailing-active positions, pending
+        partial-profit orders, and positions that have not hit any other
+        threshold are all flattened once the deadline arrives.
+        """
+        if flatten_deadline is None or now < flatten_deadline:
+            return False
+        symbol = str(state["symbol"]).upper()
+        if state.get("final_exit_order_id"):
+            logger.info("Position management %s: EOD flatten pending reconciliation.", symbol)
+            return True
+        if state.get("partial_profit_order_id") and not bool(state.get("partial_profit_taken")):
+            self._cancel_pending_partial_profit(symbol, state)
+        logger.info(
+            "Position management %s: EOD flatten triggered (cost=%s current=%s gain=%s%%).",
+            symbol, self._money(cost_basis), self._money(price), self._percent(gain_percent),
+        )
+        self._submit_full_exit(
+            symbol,
+            quantity,
+            cost_basis,
+            price,
+            source="eod_flatten",
+            reason="EOD_FLATTEN",
+            status="eod_flatten_submitted",
+            now=now,
+            counts=counts,
+        )
+        return True
+
+    def _cancel_pending_partial_profit(self, symbol: str, state: dict[str, Any]) -> None:
+        """Best-effort cancel of an unfilled partial-profit order ahead of an EOD flatten.
+
+        A pending partial-profit order only reserves part of the current broker
+        quantity, so a full-quantity flatten sell submitted alongside it can be
+        rejected for exceeding the shares still free to sell. Cancelling first
+        clears that reservation; if cancellation is unavailable or fails, the
+        flatten sell is still attempted and falls back to the broker's existing
+        safe-rejection/duplicate-prevention behavior.
+        """
+        order_id = str(state["partial_profit_order_id"])
+        cancel = getattr(self.broker, "cancel_position_management_order", None)
+        cancelled = bool(cancel(order_id)) if callable(cancel) else False
+        logger.info(
+            "Position management %s: EOD flatten cancelling pending partial-profit order %s (cancelled=%s).",
+            symbol, order_id, cancelled,
+        )
+
+    def _manage_stop_loss_and_time_stop(
+        self,
+        state: dict[str, Any],
+        quantity: Decimal,
+        cost_basis: Decimal,
+        price: Decimal,
+        gain_percent: Decimal,
+        now: datetime,
+        counts: dict[str, int],
+    ) -> bool:
+        """Force-close a pre-partial-profit position on a hard stop-loss or a dead-zone timeout.
+
+        Trailing management already owns loss control once the partial profit is
+        taken, so callers must only reach this while the 3% target is unmet.
+        """
+        symbol = str(state["symbol"]).upper()
+        if state.get("final_exit_order_id"):
+            logger.info("Position management %s: final exit pending reconciliation.", symbol)
+            return True
+        if gain_percent <= -STOP_LOSS_PERCENT:
+            source, reason, status = "stop_loss", "STOP_LOSS_2_PERCENT", "stop_loss_submitted"
+        elif (
+            self._time_stop_due(state, now)
+            and -TIME_STOP_BAND_PERCENT <= gain_percent <= TIME_STOP_BAND_PERCENT
+        ):
+            source, reason, status = "time_stop", "TIME_STOP_DEAD_ZONE_2H", "time_stop_submitted"
+        else:
+            return False
+
+        logger.info(
+            "Position management %s: %s triggered (cost=%s current=%s gain=%s%%).",
+            symbol, reason, self._money(cost_basis), self._money(price), self._percent(gain_percent),
+        )
+        self._submit_full_exit(
+            symbol,
+            quantity,
+            cost_basis,
+            price,
+            source=source,
+            reason=reason,
+            status=status,
+            now=now,
+            counts=counts,
+        )
+        return True
+
+    def _submit_full_exit(
+        self,
+        symbol: str,
+        quantity: Decimal,
+        cost_basis: Decimal,
+        price: Decimal,
+        *,
+        source: str,
+        reason: str,
+        status: str,
+        now: datetime,
+        counts: dict[str, int],
+    ) -> None:
+        """Submit a one-shot full-position SELL and record the resulting exit state."""
+        result = self._submit_sell(symbol, quantity, price, cost_basis, source=source, reason=reason, now=now)
         if result.get("executed") and result.get("broker_order_id"):
             database.update_position_management(
                 symbol,
                 final_exit_order_id=str(result["broker_order_id"]),
-                status="final_exit_submitted",
+                status=status,
                 last_checked_at=now.isoformat(),
             )
             counts["submitted"] += 1
-            logger.info("Position management %s: submitted trailing-stop SELL %s.", symbol, quantity)
+            logger.info("Position management %s: submitted %s SELL %s.", symbol, source, quantity)
         elif result.get("duplicate_prevented"):
             counts["skipped"] += 1
-            logger.info("Position management %s: duplicate trailing SELL prevented.", symbol)
+            logger.info("Position management %s: duplicate %s SELL prevented.", symbol, source)
         else:
             counts["skipped"] += 1
-            logger.info("Position management %s: trailing SELL not submitted (%s).", symbol, result.get("reason"))
+            logger.info("Position management %s: %s SELL not submitted (%s).", symbol, source, result.get("reason"))
+
+    @staticmethod
+    def _time_stop_due(state: dict[str, Any], now: datetime) -> bool:
+        opened_at = PositionManager._parse_timestamp(state.get("opened_at"))
+        if opened_at is None:
+            return False
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=now.tzinfo)
+        return now - opened_at >= timedelta(hours=TIME_STOP_HOURS)
+
+    @staticmethod
+    def _parse_timestamp(value: Any) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
 
     def _submit_sell(
         self,

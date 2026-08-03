@@ -182,7 +182,7 @@ def main() -> None:
     from position_manager import PositionManager
     from scheduler import CycleLock
 
-    position_manager = PositionManager(settings=settings, broker=broker)
+    position_manager = PositionManager(settings=settings, broker=broker, scheduler=scheduler)
     cycle_lock_path = settings.data_dir / "trading-cycle.lock"
 
     if args.test_position_manager or args.run_position_management_once:

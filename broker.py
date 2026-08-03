@@ -173,6 +173,25 @@ class BrokerClient:
             ),
         }
 
+    def cancel_position_management_order(self, order_id: str) -> bool:
+        """Best-effort cancel of a still-open deterministic exit order.
+
+        Used before an EOD flatten replaces a smaller pending order (for example
+        an unfilled partial-profit SELL) with a full-quantity flatten SELL, so
+        the flatten is not rejected for exceeding the shares still free to sell.
+        """
+        api = getattr(self._broker, "api", None)
+        if api is None or not hasattr(api, "cancel_order_by_id"):
+            return False
+        try:
+            api.cancel_order_by_id(self._canonical_order_id(order_id))
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Order cancellation failed safely for %s: %s.", order_id, exc.__class__.__name__
+            )
+            return False
+
     def execute_position_management_sell(
         self,
         symbol: str,
