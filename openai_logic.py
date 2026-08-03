@@ -134,6 +134,7 @@ class OpenAIDecisionClient:
         response = self.client.chat.completions.create(
             **self._build_chat_completion_request(system_prompt, user_prompt)
         )
+        self._log_usage(getattr(response, "usage", None))
 
         raw_content = response.choices[0].message.content
         if not raw_content:
@@ -178,8 +179,14 @@ class OpenAIDecisionClient:
         template_path = self.prompts_dir / "user_prompt_template.md"
         template = template_path.read_text(encoding="utf-8")
 
-        context_json = context.model_dump_json(indent=2)
         context_dict = context.model_dump(mode="json")
+        recent_market_data = dict(context_dict["recent_price_data"])
+        for separately_rendered_field in (
+            "dynamic_watchlist",
+            "market_intelligence",
+            "history_context",
+        ):
+            recent_market_data.pop(separately_rendered_field, None)
         account_summary = {
             "cash": context_dict["account_cash"],
             "buying_power": context_dict["buying_power"],
@@ -192,7 +199,7 @@ class OpenAIDecisionClient:
             "positions": json.dumps(context_dict["current_positions"], indent=2),
             "watchlist": json.dumps(context_dict["watchlist_symbols"], indent=2),
             "recent_market_data": json.dumps(
-                context_dict["recent_price_data"],
+                recent_market_data,
                 indent=2,
             ),
             "dynamic_watchlist": self._format_dynamic_watchlist(context_dict),
@@ -200,13 +207,29 @@ class OpenAIDecisionClient:
             "historical_context": self._format_history_context(context_dict),
             "risk_rules": json.dumps(context_dict["risk_rules"], indent=2),
             "previous_trades": context.previous_trade_summary or "None",
-            "context": context_json,
         }
 
         rendered = template
         for placeholder, value in replacements.items():
             rendered = rendered.replace(f"{{{{{placeholder}}}}}", str(value))
         return rendered
+
+    def _log_usage(self, usage: Any) -> None:
+        """Log non-sensitive token counts so API cost can be measured."""
+        if usage is None:
+            return
+
+        prompt_details = getattr(usage, "prompt_tokens_details", None)
+        completion_details = getattr(usage, "completion_tokens_details", None)
+        logger.info(
+            "OpenAI usage: input_tokens=%s cached_input_tokens=%s "
+            "output_tokens=%s reasoning_output_tokens=%s total_tokens=%s.",
+            getattr(usage, "prompt_tokens", None),
+            getattr(prompt_details, "cached_tokens", None),
+            getattr(usage, "completion_tokens", None),
+            getattr(completion_details, "reasoning_tokens", None),
+            getattr(usage, "total_tokens", None),
+        )
 
     def _format_market_intelligence(self, context_dict: dict[str, Any]) -> str:
         """Render indicators per symbol with current position context."""

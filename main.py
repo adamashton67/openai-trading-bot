@@ -205,10 +205,12 @@ def main() -> None:
             if not scheduler.is_market_open():
                 logger.info("US market is closed. Skipping trading cycle and OpenAI call.")
                 if scheduler.is_after_market_close():
-                    summary_notifier.send_daily_summary(
-                        trading_day=scheduler.now().date(),
-                        current_snapshot=broker.collect_snapshot(),
-                    )
+                    trading_day = scheduler.now().date()
+                    if summary_notifier.is_summary_due(trading_day):
+                        summary_notifier.send_daily_summary(
+                            trading_day=trading_day,
+                            current_snapshot=broker.collect_portfolio_snapshot(),
+                        )
                 scheduler.sleep_while_market_closed()
                 continue
 

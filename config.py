@@ -49,7 +49,6 @@ class Settings:
     openai_model: str
     alpaca_api_key: str
     alpaca_secret_key: str
-    alpaca_paper_base_url: str
     max_position_allocation_percent: float
     max_open_positions: int
     max_total_invested_percent: float
@@ -116,10 +115,6 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         openai_model=os.getenv("OPENAI_MODEL", "gpt-5-mini"),
         alpaca_api_key=os.getenv("ALPACA_API_KEY", ""),
         alpaca_secret_key=os.getenv("ALPACA_SECRET_KEY", ""),
-        alpaca_paper_base_url=os.getenv(
-            "ALPACA_PAPER_BASE_URL",
-            "https://paper-api.alpaca.markets",
-        ),
         max_position_allocation_percent=float(
             os.getenv("MAX_POSITION_ALLOCATION_PERCENT", "5")
         ),

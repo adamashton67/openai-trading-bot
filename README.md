@@ -10,28 +10,66 @@ Python validates.
 Lumibot executes.
 ```
 
+## Strategy Goals (read this before changing exit logic)
+
+This bot is deliberately tuned to trade like a **day trader, not a swing trader**. That
+decision came out of a review of a week of production logs where the AI's own discretionary
+SELL judgement was the only thing standing between a losing position and reality — one
+position was left open and losing more than 7% for hours because nothing forced an earlier
+exit, while a separate winning position was cut at little more than 1% gain purely on AI
+whim. That inconsistency is the reason `position_manager.py` now owns exits deterministically
+instead of leaving them to AI discretion.
+
+The outcomes this bot is tuned for, in priority order:
+
+1. **Small, frequent, consistent wins over rare big ones.** Target roughly $100-200 profit
+   per trade, not a multi-day hold hoping for $1,000+. `PARTIAL_TARGET_PERCENT` (3%) and the
+   per-position allocation cap are sized so a full win lands in that range on a typical
+   account balance — don't casually resize one without checking the other.
+2. **Cut losers fast and mechanically, not on AI discretion.** `STOP_LOSS_PERCENT` (2%) and
+   the `TIME_STOP_HOURS`/`TIME_STOP_BAND_PERCENT` dead-zone check exist specifically so a
+   losing or stagnant position can never again be left to drift for hours the way it did in
+   the log review that motivated this. These checks run every 5-minute position-management
+   cycle, independent of whatever the AI decides that cycle.
+3. **No overnight risk, full daily capital recycling.** Every open position is force-closed
+   before the close (`EOD_FLATTEN_BUFFER_MINUTES`) so capital is never sitting idle in a
+   multi-day hold — it's freed up to go back into a fresh opportunity the next session.
+4. **More entries per day, not bigger ones.** `TRADING_INTERVAL_MINUTES` was deliberately
+   shortened (15 → 10) to give the AI more looks per day at new BUY candidates, on the theory
+   that daily trade *volume* is the lever for this account, not position size or hold time.
+
+If you're changing any of the constants in `position_manager.py` or `config.py`, ask which of
+these four goals the change serves before touching it — see "Design Decisions & Deferred
+Work" below for what was deliberately left alone and why.
+
 ## Project Structure
 
 ```text
 .
-├── main.py
-├── config.py
-├── broker.py
-├── strategy.py
-├── risk_manager.py
-├── scheduler.py
-├── logger_config.py
-├── storage.py
-├── database.py
+├── main.py                        # Long-running entry point, CLI flags, main loop
+├── config.py                      # Settings dataclass loaded from environment variables
+├── scheduler.py                   # Market-hours checks, NYSE calendar, cycle cadence, file lock
+├── broker.py                      # Alpaca/Lumibot execution, portfolio guards, order reconciliation
+├── strategy.py                    # AI-driven trading cycle: build context, get decision, risk-check, execute
+├── risk_manager.py                # Python-owned guardrails applied to every AI suggestion
+├── position_manager.py            # Deterministic exits: partial-profit, trailing, stop-loss, time-stop, EOD flatten
+├── openai_logic.py                # Prompt loading, OpenAI call, JSON parsing/validation (AIDecision)
+├── market_indicators.py           # Technical indicator calculations for scanner/prompt data
+├── watchlist_scanner.py           # Dynamic/broad-market watchlist scanning and ranking
+├── context_history.py             # Loads recent SQLite history for the OpenAI prompt
+├── database.py                    # SQLite persistence: decisions, executions, snapshots, position_management
+├── storage.py                     # Trading journal (local JSON) used by Discord summaries
+├── logger_config.py               # Logging setup
 ├── notifications/
-│   ├── notifier.py
-│   └── discord_notifier.py
-├── tests/
+│   ├── notifier.py                # Daily summary building/dedupe
+│   └── discord_notifier.py        # Discord webhook delivery
+├── tests/                         # pytest suite (see below)
 ├── prompts/
-│   ├── system_prompt.md
+│   ├── system_prompt.md           # AI system prompt: constraints, JSON schema, decision rules
 │   └── user_prompt_template.md
-├── requirements.txt
-├── requirements-dev.txt
+├── execution_test.py / openai_test.py / scanner_test.py   # Backing modules for --test-* CLI flags
+├── data/, logs/                    # Runtime output (gitignored) — journal, lock file, log rotation
+├── requirements.txt / requirements-dev.txt
 ├── .env.example
 └── README.md
 ```
@@ -94,10 +132,9 @@ DATABASE_PATH=/data/trading_bot.db
 | `POSITION_MANAGEMENT_INTERVAL_MINUTES` | `5` | How often to manage open positions without scanning or calling OpenAI. |
 | `MARKET_TIMEZONE` | `America/New_York` | Timezone used for market checks. |
 | `OPENAI_API_KEY` | empty | OpenAI API key. |
-| `OPENAI_MODEL` | `gpt-5-mini` | Placeholder model setting for future AI logic. |
+| `OPENAI_MODEL` | `gpt-5-mini` | Model used for each AI trading decision. |
 | `ALPACA_API_KEY` | empty | Alpaca API key. |
 | `ALPACA_SECRET_KEY` | empty | Alpaca secret key. |
-| `ALPACA_PAPER_BASE_URL` | `https://paper-api.alpaca.markets` | Alpaca paper endpoint. |
 | `MAX_POSITION_ALLOCATION_PERCENT` | `5` | Starter risk limit per suggested trade. |
 | `MAX_OPEN_POSITIONS` | `10` | Maximum distinct held or pending-entry symbols after a new BUY. |
 | `MAX_TOTAL_INVESTED_PERCENT` | `60` | Maximum portfolio percentage invested after held positions, pending BUYs, and a new BUY. |
@@ -137,6 +174,17 @@ DATABASE_PATH=/data/trading_bot.db
 11. Log the result.
 12. Continue until stopped.
 
+These are two independent, differently-timed loops driven by `main.py` and `scheduler.py`:
+
+- **The AI trading cycle** (steps 7-11 above, every `TRADING_INTERVAL_MINUTES`) only ever
+  proposes new BUYs, discretionary SELLs, or HOLDs for one symbol per cycle — see "AI Decision
+  Layer" below for why that's one decision at a time, not a batch.
+- **Deterministic position management** (`position_manager.py`, every
+  `POSITION_MANAGEMENT_INTERVAL_MINUTES`) runs independently of the AI entirely and owns every
+  exit for existing positions. See "Deterministic Position Management" for the exact order it
+  checks things in — EOD flatten first, then trailing, then stop-loss/time-stop, then the
+  partial-profit target — which matters if you're reading or extending `_manage_symbol`.
+
 ## AI Decision Layer
 
 `openai_logic.py` owns prompt loading, OpenAI API calls, JSON parsing, and Pydantic validation.
@@ -150,6 +198,12 @@ risk_manager_input = decision.to_risk_manager_dict()
 ```
 
 The AI layer never executes trades and never bypasses the risk manager.
+
+`AIDecision` in `openai_logic.py` is a single object — one symbol, one action, per trading
+cycle. The AI sees full context on every position and every watchlist symbol each cycle (see
+`_build_ai_context` / `_format_market_intelligence` in `strategy.py`), but can only act on one
+of them. This was evaluated and deliberately deferred rather than changed — see "Design
+Decisions & Deferred Work" below for why.
 
 Real Alpaca paper order submission is isolated in `broker.py` and remains blocked unless `BOT_ENABLED=true`, `PAPER_TRADING=true`, `DRY_RUN=false`, market data includes a valid latest price, and the risk manager approves the decision.
 
@@ -197,7 +251,7 @@ This initialises the normal settings, database, broker, risk manager, and strate
 
 ## Deterministic Position Management
 
-When enabled, `position_manager.py` refreshes broker holdings and current Alpaca prices every five minutes without running the broad scanner or invoking OpenAI. At a 3% gain it sells half of the original position once. After that order is broker-confirmed as filled, it retains the post-sale high and exits the remaining broker-held quantity at an exact 2% pullback. OpenAI SELL orders remain valid, and both paths inspect broker-current holdings and covering open SELL orders before submission.
+When enabled, `position_manager.py` refreshes broker holdings and current Alpaca prices every five minutes without running the broad scanner or invoking OpenAI. `PositionManager` takes a `MarketScheduler` instance (constructed once in `main.py` and shared with the AI trading cycle) so it can read today's actual NYSE close from the market calendar for the EOD-flatten check below, rather than duplicating calendar logic. At a 3% gain it sells half of the original position once. After that order is broker-confirmed as filled, it retains the post-sale high and exits the remaining broker-held quantity at an exact 2% pullback. OpenAI SELL orders remain valid, and both paths inspect broker-current holdings and covering open SELL orders before submission.
 
 For whole-share positions, half is rounded down to a whole share (for example, 3 shares sells 1). Fractional positions round down to six decimal places. The sale is capped to current holdings, and if the result would be zero or consume the entire position, no partial sale is made; the full position enters trailing management instead. Legacy holdings record whether their original quantity was recovered from confirmed executions or adopted as a conservative current-quantity baseline.
 
@@ -208,6 +262,37 @@ Before a position ever reaches the 3% partial-profit target, three additional de
 - **EOD flatten (`EOD_FLATTEN_BUFFER_MINUTES`, 15 minutes)**: force-closes every open position 15 minutes before today's actual NYSE close (using the market calendar, so early-close days are respected), regardless of gain, loss, or trailing state. This check runs first and overrides every other exit path.
 
 Once the partial profit is taken and trailing management activates, the 2% trailing stop owns loss control for the remaining shares; the stop-loss and time-stop checks no longer apply. Each exit path records its own `status` (`stop_loss_submitted`, `time_stop_submitted`, `eod_flatten_submitted`) and `exit_source`/`exit_reason` pair, consistent with the existing `partial_profit` and `trailing_stop` conventions.
+
+**Exit check order inside `_manage_symbol` (top to bottom, first match wins):**
+
+1. EOD flatten — overrides everything below, regardless of state.
+2. Trailing stop — only if `trailing_stop_activated` (i.e. the partial profit already filled).
+3. Stop-loss / time-stop — only reachable pre-partial-profit (gain below `PARTIAL_TARGET_PERCENT`).
+4. Partial-profit target — the original 3% rule, only once nothing above has fired.
+
+**Every exit path guards against resubmitting while its own order is still pending
+reconciliation.** Trailing, stop-loss/time-stop, and EOD flatten each check
+`state.get("final_exit_order_id")` and return immediately if it's already set, instead of
+calling the broker again on the next 5-minute cycle before the previous order has filled. This
+was added after the original stop-loss/time-stop implementation was found to be missing this
+guard (broker-side `_covering_open_sell_order` duplicate-prevention in `broker.py` stopped it
+from ever placing a real duplicate order, but it was still calling the broker and logging
+"duplicate prevented" every cycle until the order filled — fixed for consistency with the
+other two paths).
+
+**EOD flatten cancels a still-open partial-profit order before flattening, if it can.** If the
+flatten deadline arrives while a partial-profit SELL is submitted but not yet filled
+(`partial_profit_order_id` set, `partial_profit_taken` still false), a full-quantity flatten
+sell submitted alongside it would only be able to sell the shares not already reserved by that
+order — `broker._covering_open_sell_order` only treats an existing order as "covering" a new
+request when its remaining quantity is greater than or equal to the new request, so a
+half-size pending order does not shield a full-quantity flatten from a broker-side rejection.
+`_manage_eod_flatten` calls `BrokerClient.cancel_position_management_order(order_id)` first in
+this situation (a thin wrapper around Alpaca's `cancel_order_by_id`) and then submits the
+flatten sell regardless of whether the cancel call reports success — if cancellation worked,
+the flatten now succeeds in the same cycle; if it didn't (or the broker doesn't expose
+cancellation), the flatten sell falls back to the same safe broker-side rejection it would
+have hit anyway, and retries on the next 5-minute cycle.
 
 Run one management pass, respecting the configured `DRY_RUN` value:
 
@@ -257,8 +342,71 @@ To preview the message without sending it:
 python main.py --send-test-summary --dry-run
 ```
 
+## Design Decisions & Deferred Work
+
+These were deliberately evaluated and left alone. If you're picking this project back up,
+read this before "fixing" any of them — they're intentional, not oversights.
+
+- **Position limits (`MAX_OPEN_POSITIONS`, `MAX_TOTAL_INVESTED_PERCENT`,
+  `MAX_POSITION_ALLOCATION_PERCENT`) were left unchanged** when the exit logic above was
+  added. A week of production logs showed the busiest day already produced ~16 trades within
+  the existing caps, while the quietest days coincided with capital being stuck in a single
+  stagnant loser for days rather than the caps themselves being the bottleneck. The
+  stop-loss/time-stop/EOD-flatten changes were made first specifically to test whether faster
+  capital recycling increases daily trade count on its own before touching the caps. If you're
+  considering raising them, check daily trade counts since these exits shipped first — you may
+  not need to.
+- **Multi-symbol AI decisions per cycle were considered and deferred.** The AI already sees
+  every position and every watchlist symbol's indicators each cycle; it just can't act on more
+  than one per cycle. Batching multiple decisions into one AI response was evaluated as a way
+  to open more new positions per day, but was set aside because it needs real design work
+  first: per-decision JSON validation (so one malformed decision in a batch doesn't cost the
+  whole cycle instead of just one, the way a single-decision failure does today), and
+  cumulative allocation/position-count validation across the batch in `risk_manager.py` and
+  `broker.py` (today's portfolio checks assume one decision at a time). There's also a real
+  correlation risk: decisions made in the same cycle share the same market snapshot, so a
+  batch of BUYs is more likely to be correlated than BUYs staggered across separate cycles.
+  `TRADING_INTERVAL_MINUTES` was shortened instead as the lower-risk lever for more entries
+  per day. Revisit batching only as a separate, carefully-scoped change.
+- **`TRADING_INTERVAL_MINUTES` was shortened from 15 to 10 minutes** to increase how often the
+  AI evaluates new BUY candidates per day, on the theory that entry frequency — not position
+  size or hold time — is the lever for this account's $100-200-per-trade goal. If this is
+  overridden as an explicit environment variable on Railway (rather than left to the code
+  default), remember to update it there too; changing the default in `config.py` alone won't
+  affect an environment where it's set explicitly.
+
+## Operations Notes
+
+Lumibot logs a `LUMIBOT_TELEMETRY` line on every cycle with process memory, thread count, and
+file-descriptor usage — useful for right-sizing Railway resources without guessing. Railway's
+seven-day metrics on 2026-08-03 showed average memory use of roughly 0.33 GB (0.62 GB maximum)
+and average CPU use of roughly 0.0022 vCPU. The broad market scanner and indicator calculations
+run sequentially, batched via `BROAD_SCAN_DATA_BATCH_SIZE`, so this workload does not need many
+vCPUs. Railway bills per-second on actual vCPU-seconds and GB-seconds consumed, not on the
+resource limit/cap configured for the service — the cap is a safety ceiling against runaway
+usage, not a cost lever.
+
+During a normal market session the production workload is:
+
+- Up to roughly 39 AI trading cycles at the 10-minute cadence. Each cycle reconciles prior
+  executions, builds the final watchlist and market indicators, requests one OpenAI decision,
+  applies Python risk controls, optionally submits one order, and persists the result.
+- Up to roughly 78 deterministic position-management passes at the 5-minute cadence. These
+  refresh only current holdings and prices; they do not run the scanner or call OpenAI.
+- One closing account/position snapshot and one Discord daily report after the market closes.
+  Once the report is recorded as sent, later closed-market checks do not rebuild the scanner.
+- No OpenAI calls on weekends, market holidays, or while the regular market is closed.
+
+Each successful OpenAI response logs input, cached-input, output, reasoning-output, and total
+token counts. Use those counts with the current OpenAI model pricing rather than estimating
+API spend from request count alone.
+
 ## Next Steps
 
-- Continue paper-trading validation on Railway before disabling `DRY_RUN`.
+- Keep Railway in Alpaca paper-trading mode while validating real paper-order execution with
+  `DRY_RUN=false`; do not consider live brokerage execution until several sessions are stable.
+- Watch daily trade counts for a few sessions now that stop-loss/time-stop/EOD-flatten and the
+  10-minute cycle are live, before deciding whether position limits need to change (see
+  "Design Decisions & Deferred Work" above).
 - Review Discord summaries after several market sessions and tune reporting fields if needed.
 - Keep broad scanner and OpenAI prompt changes separate from execution safety changes.

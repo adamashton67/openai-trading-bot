@@ -30,6 +30,12 @@ class BrokerSnapshot:
 class LumibotExecutionStrategyAdapter:
     """Minimal strategy-owned order submission adapter for Lumibot brokers."""
 
+    NEW_ORDER = "new"
+    CANCELED_ORDER = "canceled"
+    FILLED_ORDER = "fill"
+    PARTIALLY_FILLED_ORDER = "partial_fill"
+    ERROR_ORDER = "error"
+
     def __init__(
         self,
         broker: Any,
@@ -39,6 +45,19 @@ class LumibotExecutionStrategyAdapter:
         self.broker = broker
         self.name = name
         self._order_factory = order_factory
+        add_subscriber = getattr(self.broker, "_add_subscriber", None)
+        if callable(add_subscriber):
+            add_subscriber(self)
+
+    def add_event(self, event_name: str, payload: dict[str, Any]) -> None:
+        """Accept Lumibot fill callbacks after its broker state has been updated.
+
+        This application reconciles fills from Alpaca rather than running a full
+        Lumibot ``StrategyExecutor`` thread. Registering this no-op event sink keeps
+        Lumibot's event router consistent and avoids false "Subscriber not found"
+        errors for otherwise successful fills.
+        """
+        logger.debug("Lumibot event received by execution adapter: %s", event_name)
 
     def create_order(self, symbol: str, action: str, quantity: int) -> Any:
         """Create a market order with this adapter as the strategy owner."""
@@ -131,6 +150,19 @@ class BrokerClient:
         market_data = self._collect_market_data()
 
         snapshot = BrokerSnapshot(account=account, positions=positions, market_data=market_data)
+        self._last_snapshot = snapshot
+        self._log_snapshot_gaps(snapshot)
+        return snapshot
+
+    def collect_portfolio_snapshot(self) -> BrokerSnapshot:
+        """Collect only account and position data for reporting outside a trading cycle."""
+        logger.info("Collecting broker account/position data for reporting.")
+
+        snapshot = BrokerSnapshot(
+            account=self._collect_account_data(),
+            positions=self._collect_positions(),
+            market_data={},
+        )
         self._last_snapshot = snapshot
         self._log_snapshot_gaps(snapshot)
         return snapshot

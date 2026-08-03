@@ -46,6 +46,12 @@ class DailySummaryNotifier:
         self.bot_dry_run = bot_dry_run
         self.bot_version = bot_version
 
+    def is_summary_due(self, trading_day: date) -> bool:
+        """Return whether a live-loop summary still needs its closing snapshot."""
+        if not self.enabled and not self.dry_run:
+            return False
+        return self.journal.get_last_summary_date() != trading_day.isoformat()
+
     def send_daily_summary(
         self,
         trading_day: date,

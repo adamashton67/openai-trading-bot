@@ -37,7 +37,7 @@ def make_settings(**overrides):
         "bot_enabled": True,
         "paper_trading": True,
         "dry_run": False,
-        "trading_interval_minutes": 15,
+        "trading_interval_minutes": 10,
         "position_management_enabled": False,
         "position_management_interval_minutes": 5,
         "market_timezone": "America/New_York",
@@ -45,7 +45,6 @@ def make_settings(**overrides):
         "openai_model": "test-model",
         "alpaca_api_key": "test-alpaca-key",
         "alpaca_secret_key": "test-alpaca-secret",
-        "alpaca_paper_base_url": "https://paper-api.alpaca.markets",
         "max_position_allocation_percent": 5,
         "max_open_positions": 10,
         "max_total_invested_percent": 60,
@@ -781,6 +780,53 @@ def test_user_prompt_includes_structured_market_intelligence():
     assert "Historical Context:" in rendered
     assert '"recent_ai_decisions": [' in rendered
     assert '"hold_count_today": 3' in rendered
+
+
+def test_user_prompt_does_not_duplicate_structured_context():
+    client = object.__new__(OpenAIDecisionClient)
+    client.prompts_dir = Path("prompts")
+    context = TradingContext(
+        current_datetime=datetime(2026, 7, 6, 10, 0, tzinfo=ZoneInfo("America/New_York")),
+        market_status="open",
+        watchlist_symbols=["AAPL"],
+        recent_price_data={
+            "scanner_mode": "broad_market",
+            "dynamic_watchlist": [{"symbol": "AAPL", "score": 7}],
+            "market_intelligence": {"AAPL": {"current_price": 214.33}},
+            "history_context": {"duplicate_marker": "must-not-appear"},
+        },
+        history_context={
+            "recent_ai_decisions": [],
+            "recent_executions": [],
+            "portfolio_performance_summary": {},
+        },
+    )
+
+    rendered = client._render_user_prompt(context)
+
+    assert rendered.count('"score": 7') == 1
+    assert rendered.count('"current_price": 214.33') == 1
+    assert "must-not-appear" not in rendered
+    assert '"scanner_mode": "broad_market"' in rendered
+
+
+def test_openai_usage_logging_includes_cost_inputs(caplog):
+    client = object.__new__(OpenAIDecisionClient)
+    usage = types.SimpleNamespace(
+        prompt_tokens=1234,
+        completion_tokens=56,
+        total_tokens=1290,
+        prompt_tokens_details=types.SimpleNamespace(cached_tokens=1000),
+        completion_tokens_details=types.SimpleNamespace(reasoning_tokens=40),
+    )
+
+    with caplog.at_level(logging.INFO, logger="openai_logic"):
+        client._log_usage(usage)
+
+    assert "input_tokens=1234" in caplog.text
+    assert "cached_input_tokens=1000" in caplog.text
+    assert "output_tokens=56" in caplog.text
+    assert "reasoning_output_tokens=40" in caplog.text
 
 
 def test_user_prompt_instructs_null_indicators_are_unavailable():
@@ -1607,7 +1653,11 @@ def test_broad_asset_filter_keeps_realistic_alpaca_field_shapes():
 class MockLumibotBroker:
     def __init__(self, should_raise=False):
         self.submitted_orders = []
+        self.subscribers = []
         self.should_raise = should_raise
+
+    def _add_subscriber(self, subscriber):
+        self.subscribers.append(subscriber)
 
     def submit_order(self, order):
         self.submitted_orders.append(order)
@@ -1821,6 +1871,23 @@ def test_dry_run_still_allows_broker_data_collection():
     assert snapshot.market_data["market_intelligence"]["AAPL"]["RSI14"] == 100
     assert snapshot.market_data["market_intelligence"]["MSFT"]["EMA20"] is not None
     assert snapshot.market_data["market_intelligence"]["SPY"]["VWAP"] is not None
+
+
+def test_portfolio_snapshot_skips_market_collection(monkeypatch):
+    broker = BrokerClient(make_settings())
+    monkeypatch.setattr(broker, "_collect_account_data", lambda: {"cash": 1000})
+    monkeypatch.setattr(broker, "_collect_positions", lambda: [{"symbol": "AAPL"}])
+
+    def fail_market_collection():
+        raise AssertionError("reporting snapshot must not run the market scanner")
+
+    monkeypatch.setattr(broker, "_collect_market_data", fail_market_collection)
+
+    snapshot = broker.collect_portfolio_snapshot()
+
+    assert snapshot.account == {"cash": 1000}
+    assert snapshot.positions == [{"symbol": "AAPL"}]
+    assert snapshot.market_data == {}
 
 
 def test_failed_symbol_does_not_crash_whole_market_collection():
@@ -3232,6 +3299,19 @@ def test_execution_order_is_not_strategy_none_for_fill_event_routing():
     assert fake_broker.submitted_orders[0].strategy == "openai_trading_bot_executor"
 
 
+def test_execution_adapter_registers_a_lumibot_event_sink():
+    fake_broker = MockLumibotBroker()
+    broker = broker_with_snapshot(make_settings(), price=100, fake_broker=fake_broker)
+
+    result = broker.execute_order(approved_decision(action="BUY"))
+
+    assert result["executed"] is True
+    assert len(fake_broker.subscribers) == 1
+    subscriber = fake_broker.subscribers[0]
+    assert subscriber.name == "openai_trading_bot_executor"
+    subscriber.add_event(subscriber.FILLED_ORDER, {"order": fake_broker.submitted_orders[0]})
+
+
 def test_broker_lumibot_exception_is_caught_safely():
     fake_broker = MockLumibotBroker(should_raise=True)
     broker = broker_with_snapshot(make_settings(), price=100, fake_broker=fake_broker)
@@ -3474,3 +3554,17 @@ def test_duplicate_daily_summary_is_prevented(tmp_path):
     assert first.sent is True
     assert second.skipped is True
     assert len(fake_discord.messages) == 1
+
+
+def test_daily_summary_due_check_prevents_rebuilding_a_sent_snapshot(tmp_path):
+    journal = TradingJournal(tmp_path)
+    notifier = DailySummaryNotifier(
+        journal=journal,
+        discord_notifier=FakeDiscordNotifier(),
+        enabled=True,
+    )
+    trading_day = date(2026, 7, 6)
+
+    assert notifier.is_summary_due(trading_day) is True
+    journal.set_last_summary_date(trading_day)
+    assert notifier.is_summary_due(trading_day) is False
