@@ -591,6 +591,27 @@ def archive_daily_statistics(trading_date: date | str) -> None:
         logger.error("Database daily statistics archive failed safely: %s.", exc.__class__.__name__)
 
 
+def is_daily_statistics_archived(trading_date: date | str) -> bool:
+    """Return whether the persistent daily report was already sent and archived."""
+    if not _ensure_database_available():
+        return False
+
+    try:
+        date_text = _date_text(trading_date)
+        with _connect(_database_path) as connection:
+            row = connection.execute(
+                "SELECT archived_at FROM daily_statistics WHERE date = ?",
+                (date_text,),
+            ).fetchone()
+        return bool(row and row[0])
+    except Exception as exc:
+        logger.error(
+            "Database daily statistics archive check failed safely: %s.",
+            exc.__class__.__name__,
+        )
+        return False
+
+
 def load_reconcilable_executions() -> list[dict[str, Any]]:
     """Return broker-backed executions whose final fill state should be refreshed."""
     if not _ensure_database_available():

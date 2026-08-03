@@ -50,7 +50,13 @@ class DailySummaryNotifier:
         """Return whether a live-loop summary still needs its closing snapshot."""
         if not self.enabled and not self.dry_run:
             return False
-        return self.journal.get_last_summary_date() != trading_day.isoformat()
+        return not self._summary_already_sent(trading_day)
+
+    def _summary_already_sent(self, trading_day: date) -> bool:
+        """Check both local journal state and the persistent Railway SQLite archive."""
+        if self.journal.get_last_summary_date() == trading_day.isoformat():
+            return True
+        return database.is_daily_statistics_archived(trading_day)
 
     def send_daily_summary(
         self,
@@ -63,8 +69,7 @@ class DailySummaryNotifier:
             logger.info("Discord daily summary disabled.")
             return SummaryResult(sent=False, skipped=True, message="")
 
-        last_summary_date = self.journal.get_last_summary_date()
-        if not force and last_summary_date == trading_day.isoformat():
+        if not force and self._summary_already_sent(trading_day):
             logger.info("Discord summary skipped because already sent for %s.", trading_day)
             return SummaryResult(sent=False, skipped=True, message="")
 

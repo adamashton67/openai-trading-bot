@@ -394,7 +394,8 @@ During a normal market session the production workload is:
 - Up to roughly 78 deterministic position-management passes at the 5-minute cadence. These
   refresh only current holdings and prices; they do not run the scanner or call OpenAI.
 - One closing account/position snapshot and one Discord daily report after the market closes.
-  Once the report is recorded as sent, later closed-market checks do not rebuild the scanner.
+  Once the report is recorded as sent in persistent SQLite state, later closed-market checks
+  and Railway restarts do not rebuild the scanner or resend the report.
 - No OpenAI calls on weekends, market holidays, or while the regular market is closed.
 
 Each successful OpenAI response logs input, cached-input, output, reasoning-output, and total

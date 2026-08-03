@@ -371,6 +371,7 @@ def test_database_execution_stats_and_archive(tmp_path):
     assert report_data["stats"]["realised_pl"] == 12.34
     assert report_data["stats"]["largest_win"] == 12.34
     assert report_data["stats"]["archived_at"] is not None
+    assert database.is_daily_statistics_archived(trading_day) is True
     assert report_data["executions"][0]["symbol"] == "AAPL"
 
 
@@ -3539,7 +3540,8 @@ class FakeDiscordNotifier:
         return True
 
 
-def test_duplicate_daily_summary_is_prevented(tmp_path):
+def test_duplicate_daily_summary_is_prevented(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "is_daily_statistics_archived", lambda trading_day: False)
     fake_discord = FakeDiscordNotifier()
     notifier = DailySummaryNotifier(
         journal=TradingJournal(tmp_path),
@@ -3556,7 +3558,8 @@ def test_duplicate_daily_summary_is_prevented(tmp_path):
     assert len(fake_discord.messages) == 1
 
 
-def test_daily_summary_due_check_prevents_rebuilding_a_sent_snapshot(tmp_path):
+def test_daily_summary_due_check_prevents_rebuilding_a_sent_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "is_daily_statistics_archived", lambda trading_day: False)
     journal = TradingJournal(tmp_path)
     notifier = DailySummaryNotifier(
         journal=journal,
@@ -3568,3 +3571,20 @@ def test_daily_summary_due_check_prevents_rebuilding_a_sent_snapshot(tmp_path):
     assert notifier.is_summary_due(trading_day) is True
     journal.set_last_summary_date(trading_day)
     assert notifier.is_summary_due(trading_day) is False
+
+
+def test_persistent_database_archive_prevents_summary_after_restart(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "is_daily_statistics_archived", lambda trading_day: True)
+    fake_discord = FakeDiscordNotifier()
+    notifier = DailySummaryNotifier(
+        journal=TradingJournal(tmp_path),
+        discord_notifier=fake_discord,
+        enabled=True,
+    )
+    trading_day = date(2026, 7, 6)
+
+    assert notifier.is_summary_due(trading_day) is False
+    result = notifier.send_daily_summary(trading_day)
+
+    assert result.skipped is True
+    assert fake_discord.messages == []
