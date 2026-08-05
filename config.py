@@ -59,6 +59,7 @@ class Settings:
     broad_market_max_symbols: int
     max_scanner_candidates_after_filters: int
     alpaca_data_feed: str
+    max_market_data_age_seconds: int
     broad_scan_data_batch_size: int
     min_stock_price: float
     min_average_volume: float
@@ -83,6 +84,8 @@ class Settings:
             raise ValueError(
                 "MAX_TOTAL_INVESTED_PERCENT must be greater than 0 and no more than 100."
             )
+        if self.max_market_data_age_seconds < 1:
+            raise ValueError("MAX_MARKET_DATA_AGE_SECONDS must be at least 1.")
 
     @property
     def trading_interval_seconds(self) -> int:
@@ -137,6 +140,10 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
             os.getenv("MAX_SCANNER_CANDIDATES_AFTER_FILTERS", "1000")
         ),
         alpaca_data_feed=os.getenv("ALPACA_DATA_FEED", "iex"),
+        max_market_data_age_seconds=max(
+            1,
+            int(os.getenv("MAX_MARKET_DATA_AGE_SECONDS", "180")),
+        ),
         broad_scan_data_batch_size=int(os.getenv("BROAD_SCAN_DATA_BATCH_SIZE", "200")),
         min_stock_price=float(os.getenv("MIN_STOCK_PRICE", "5")),
         min_average_volume=float(os.getenv("MIN_AVERAGE_VOLUME", "500000")),

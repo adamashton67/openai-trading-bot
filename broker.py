@@ -18,6 +18,9 @@ from watchlist_scanner import (
 logger = logging.getLogger(__name__)
 
 
+ALLOCATION_EPSILON_PERCENT = 1e-9
+
+
 @dataclass(frozen=True)
 class BrokerSnapshot:
     """Account, position, and market context passed into the strategy."""
@@ -110,6 +113,10 @@ class BrokerClient:
         self._broker_available = True
         self._broker_unavailable_reason: str | None = None
         self._execution_strategy_name = "openai_trading_bot_executor"
+        self._broad_assets_cache_date = None
+        self._broad_assets_cache: list[Any] | None = None
+        self._broad_daily_bars_cache_key: tuple[Any, tuple[str, ...]] | None = None
+        self._broad_daily_bars_cache: dict[str, Any] | None = None
 
     def connect(self) -> None:
         """Initialize the broker connection.
@@ -475,7 +482,7 @@ class BrokerClient:
 
             stage = "fetching tradable assets"
             logger.info("Broad scanner: fetching tradable assets.")
-            assets = self._get_broad_market_assets()
+            assets = self._get_broad_market_assets_cached()
             logger.info("Broad scanner: fetched %s assets.", len(assets))
             logger.info("Broad scanner: sample assets: %s.", self._safe_asset_samples(assets))
 
@@ -498,19 +505,10 @@ class BrokerClient:
             stage = "beginning market data collection"
             logger.info("Broad scanner: collecting market data.")
             logger.info(
-                "Broad scanner: first 20 symbols before quality ordering/cap: %s.",
+                "Broad scanner: first 20 asset-filtered symbols: %s.",
                 ", ".join(candidate_symbols[:20]) or "none",
             )
-            candidate_symbols = self._cap_symbols_before_native_data(candidate_symbols, assets)
-            market_data["broad_capped_candidate_count"] = len(candidate_symbols)
-            logger.info(
-                "Broad scanner: capped %s symbols before native Alpaca data calls.",
-                len(candidate_symbols),
-            )
-            logger.info(
-                "Broad scanner: first 20 symbols after quality ordering/cap: %s.",
-                ", ".join(candidate_symbols[:20]) or "none",
-            )
+            market_data["broad_asset_candidate_count"] = len(candidate_symbols)
             logger.info(
                 "Broad scanner: Alpaca native data batch size is %s.",
                 self.settings.broad_scan_data_batch_size,
@@ -518,11 +516,7 @@ class BrokerClient:
 
             stage = "applying liquidity filters"
             logger.info("Broad scanner: applying liquidity filters.")
-            daily_bars_result = self._fetch_native_stock_bars(
-                candidate_symbols,
-                timeframe="day",
-                limit=60,
-            )
+            daily_bars_result = self._fetch_cached_broad_daily_bars(candidate_symbols)
             market_data["broad_bar_request_count"] = daily_bars_result["request_count"]
             logger.info(
                 "Broad scanner: made %s native daily bar requests.",
@@ -530,10 +524,10 @@ class BrokerClient:
             )
 
             preliminary_intelligence = {}
+            liquid_candidates = []
             low_price_count = 0
             low_volume_count = 0
             missing_bar_count = 0
-            partial_intraday_indicator_count = 0
             for symbol in candidate_symbols:
                 daily_bars = daily_bars_result["bars"].get(symbol)
                 if daily_bars is None:
@@ -541,11 +535,6 @@ class BrokerClient:
                     continue
 
                 indicators = calculate_market_indicators(symbol, None, daily_bars)
-                if any(
-                    indicators.get(field_name) is None
-                    for field_name in ("5m_change_percent", "15m_change_percent", "1h_change_percent")
-                ):
-                    partial_intraday_indicator_count += 1
                 price = self._to_float(indicators.get("current_price"))
                 if price is None or price < self.settings.min_stock_price:
                     low_price_count += 1
@@ -557,6 +546,13 @@ class BrokerClient:
                     continue
 
                 preliminary_intelligence[symbol] = indicators
+                liquid_candidates.append(
+                    {
+                        "symbol": symbol,
+                        "price": price,
+                        "volume": average_volume,
+                    }
+                )
 
             logger.info("Broad scanner: %s symbols have usable native daily data.", len(preliminary_intelligence))
             logger.info(
@@ -569,17 +565,56 @@ class BrokerClient:
                 "Broad scanner: skipped %s symbols below minimum average volume.",
                 low_volume_count,
             )
-            if partial_intraday_indicator_count:
-                logger.info(
-                    "Market indicators: skipped/partial indicators for %s symbols due to insufficient intraday bars.",
-                    partial_intraday_indicator_count,
-                )
             market_data["broad_price_filtered_count"] = len(preliminary_intelligence)
+
+            stage = "collecting intraday candidate data"
+            capped_candidates = self._cap_broad_candidates(liquid_candidates)
+            intraday_symbols = [candidate["symbol"] for candidate in capped_candidates]
+            market_data["broad_capped_candidate_count"] = len(intraday_symbols)
+            logger.info(
+                "Broad scanner: retained %s highest-liquidity symbols for intraday analysis.",
+                len(intraday_symbols),
+            )
+            logger.info(
+                "Broad scanner: first 20 symbols after liquidity ordering/cap: %s.",
+                ", ".join(intraday_symbols[:20]) or "none",
+            )
+            minute_bars_result = self._fetch_native_stock_bars(
+                intraday_symbols,
+                timeframe="minute",
+                limit=120,
+            )
+            market_data["broad_bar_request_count"] += minute_bars_result["request_count"]
+            logger.info(
+                "Broad scanner: made %s native minute bar requests for %s liquid candidates.",
+                minute_bars_result["request_count"],
+                len(intraday_symbols),
+            )
+
+            enriched_intelligence = {}
+            missing_intraday_count = 0
+            for symbol in intraday_symbols:
+                minute_bars = minute_bars_result["bars"].get(symbol)
+                if minute_bars is None:
+                    missing_intraday_count += 1
+                indicators = calculate_market_indicators(
+                    symbol,
+                    minute_bars,
+                    daily_bars_result["bars"].get(symbol),
+                )
+                if indicators.get("current_price") is None:
+                    indicators = preliminary_intelligence[symbol]
+                enriched_intelligence[symbol] = indicators
+            if missing_intraday_count:
+                logger.info(
+                    "Broad scanner: %s liquid candidates lacked intraday bars and used daily fallback data.",
+                    missing_intraday_count,
+                )
 
             stage = "beginning ranking"
             logger.info("Broad scanner: beginning ranking.")
             scanner = DynamicWatchlistScanner(self.settings.watchlist_size)
-            selected = scanner.rank(list(preliminary_intelligence), preliminary_intelligence)
+            selected = scanner.rank(intraday_symbols, enriched_intelligence)
             if not selected:
                 raise RuntimeError("Broad scanner returned no candidates.")
             if len(selected) < self.settings.watchlist_size:
@@ -588,25 +623,8 @@ class BrokerClient:
                 )
 
             stage = "finalizing watchlist"
-            final_symbols = [candidate.symbol for candidate in selected]
-            minute_bars_result = self._fetch_native_stock_bars(
-                final_symbols,
-                timeframe="minute",
-                limit=120,
-            )
-            market_data["broad_bar_request_count"] += minute_bars_result["request_count"]
-            logger.info(
-                "Broad scanner: made %s native minute bar requests for final symbols.",
-                minute_bars_result["request_count"],
-            )
-
-            broad_universe_data = self._empty_market_data(final_symbols)
-            for symbol in final_symbols:
-                daily_bars = daily_bars_result["bars"].get(symbol)
-                minute_bars = minute_bars_result["bars"].get(symbol)
-                indicators = calculate_market_indicators(symbol, minute_bars, daily_bars)
-                if indicators.get("current_price") is None:
-                    indicators = preliminary_intelligence[symbol]
+            broad_universe_data = self._empty_market_data(intraday_symbols)
+            for symbol, indicators in enriched_intelligence.items():
                 broad_universe_data["market_intelligence"][symbol] = indicators
                 broad_universe_data["prices"][symbol] = {
                     "last_price": indicators.get("current_price"),
@@ -615,7 +633,7 @@ class BrokerClient:
             self._copy_selected_watchlist(market_data, broad_universe_data, selected)
             market_data["scanner_status"] = "broad_generated"
             market_data["scanner_mode"] = "broad_market"
-            market_data["broad_candidate_count"] = len(preliminary_intelligence)
+            market_data["broad_candidate_count"] = len(intraday_symbols)
             logger.info("Broad scanner: final watchlist size is %s.", len(selected))
             logger.info(
                 "Broad scanner: top selected symbols: %s.",
@@ -672,6 +690,33 @@ class BrokerClient:
 
         raise AttributeError("Broker does not expose tradable assets.")
 
+    def _get_broad_market_assets_cached(self) -> list[Any]:
+        """Reuse the tradable asset universe for the current UTC trading day."""
+        cache_date = datetime.now(timezone.utc).date()
+        if self._broad_assets_cache_date == cache_date and self._broad_assets_cache is not None:
+            logger.info("Broad scanner: using cached tradable assets for %s.", cache_date)
+            return self._broad_assets_cache
+
+        assets = self._get_broad_market_assets()
+        self._broad_assets_cache_date = cache_date
+        self._broad_assets_cache = assets
+        return assets
+
+    def _fetch_cached_broad_daily_bars(self, symbols: list[str]) -> dict[str, Any]:
+        """Cache completed daily bars while refreshing intraday bars every cycle."""
+        cache_key = (datetime.now(timezone.utc).date(), tuple(symbols))
+        if (
+            self._broad_daily_bars_cache_key == cache_key
+            and self._broad_daily_bars_cache is not None
+        ):
+            logger.info("Broad scanner: using cached completed daily bars.")
+            return {"bars": self._broad_daily_bars_cache, "request_count": 0}
+
+        result = self._fetch_native_stock_bars(symbols, timeframe="day", limit=60)
+        self._broad_daily_bars_cache_key = cache_key
+        self._broad_daily_bars_cache = result["bars"]
+        return result
+
     def _dedupe_symbols(self, symbols: list[str]) -> list[str]:
         deduped = []
         seen = set()
@@ -681,105 +726,6 @@ class BrokerClient:
                 seen.add(normalized_symbol)
                 deduped.append(normalized_symbol)
         return deduped
-
-    def _cap_symbols_before_native_data(self, symbols: list[str], assets: list[Any]) -> list[str]:
-        cap = max(
-            1,
-            min(
-                self.settings.broad_market_max_symbols,
-                self.settings.max_scanner_candidates_after_filters,
-            ),
-        )
-        asset_by_symbol = {broad_asset_symbol(asset): asset for asset in assets}
-        ranked = sorted(
-            symbols,
-            key=lambda symbol: self._broad_asset_quality_sort_key(
-                symbol,
-                asset_by_symbol.get(symbol),
-            ),
-        )
-        return ranked[:cap]
-
-    def _broad_asset_quality_sort_key(self, symbol: str, asset: Any | None) -> tuple[Any, ...]:
-        exchange_priority = {
-            "NASDAQ": 0,
-            "NYSE": 1,
-            "ARCA": 2,
-            "AMEX": 3,
-        }
-        exchange = self._safe_asset_field(getattr(asset, "exchange", "")) if asset is not None else ""
-        exchange_value = str(exchange).upper()
-        if "." in exchange_value:
-            exchange_value = exchange_value.rsplit(".", 1)[-1]
-        exchange_score = exchange_priority.get(exchange_value, 9)
-        known_priority = self._known_liquid_common_symbol_priority().get(symbol, 999)
-        known_score = 0 if known_priority != 999 else 1
-        odd_suffix_score = 1 if self._looks_like_odd_suffix_symbol(symbol) else 0
-        dollar_volume = self._asset_volume_for_symbol([asset], symbol) if asset is not None else None
-        return (
-            odd_suffix_score,
-            exchange_score,
-            known_score,
-            known_priority,
-            -(dollar_volume or 0),
-            len(symbol),
-            symbol,
-        )
-
-    def _looks_like_odd_suffix_symbol(self, symbol: str) -> bool:
-        if symbol in self._known_liquid_common_symbols():
-            return False
-        return symbol.endswith(("WS", "W", "U", "R"))
-
-    def _known_liquid_common_symbols(self) -> set[str]:
-        return set(self._known_liquid_common_symbol_priority())
-
-    def _known_liquid_common_symbol_priority(self) -> dict[str, int]:
-        symbols = [
-            "AAPL",
-            "MSFT",
-            "NVDA",
-            "AMZN",
-            "GOOGL",
-            "GOOG",
-            "META",
-            "TSLA",
-            "AMD",
-            "AVGO",
-            "NFLX",
-            "COST",
-            "CRM",
-            "ADBE",
-            "ORCL",
-            "INTC",
-            "UBER",
-            "SHOP",
-            "PLTR",
-            "JPM",
-            "BAC",
-            "WFC",
-            "GS",
-            "V",
-            "MA",
-            "HD",
-            "WMT",
-            "PG",
-            "KO",
-            "PEP",
-            "MRK",
-            "PFE",
-            "UNH",
-            "XOM",
-            "CVX",
-            "BA",
-            "CAT",
-            "GE",
-            "SPY",
-            "QQQ",
-            "IWM",
-            "DIA",
-        ]
-        return {symbol: index for index, symbol in enumerate(symbols)}
 
     def _fetch_native_stock_bars(
         self,
@@ -854,7 +800,7 @@ class BrokerClient:
             end = now - timedelta(days=1)
             start = end - timedelta(days=120)
         else:
-            end = now - timedelta(minutes=15)
+            end = now
             start = end - timedelta(days=5)
         return StockBarsRequest(
             symbol_or_symbols=symbols,
@@ -1051,22 +997,6 @@ class BrokerClient:
                     )
         return stats
 
-    def _asset_volume_for_symbol(self, assets: list[Any], symbol: str) -> float | None:
-        for asset in assets:
-            if broad_asset_symbol(asset) != symbol:
-                continue
-            for field_name in (
-                "average_volume",
-                "avg_volume",
-                "volume",
-                "last_volume",
-                "recent_volume",
-            ):
-                value = self._to_float(getattr(asset, field_name, None))
-                if value is not None:
-                    return value
-        return None
-
     def _cap_broad_candidates(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
         cap = max(
             1,
@@ -1180,7 +1110,7 @@ class BrokerClient:
 
         symbol = str(approved_decision.get("symbol", "")).upper()
         action = str(approved_decision.get("action", "")).upper()
-        price = self._latest_price(symbol)
+        price = self._execution_price(symbol)
         if price is None or price <= 0:
             reason = f"Missing or invalid latest price for {symbol}."
             logger.info("Order execution rejected: %s", reason)
@@ -1252,6 +1182,7 @@ class BrokerClient:
                 approved_decision,
                 price,
                 portfolio_value=buy_risk_details.get("portfolio_value"),
+                order_value=buy_risk_details.get("requested_order_value"),
             )
         quantity = requested_quantity
         if action == "SELL" and held_quantity is not None:
@@ -1399,6 +1330,7 @@ class BrokerClient:
             filled_quantity=self._broker_filled_quantity(broker_order),
             average_fill_price=self._broker_average_fill_price(broker_order),
             cost_basis_per_share=cost_basis_per_share,
+            **buy_risk_details,
         )
 
     def _execution_guard_failure(self, decision: dict[str, Any]) -> str | None:
@@ -1434,10 +1366,21 @@ class BrokerClient:
         elif allocation <= 0:
             return "Suggested allocation must be greater than 0."
 
-        if allocation > self.settings.max_position_allocation_percent:
+        if (
+            allocation
+            > self.settings.max_position_allocation_percent + ALLOCATION_EPSILON_PERCENT
+        ):
             return (
                 f"Suggested allocation {allocation:.2f}% exceeds maximum "
                 f"{self.settings.max_position_allocation_percent:.2f}%."
+            )
+
+        data_age = self._to_float(decision.get("market_data_age_seconds"))
+        max_data_age = float(getattr(self.settings, "max_market_data_age_seconds", 180))
+        if action == "BUY" and data_age is not None and data_age > max_data_age:
+            return (
+                f"Market data for {symbol or 'the selected symbol'} is {data_age:.0f}s old, "
+                f"above the {max_data_age:.0f}s limit."
             )
 
         return None
@@ -1448,6 +1391,7 @@ class BrokerClient:
         latest_price: float,
         *,
         portfolio_value: float | None = None,
+        order_value: float | None = None,
     ) -> int:
         snapshot = self._last_snapshot
         if portfolio_value is None:
@@ -1458,7 +1402,11 @@ class BrokerClient:
         if portfolio_value is None or portfolio_value <= 0 or allocation is None:
             return 0
 
-        notional = portfolio_value * (allocation / 100)
+        notional = (
+            order_value
+            if order_value is not None
+            else portfolio_value * (allocation / 100)
+        )
         return int(notional // latest_price)
 
     def _calculate_sell_quantity(
@@ -1551,10 +1499,16 @@ class BrokerClient:
         projected_symbols = held_symbols | pending_symbols | {symbol}
         projected_count = len(projected_symbols)
         invested_value = sum(held_values.values())
-        requested_notional = portfolio_value * allocation / 100
+        current_symbol_value = held_values.get(symbol, 0.0) + pending_values.get(symbol, 0.0)
+        target_position_value = portfolio_value * allocation / 100
+        requested_notional = max(0.0, target_position_value - current_symbol_value)
         projected_invested_value = invested_value + pending_value + requested_notional
         current_percent = invested_value / portfolio_value * 100
         projected_percent = projected_invested_value / portfolio_value * 100
+        current_symbol_percent = current_symbol_value / portfolio_value * 100
+        projected_symbol_percent = (
+            current_symbol_value + requested_notional
+        ) / portfolio_value * 100
         details = {
             "portfolio_value": portfolio_value,
             "current_open_position_count": current_count,
@@ -1563,7 +1517,17 @@ class BrokerClient:
             "projected_invested_percent": projected_percent,
             "pending_buy_value": pending_value,
             "requested_order_value": requested_notional,
+            "target_position_value": target_position_value,
+            "current_symbol_percent": current_symbol_percent,
+            "projected_symbol_percent": projected_symbol_percent,
         }
+
+        if requested_notional <= portfolio_value * ALLOCATION_EPSILON_PERCENT / 100:
+            return (
+                f"Current {symbol} allocation already meets the requested "
+                f"{allocation:.2f}% target.",
+                details,
+            )
 
         if projected_count > self.settings.max_open_positions:
             if current_count >= self.settings.max_open_positions and symbol not in held_symbols:
@@ -1578,16 +1542,20 @@ class BrokerClient:
                 )
             return reason, details
 
-        current_symbol_value = held_values.get(symbol, 0.0) + pending_values.get(symbol, 0.0)
-        projected_symbol_percent = (current_symbol_value + requested_notional) / portfolio_value * 100
-        if projected_symbol_percent > self.settings.max_position_allocation_percent:
+        if (
+            projected_symbol_percent
+            > self.settings.max_position_allocation_percent + ALLOCATION_EPSILON_PERCENT
+        ):
             return (
                 f"Projected {symbol} allocation exceeds maximum "
                 f"{self.settings.max_position_allocation_percent:.2f}%.",
                 details,
             )
 
-        if projected_percent > self.settings.max_total_invested_percent:
+        if (
+            projected_percent
+            > self.settings.max_total_invested_percent + ALLOCATION_EPSILON_PERCENT
+        ):
             return (
                 f"Projected invested allocation {projected_percent:.1f}% exceeds maximum "
                 f"{self.settings.max_total_invested_percent:.1f}%.",
@@ -1953,6 +1921,21 @@ class BrokerClient:
                 value = symbol_data.get("last_price") or symbol_data.get("price") or symbol_data.get("close")
 
         return self._to_float(value)
+
+    def _execution_price(self, symbol: str) -> float | None:
+        """Refresh the price immediately before sizing, with snapshot fallback."""
+        try:
+            live_price = self._get_last_price(symbol)
+        except Exception as exc:
+            logger.info(
+                "Live execution price refresh unavailable for %s (%s); using snapshot price.",
+                symbol,
+                exc.__class__.__name__,
+            )
+            live_price = None
+        if live_price is not None and live_price > 0:
+            return live_price
+        return self._latest_price(symbol)
 
     def _get_broker(self) -> Any:
         if self._broker is None:

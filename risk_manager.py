@@ -9,6 +9,9 @@ from config import Settings
 logger = logging.getLogger(__name__)
 
 
+ALLOCATION_EPSILON_PERCENT = 1e-9
+
+
 class RiskManager:
     """Applies Python-owned guardrails to every AI trading suggestion."""
 
@@ -37,6 +40,22 @@ class RiskManager:
                 return False, f"{symbol or 'Missing symbol'} is not in the final watchlist."
             return False, f"{symbol or 'Missing symbol'} is not in ALLOWED_SYMBOLS."
 
+        buy_eligible_symbols = decision.get("cycle_buy_eligible_symbols")
+        if (
+            action == "buy"
+            and isinstance(buy_eligible_symbols, list)
+            and symbol not in {str(value).upper() for value in buy_eligible_symbols}
+        ):
+            return False, f"{symbol or 'Missing symbol'} is not currently eligible for additional BUY exposure."
+
+        data_age = self._to_float(decision.get("market_data_age_seconds"))
+        max_data_age = float(getattr(self.settings, "max_market_data_age_seconds", 180))
+        if action == "buy" and data_age is not None and data_age > max_data_age:
+            return False, (
+                f"Market data for {symbol or 'the selected symbol'} is {data_age:.0f}s old, "
+                f"above the {max_data_age:.0f}s limit."
+            )
+
         confidence = float(decision.get("confidence", 0))
         if confidence < self.settings.min_confidence:
             return False, f"Confidence {confidence:.2f} is below minimum {self.settings.min_confidence:.2f}."
@@ -48,7 +67,10 @@ class RiskManager:
         elif allocation <= 0:
             return False, "Suggested allocation must be greater than 0."
 
-        if allocation > self.settings.max_position_allocation_percent:
+        if (
+            allocation
+            > self.settings.max_position_allocation_percent + ALLOCATION_EPSILON_PERCENT
+        ):
             return False, (
                 f"Suggested allocation {allocation:.2f}% exceeds maximum "
                 f"{self.settings.max_position_allocation_percent:.2f}%."
@@ -68,3 +90,11 @@ class RiskManager:
             decision.get("cycle_allowed_symbols"),
             list,
         )
+
+    def _to_float(self, value: Any) -> float | None:
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None

@@ -3,7 +3,7 @@
 import json
 import logging
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import sys
 import types
@@ -55,6 +55,7 @@ def make_settings(**overrides):
         "broad_market_max_symbols": 1000,
         "max_scanner_candidates_after_filters": 1000,
         "alpaca_data_feed": "iex",
+        "max_market_data_age_seconds": 180,
         "broad_scan_data_batch_size": 200,
         "min_stock_price": 5,
         "min_average_volume": 500000,
@@ -134,6 +135,7 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
         "BROAD_MARKET_MAX_SYMBOLS",
         "MAX_SCANNER_CANDIDATES_AFTER_FILTERS",
         "ALPACA_DATA_FEED",
+        "MAX_MARKET_DATA_AGE_SECONDS",
         "BROAD_SCAN_DATA_BATCH_SIZE",
         "MIN_STOCK_PRICE",
         "MIN_AVERAGE_VOLUME",
@@ -163,6 +165,7 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
     assert settings.broad_market_max_symbols == 1000
     assert settings.max_scanner_candidates_after_filters == 1000
     assert settings.alpaca_data_feed == "iex"
+    assert settings.max_market_data_age_seconds == 180
     assert settings.broad_scan_data_batch_size == 200
     assert settings.min_stock_price == 5
     assert settings.min_average_volume == 500000
@@ -188,6 +191,7 @@ def test_config_loading_reads_environment(monkeypatch):
     monkeypatch.setenv("BROAD_MARKET_MAX_SYMBOLS", "50")
     monkeypatch.setenv("MAX_SCANNER_CANDIDATES_AFTER_FILTERS", "25")
     monkeypatch.setenv("ALPACA_DATA_FEED", "sip")
+    monkeypatch.setenv("MAX_MARKET_DATA_AGE_SECONDS", "120")
     monkeypatch.setenv("BROAD_SCAN_DATA_BATCH_SIZE", "12")
     monkeypatch.setenv("MIN_STOCK_PRICE", "10")
     monkeypatch.setenv("MIN_AVERAGE_VOLUME", "750000")
@@ -214,6 +218,7 @@ def test_config_loading_reads_environment(monkeypatch):
     assert settings.broad_market_max_symbols == 50
     assert settings.max_scanner_candidates_after_filters == 25
     assert settings.alpaca_data_feed == "sip"
+    assert settings.max_market_data_age_seconds == 120
     assert settings.broad_scan_data_batch_size == 12
     assert settings.min_stock_price == 10
     assert settings.min_average_volume == 750000
@@ -1464,6 +1469,75 @@ def test_market_indicators_calculate_ema_rsi_and_vwap():
     assert indicators["VWAP"] == pytest.approx(expected_vwap)
 
 
+def test_intraday_indicators_use_only_the_current_regular_session():
+    previous_session = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-08-04 13:30", periods=60, freq="min", tz="UTC"),
+            "open": [200] * 60,
+            "high": [201] * 60,
+            "low": [199] * 60,
+            "close": [200] * 60,
+            "volume": [10_000] * 60,
+        }
+    )
+    current_session = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-08-05 13:30", periods=30, freq="min", tz="UTC"),
+            "open": [100] * 30,
+            "high": [102] * 30,
+            "low": [99] * 30,
+            "close": [100 + index / 10 for index in range(30)],
+            "volume": [1_000] * 30,
+        }
+    )
+    after_hours = pd.DataFrame(
+        {
+            "timestamp": [pd.Timestamp("2026-08-05 20:30", tz="UTC")],
+            "open": [500],
+            "high": [501],
+            "low": [499],
+            "close": [500],
+            "volume": [50_000],
+        }
+    )
+    daily_bars = make_mock_bars(length=60, start_price=90, volume=390_000)
+
+    indicators = calculate_market_indicators(
+        "AAPL",
+        pd.concat([previous_session, current_session, after_hours], ignore_index=True),
+        daily_bars,
+    )
+
+    assert indicators["current_price"] == pytest.approx(102.9)
+    assert indicators["volume"] == 30_000
+    assert indicators["session_bar_count"] == 30
+    assert indicators["day_change_percent"] == pytest.approx(2.9)
+    assert indicators["VWAP"] < 110
+    expected_progress_volume = indicators["average_20d_volume"] * (30 / 390)
+    assert indicators["relative_volume"] == pytest.approx(30_000 / expected_progress_volume)
+    assert indicators["latest_bar_timestamp"].startswith("2026-08-05T13:59:00")
+
+
+def test_intraday_indicators_preserve_datetime_index_for_freshness_checks():
+    minute_bars = make_mock_bars(length=30, start_price=100, volume=1_000)
+    minute_bars.index = pd.date_range(
+        "2026-08-05 13:30",
+        periods=30,
+        freq="min",
+        tz="UTC",
+    )
+
+    indicators = calculate_market_indicators(
+        "AAPL",
+        minute_bars,
+        make_mock_bars(length=60, start_price=90, volume=390_000),
+    )
+
+    assert indicators["session_bar_count"] == 30
+    assert indicators["latest_bar_timestamp"].startswith("2026-08-05T13:59:00")
+    assert indicators["data_age_seconds"] is not None
+
+
 def test_missing_bars_do_not_crash_indicator_calculation():
     indicators = calculate_market_indicators("AAPL", None, None)
 
@@ -1758,11 +1832,19 @@ class MockDataSource:
 
 
 class MockNativeAlpacaDataClient:
-    def __init__(self, failing=False, missing_symbols=None, daily_volumes=None, start_prices=None):
+    def __init__(
+        self,
+        failing=False,
+        missing_symbols=None,
+        daily_volumes=None,
+        start_prices=None,
+        minute_bars=None,
+    ):
         self.failing = failing
         self.missing_symbols = set(missing_symbols or [])
         self.daily_volumes = daily_volumes or {}
         self.start_prices = start_prices or {}
+        self.minute_bars = minute_bars or {}
         self.requests = []
 
     def get_stock_bars(self, request):
@@ -1804,7 +1886,10 @@ class MockNativeAlpacaDataClient:
             if "day" in timeframe.lower() or "1day" in timeframe.lower():
                 bars[symbol] = make_mock_bars(length=60, start_price=start_price, volume=daily_volume)
             else:
-                bars[symbol] = make_mock_bars(length=120, start_price=start_price, volume=3000)
+                bars[symbol] = self.minute_bars.get(
+                    symbol,
+                    make_mock_bars(length=120, start_price=start_price, volume=3000),
+                )
         return bars
 
 
@@ -1996,7 +2081,7 @@ def test_broad_market_scan_logs_major_stages(caplog):
     assert "Broad scanner: 3 symbols have usable native daily data." in caplog.text
     assert "Broad scanner: 3 symbols remain after liquidity filters." in caplog.text
     assert "Broad scanner: beginning ranking." in caplog.text
-    assert "Broad scanner: requesting native minute bars batch 1 with 2 symbols." in caplog.text
+    assert "Broad scanner: requesting native minute bars batch 1 with 3 symbols." in caplog.text
     assert "Broad scanner: final watchlist size is 2." in caplog.text
     assert "Broad scanner: top selected symbols:" in caplog.text
 
@@ -2034,6 +2119,68 @@ def test_broad_scan_context_only_contains_final_watchlist():
     assert len(context.watchlist_symbols) == 2
     assert set(context.recent_price_data["market_intelligence"]) == set(context.watchlist_symbols)
     assert set(context.recent_price_data["prices"]) == set(context.watchlist_symbols)
+
+
+def test_ai_context_excludes_positions_without_whole_share_buy_capacity():
+    settings = make_settings(
+        dynamic_watchlist_enabled=True,
+        allowed_symbols=["AAPL", "MSFT"],
+        watchlist_size=2,
+    )
+    snapshot = BrokerSnapshot(
+        account={"portfolio_value": 100_000, "cash": 95_000, "buying_power": 95_000},
+        positions=[{"symbol": "AAPL", "quantity": 50, "market_value": 5_000}],
+        market_data={
+            "symbols": ["AAPL", "MSFT"],
+            "prices": {
+                "AAPL": {"last_price": 100},
+                "MSFT": {"last_price": 400},
+            },
+            "market_intelligence": {
+                "AAPL": {"current_price": 100},
+                "MSFT": {"current_price": 400},
+            },
+        },
+    )
+    strategy = TradingStrategy(
+        settings=settings,
+        broker=types.SimpleNamespace(),
+        risk_manager=RiskManager(settings),
+    )
+
+    context = strategy._build_ai_context(snapshot)
+    decision = strategy._decision_with_cycle_universe(
+        approved_decision(symbol="AAPL"),
+        snapshot,
+    )
+
+    assert context.risk_rules["buy_eligible_symbols"] == ["MSFT"]
+    assert decision["cycle_buy_eligible_symbols"] == ["MSFT"]
+
+
+def test_risk_manager_rejects_buy_outside_cycle_buy_eligibility():
+    manager = RiskManager(make_settings(dynamic_watchlist_enabled=True))
+    decision = approved_decision(
+        symbol="AAPL",
+        cycle_allowed_symbols=["AAPL", "MSFT"],
+        cycle_buy_eligible_symbols=["MSFT"],
+    )
+
+    approved, reason = manager.validate(decision)
+
+    assert approved is False
+    assert "not currently eligible" in reason
+
+
+def test_risk_manager_rejects_stale_intraday_data():
+    manager = RiskManager(make_settings(max_market_data_age_seconds=180))
+
+    approved, reason = manager.validate(
+        approved_decision(market_data_age_seconds=181)
+    )
+
+    assert approved is False
+    assert "181s old" in reason
 
 
 def test_broad_market_scan_disabled_uses_configured_scanner_v1():
@@ -2126,7 +2273,7 @@ def test_broad_market_scan_keeps_realistic_active_tradable_equities():
     assert snapshot.market_data["broad_candidate_count"] == 2
 
 
-def test_broad_market_scan_applies_candidate_cap_before_indicators():
+def test_broad_market_scan_applies_candidate_cap_after_liquidity_filters():
     assets = [
         types.SimpleNamespace(symbol="AAPL", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ", average_volume=900000),
         types.SimpleNamespace(symbol="MSFT", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ", average_volume=800000),
@@ -2152,13 +2299,25 @@ def test_broad_market_scan_applies_candidate_cap_before_indicators():
     broker.connect()
     snapshot = broker.collect_snapshot()
 
-    assert snapshot.market_data["broad_price_filtered_count"] == 2
+    daily_requests = [
+        request
+        for request in broker._broker.native_data_client.requests
+        if "day" in request["timeframe"].lower()
+    ]
+    minute_requests = [
+        request
+        for request in broker._broker.native_data_client.requests
+        if "min" in request["timeframe"].lower()
+    ]
+    assert daily_requests[0]["symbols"] == ["AAPL", "MSFT", "NVDA", "AMD"]
+    assert minute_requests[0]["symbols"] == ["MSFT", "AAPL"]
+    assert snapshot.market_data["broad_price_filtered_count"] == 4
     assert snapshot.market_data["broad_capped_candidate_count"] == 2
     assert snapshot.market_data["broad_candidate_count"] == 2
     assert len(snapshot.market_data["symbols"]) == 2
 
 
-def test_broad_market_scan_quality_orders_symbols_before_cap(caplog):
+def test_broad_market_scan_quality_orders_liquid_symbols_before_intraday_cap(caplog):
     assets = [
         types.SimpleNamespace(symbol="AAAW", status="active", tradable=True, asset_class="us_equity", exchange="BATS", average_volume=1000),
         types.SimpleNamespace(symbol="BBBU", status="active", tradable=True, asset_class="us_equity", exchange="BATS", average_volume=1000),
@@ -2191,11 +2350,15 @@ def test_broad_market_scan_quality_orders_symbols_before_cap(caplog):
     daily_requests = [
         request for request in fake_broker.native_data_client.requests if "day" in request["timeframe"].lower()
     ]
-    assert daily_requests[0]["symbols"] == ["AAPL", "MSFT", "NVDA"]
+    minute_requests = [
+        request for request in fake_broker.native_data_client.requests if "min" in request["timeframe"].lower()
+    ]
+    assert daily_requests[0]["symbols"] == ["AAAW", "BBBU", "CCCR", "MSFT", "AAPL", "NVDA"]
+    assert minute_requests[0]["symbols"] == ["MSFT", "AAPL", "NVDA"]
     assert snapshot.market_data["broad_capped_candidate_count"] == 3
     assert set(snapshot.market_data["symbols"]).issubset({"AAPL", "MSFT", "NVDA"})
-    assert "Broad scanner: first 20 symbols before quality ordering/cap: AAAW, BBBU, CCCR, MSFT, AAPL, NVDA" in caplog.text
-    assert "Broad scanner: first 20 symbols after quality ordering/cap: AAPL, MSFT, NVDA" in caplog.text
+    assert "Broad scanner: first 20 asset-filtered symbols: AAAW, BBBU, CCCR, MSFT, AAPL, NVDA" in caplog.text
+    assert "Broad scanner: first 20 symbols after liquidity ordering/cap: MSFT, AAPL, NVDA" in caplog.text
 
 
 def test_broad_market_scan_uses_native_alpaca_data_not_lumibot_prices():
@@ -2231,10 +2394,85 @@ def test_broad_market_scan_uses_native_alpaca_data_not_lumibot_prices():
         request for request in fake_broker.native_data_client.requests if "min" in request["timeframe"].lower()
     ]
     assert [request["symbols"] for request in daily_requests] == [["AAPL", "MSFT"], ["NVDA"]]
-    assert len(minute_requests) == 1
-    assert snapshot.market_data["broad_bar_request_count"] == 3
+    assert [request["symbols"] for request in minute_requests] == [["MSFT", "AAPL"], ["NVDA"]]
+    assert snapshot.market_data["broad_bar_request_count"] == 4
     assert all(request["limit"] is None for request in daily_requests + minute_requests)
     assert all(request["start"] < request["end"] for request in daily_requests + minute_requests)
+    request_end = minute_requests[0]["end"].replace(tzinfo=timezone.utc)
+    assert datetime.now(timezone.utc) - request_end < timedelta(minutes=2)
+
+
+def test_broad_market_scan_ranks_using_intraday_data():
+    aapl_minutes = pd.DataFrame(
+        {
+            "open": [100] * 120,
+            "high": [101] * 120,
+            "low": [99] * 120,
+            "close": [100] * 120,
+            "volume": [100] * 120,
+        }
+    )
+    msft_minutes = make_mock_bars(length=120, start_price=100, volume=10_000)
+    native_client = MockNativeAlpacaDataClient(
+        daily_volumes={"AAPL": 900_000, "MSFT": 900_000},
+        minute_bars={"AAPL": aapl_minutes, "MSFT": msft_minutes},
+    )
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            broad_market_scan_enabled=True,
+            min_average_volume=10_000,
+            watchlist_size=1,
+            allowed_symbols=["AAPL", "MSFT"],
+        ),
+        broker_factory=lambda config: MockDataBroker(
+            assets=[
+                types.SimpleNamespace(symbol="AAPL", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+                types.SimpleNamespace(symbol="MSFT", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+            ],
+            native_data_client=native_client,
+        ),
+    )
+
+    broker.connect()
+    snapshot = broker.collect_snapshot()
+
+    assert snapshot.market_data["symbols"] == ["MSFT"]
+
+
+def test_broad_market_scan_caches_daily_data_but_refreshes_intraday_data():
+    native_client = MockNativeAlpacaDataClient(
+        daily_volumes={"AAPL": 900_000, "MSFT": 800_000},
+    )
+    broker = BrokerClient(
+        make_settings(
+            dynamic_watchlist_enabled=True,
+            broad_market_scan_enabled=True,
+            min_average_volume=10_000,
+            watchlist_size=2,
+            allowed_symbols=["AAPL", "MSFT"],
+        ),
+        broker_factory=lambda config: MockDataBroker(
+            assets=[
+                types.SimpleNamespace(symbol="AAPL", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+                types.SimpleNamespace(symbol="MSFT", status="active", tradable=True, asset_class="us_equity", exchange="NASDAQ"),
+            ],
+            native_data_client=native_client,
+        ),
+    )
+
+    broker.connect()
+    broker.collect_snapshot()
+    broker.collect_snapshot()
+
+    daily_requests = [
+        request for request in native_client.requests if "day" in request["timeframe"].lower()
+    ]
+    minute_requests = [
+        request for request in native_client.requests if "min" in request["timeframe"].lower()
+    ]
+    assert len(daily_requests) == 1
+    assert len(minute_requests) == 2
 
 
 def test_broad_market_scan_native_data_batching_works():
@@ -2380,10 +2618,7 @@ def test_broad_market_scan_aggregates_insufficient_data_logs(caplog):
 
     assert snapshot.market_data["scanner_status"] == "broad_generated"
     assert "Broad scanner: skipped 1 symbols with missing bars." in caplog.text
-    assert (
-        "Market indicators: skipped/partial indicators for 2 symbols due to insufficient intraday bars."
-        in caplog.text
-    )
+    assert "due to insufficient intraday bars" not in caplog.text
     assert "Could not calculate market indicators for MSFT" not in caplog.text
 
 
@@ -3136,7 +3371,7 @@ def test_broker_rejects_buy_that_would_exceed_position_allocation():
     result = broker.execute_order(approved_decision(suggested_allocation_percent=3))
 
     assert result["executed"] is False
-    assert "Projected AAPL allocation exceeds maximum" in result["reason"]
+    assert "already meets" in result["reason"]
     assert fake_broker.submitted_orders == []
 
 
@@ -3156,7 +3391,7 @@ def test_broker_allows_buy_within_remaining_position_allocation():
     result = broker.execute_order(approved_decision(suggested_allocation_percent=3))
 
     assert result["executed"] is True
-    assert result["quantity"] == 30
+    assert result["quantity"] == 10
     assert fake_broker.submitted_orders[0].symbol == "AAPL"
 
 

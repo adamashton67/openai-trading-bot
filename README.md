@@ -138,12 +138,13 @@ DATABASE_PATH=/data/trading_bot.db
 | `MAX_POSITION_ALLOCATION_PERCENT` | `5` | Starter risk limit per suggested trade. |
 | `MAX_OPEN_POSITIONS` | `10` | Maximum distinct held or pending-entry symbols after a new BUY. |
 | `MAX_TOTAL_INVESTED_PERCENT` | `60` | Maximum portfolio percentage invested after held positions, pending BUYs, and a new BUY. |
+| `MAX_MARKET_DATA_AGE_SECONDS` | `180` | Maximum age of intraday data allowed for a new BUY. |
 | `MIN_CONFIDENCE` | `0.70` | Minimum AI confidence before a trade can pass risk checks. |
 | `ALLOWED_SYMBOLS` | sample symbols | Optional comma-separated symbol allowlist. |
 | `DYNAMIC_WATCHLIST_ENABLED` | `false` | Enables the scanner-built analysis watchlist during each trading cycle. |
 | `BROAD_MARKET_SCAN_ENABLED` | `false` | Uses Alpaca tradable US equity assets for a broader scanner before selecting the final watchlist. |
 | `BROAD_MARKET_MAX_SYMBOLS` | `1000` | Maximum liquid broad-scan candidates evaluated before final ranking. |
-| `MAX_SCANNER_CANDIDATES_AFTER_FILTERS` | `1000` | Maximum broad-scan candidates sent into indicator calculation after asset and price filters. |
+| `MAX_SCANNER_CANDIDATES_AFTER_FILTERS` | `1000` | Maximum highest-liquidity broad-scan candidates sent into intraday indicator calculation. |
 | `ALPACA_DATA_FEED` | `iex` | Alpaca market data feed for broad scanner bars. |
 | `BROAD_SCAN_DATA_BATCH_SIZE` | `200` | Symbols requested per native Alpaca broad-scan bar batch. |
 | `MIN_STOCK_PRICE` | `5` | Minimum current price for broad-scan candidates. |
@@ -176,6 +177,8 @@ DATABASE_PATH=/data/trading_bot.db
 
 These are two independent, differently-timed loops driven by `main.py` and `scheduler.py`:
 
+Both schedules are anchored to their planned start times. Scanner, model, or broker runtime no longer gets added to the configured interval, so a 10-minute trading cycle remains on a 10-minute cadence even when one cycle takes time to complete.
+
 - **The AI trading cycle** (steps 7-11 above, every `TRADING_INTERVAL_MINUTES`) only ever
   proposes new BUYs, discretionary SELLs, or HOLDs for one symbol per cycle — see "AI Decision
   Layer" below for why that's one decision at a time, not a batch.
@@ -207,7 +210,7 @@ Decisions & Deferred Work" below for why.
 
 Real Alpaca paper order submission is isolated in `broker.py` and remains blocked unless `BOT_ENABLED=true`, `PAPER_TRADING=true`, `DRY_RUN=false`, market data includes a valid latest price, and the risk manager approves the decision.
 
-Before every new BUY, the execution layer refreshes broker account equity, long positions, and open BUY orders. It rejects entries that would exceed `MAX_OPEN_POSITIONS`, `MAX_TOTAL_INVESTED_PERCENT`, or the existing per-symbol allocation cap. Pending BUY notional is used when available; otherwise remaining quantity is valued at a current price. If neither is available, the guard conservatively reserves one full `MAX_POSITION_ALLOCATION_PERCENT` allocation rather than ignoring the pending exposure.
+Before every new BUY, the execution layer refreshes broker account equity, long positions, open BUY orders, and the latest execution price. The suggested allocation is treated as the target final position size, so an existing position is topped up only by the remaining amount instead of receiving another full allocation. It rejects entries that would exceed `MAX_OPEN_POSITIONS`, `MAX_TOTAL_INVESTED_PERCENT`, the per-symbol allocation cap, or `MAX_MARKET_DATA_AGE_SECONDS`. Pending BUY notional is used when available; otherwise remaining quantity is valued at a current price. If neither is available, the guard conservatively reserves one full `MAX_POSITION_ALLOCATION_PERCENT` allocation rather than ignoring the pending exposure.
 
 These portfolio limits apply only to new BUY exposure. They never force-close existing positions, even when the portfolio is already above a configured limit. HOLD, OpenAI SELL, partial-profit exits, trailing-stop exits, reconciliation, and reporting remain unaffected, and all exits remain permitted by these BUY limits.
 
@@ -221,9 +224,9 @@ When `INCLUDE_HISTORY_CONTEXT=true`, recent decisions, executions, and portfolio
 
 ## Dynamic Watchlist
 
-Dynamic watchlists are disabled by default. When `DYNAMIC_WATCHLIST_ENABLED=true`, the bot scans `SCANNER_UNIVERSE`, ranks symbols by volume, gain/loss movement, relative volume, volatility, and momentum, then sends the final capped watchlist to OpenAI. The risk manager and broker safety gates still apply, so the scanner cannot bypass configured trading controls.
+Dynamic watchlists are disabled by default. When `DYNAMIC_WATCHLIST_ENABLED=true`, the bot scans `SCANNER_UNIVERSE`, ranks symbols by volume, gain/loss movement, relative volume, volatility, and momentum, then sends the final capped watchlist to OpenAI. Intraday metrics use the latest regular-market session only, relative volume is adjusted for elapsed session time, and stale intraday data cannot produce a new BUY. The risk manager and broker safety gates still apply, so the scanner cannot bypass configured trading controls.
 
-When `BROAD_MARKET_SCAN_ENABLED=true`, the scanner first pulls tradable US equity assets from Alpaca, filters out inactive, untradable, OTC, ETF-like, low-price, and low-volume candidates where possible, then fetches native Alpaca bars in batches to rank candidates. Only the final `WATCHLIST_SIZE` symbols and their indicators are sent to OpenAI. If broad scanning fails, the bot falls back to scanner v1; if that fails, it falls back to the static allowed symbols.
+When `BROAD_MARKET_SCAN_ENABLED=true`, the scanner first pulls tradable US equity assets from Alpaca and filters out inactive, untradable, OTC, and ETF-like assets. It fetches completed daily bars for the full filtered universe, applies price and volume requirements, keeps the highest-liquidity candidates, and refreshes their current intraday bars before ranking. Assets and completed daily bars are cached for the trading day, while intraday data is refreshed every cycle. Only the final `WATCHLIST_SIZE` symbols and their indicators are sent to OpenAI. The AI also receives an explicit list of symbols that still have portfolio capacity for at least one whole share, preventing repeated BUY suggestions for positions already at their target. If broad scanning fails, the bot falls back to scanner v1; if that fails, it falls back to the static allowed symbols.
 
 To test OpenAI with fake paper-trading context:
 

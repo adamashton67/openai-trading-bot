@@ -92,14 +92,28 @@ class MarketScheduler:
         return (monotonic_time if monotonic_time is not None else time_module.monotonic()) >= self._next_position_management_cycle
 
     def mark_trading_cycle_run(self, monotonic_time: float | None = None) -> None:
-        """Schedule the next OpenAI cycle from a monotonic clock."""
+        """Advance the OpenAI deadline without adding cycle runtime to its cadence."""
         current = monotonic_time if monotonic_time is not None else time_module.monotonic()
-        self._next_trading_cycle = current + self.settings.trading_interval_seconds
+        self._next_trading_cycle = self._advance_deadline(
+            self._next_trading_cycle,
+            current,
+            self.settings.trading_interval_seconds,
+        )
 
     def mark_position_management_run(self, monotonic_time: float | None = None) -> None:
-        """Schedule the next position-only cycle from a monotonic clock."""
+        """Advance the position deadline without adding cycle runtime to its cadence."""
         current = monotonic_time if monotonic_time is not None else time_module.monotonic()
-        self._next_position_management_cycle = current + self.settings.position_management_interval_seconds
+        self._next_position_management_cycle = self._advance_deadline(
+            self._next_position_management_cycle,
+            current,
+            self.settings.position_management_interval_seconds,
+        )
+
+    def _advance_deadline(self, previous: float, current: float, interval: int) -> float:
+        deadline = (previous if previous > 0 else current) + interval
+        while deadline <= current:
+            deadline += interval
+        return deadline
 
     def sleep_until_next_cycle(self) -> None:
         """Sleep until the earliest enabled cycle is due."""

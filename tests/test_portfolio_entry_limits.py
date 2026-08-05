@@ -138,17 +138,51 @@ def test_new_symbol_rejected_at_max_open_positions():
 
 def test_existing_position_does_not_increase_distinct_count():
     client, broker, _ = _client(positions=_symbols(10))
-    result = client.execute_order(_buy("AAPL", 1))
+    result = client.execute_order(_buy("AAPL", 2))
     assert result["executed"] is True
     assert broker.submitted_orders
 
 
-def test_existing_position_still_obeys_per_symbol_limit():
+def test_existing_position_buy_targets_final_allocation():
     client, broker, _ = _client(positions=[_position("AAPL", 4_000)])
-    result = client.execute_order(_buy("AAPL", 2))
+    result = client.execute_order(_buy("AAPL", 5))
+
+    assert result["executed"] is True
+    assert result["quantity"] == 10
+    assert result["requested_order_value"] == pytest.approx(1_000)
+    assert result["target_position_value"] == pytest.approx(5_000)
+    assert broker.submitted_orders[0].quantity == 10
+
+
+def test_buy_at_already_met_target_is_a_safe_noop():
+    client, broker, _ = _client(positions=[_position("AAPL", 5_000)])
+    result = client.execute_order(_buy("AAPL", 5))
+
     assert result["executed"] is False
-    assert "Projected AAPL allocation exceeds maximum" in result["reason"]
+    assert "already meets" in result["reason"]
+    assert result["requested_order_value"] == 0
     assert broker.submitted_orders == []
+
+
+def test_exact_max_allocation_is_not_rejected_by_float_rounding():
+    client, broker, _ = _client(portfolio_value=96_300.78)
+    result = client.execute_order(_buy("AAPL", 5))
+
+    assert result["executed"] is True
+    assert result["projected_symbol_percent"] == pytest.approx(5)
+    assert broker.submitted_orders
+
+
+def test_buy_refreshes_execution_price_after_ai_analysis():
+    client, broker, _ = _client()
+    client._get_last_price = lambda symbol: 120
+
+    result = client.execute_order(_buy("AAPL", 5))
+
+    assert result["executed"] is True
+    assert result["quantity"] == 41
+    assert result["submitted_price"] == 120
+    assert broker.submitted_orders[0].quantity == 41
 
 
 def test_projected_invested_percent_exactly_at_limit_is_allowed():

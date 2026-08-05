@@ -150,6 +150,19 @@ def test_scheduler_position_cadence_is_five_minutes_and_ai_remains_fifteen():
     assert scheduler.trading_cycle_due(1000) is True
 
 
+def test_scheduler_keeps_original_cadence_when_cycle_finishes_late():
+    scheduler = MarketScheduler.__new__(MarketScheduler)
+    scheduler.settings = settings()
+    scheduler._next_trading_cycle = 100
+    scheduler._next_position_management_cycle = 100
+
+    scheduler.mark_position_management_run(140)
+    scheduler.mark_trading_cycle_run(140)
+
+    assert scheduler._next_position_management_cycle == 400
+    assert scheduler._next_trading_cycle == 1000
+
+
 @pytest.mark.parametrize("price, expected", [(102.99, 0), (103.00, 1)])
 def test_partial_profit_boundary(price, expected):
     broker = FakeBroker([position()], {"AAPL": price})

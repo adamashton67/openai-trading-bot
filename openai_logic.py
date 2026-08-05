@@ -33,6 +33,9 @@ MARKET_INTELLIGENCE_FIELDS = (
     "EMA50",
     "RSI14",
     "VWAP",
+    "latest_bar_timestamp",
+    "data_age_seconds",
+    "session_bar_count",
 )
 
 

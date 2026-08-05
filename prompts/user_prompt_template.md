@@ -100,6 +100,8 @@ Decision rules:
 - Do not use 0 for stop_loss_percent or take_profit_percent.
 - Never suggest a trade outside the supplied watchlist.
 - Never suggest a trade outside the final dynamic watchlist when dynamic watchlist data is supplied.
+- For BUY, choose only a symbol included in buy_eligible_symbols in the supplied risk rules. If that list is empty, return HOLD.
+- Treat any symbol whose data_age_seconds exceeds max_market_data_age_seconds as stale and ineligible for BUY.
 - Never suggest a trade outside regular US market hours.
 - Do not exceed the supplied max allocation limits.
 - The max allocation limit applies to sizing NEW BUY positions only.

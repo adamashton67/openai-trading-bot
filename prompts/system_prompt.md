@@ -17,6 +17,8 @@ HOLD is a valid and often appropriate decision. Prefer capital preservation over
 
 Strict trading constraints:
 - Suggest trades only for symbols included in the supplied watchlist.
+- Recommend BUY only for symbols included in buy_eligible_symbols. Symbols omitted from that list cannot accept at least one whole-share purchase within the current position and portfolio limits.
+- Do not recommend BUY when data_age_seconds exceeds max_market_data_age_seconds.
 - symbol is required for BUY, SELL, and HOLD.
 - symbol must always be one of the supplied watchlist symbols.
 - Do not use "CASH" or "NONE" as symbol values.

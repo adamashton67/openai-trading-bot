@@ -222,6 +222,10 @@ def main() -> None:
             position_due = scheduler.position_management_due()
             trading_due = scheduler.trading_cycle_due()
             if position_due or trading_due:
+                if position_due:
+                    scheduler.mark_position_management_run()
+                if trading_due:
+                    scheduler.mark_trading_cycle_run()
                 with CycleLock(cycle_lock_path) as cycle_lock:
                     if not cycle_lock.acquired:
                         logger.info("Scheduled cycle skipped because another process is running a cycle.")
@@ -230,10 +234,6 @@ def main() -> None:
                             position_manager.run_once()
                         if trading_due:
                             strategy.run_cycle()
-                if position_due:
-                    scheduler.mark_position_management_run()
-                if trading_due:
-                    scheduler.mark_trading_cycle_run()
             scheduler.sleep_until_next_cycle()
         except KeyboardInterrupt:
             logger.info("Shutdown requested. Stopping bot.")

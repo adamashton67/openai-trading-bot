@@ -286,6 +286,7 @@ class TradingStrategy:
     def _build_ai_context(self, snapshot: BrokerSnapshot) -> TradingContext:
         """Create the OpenAI context object from broker and strategy state."""
         account = snapshot.account
+        buy_eligible_symbols = self._buy_eligible_symbols(snapshot)
 
         return TradingContext(
             current_datetime=datetime.now(ZoneInfo(self.settings.market_timezone)),
@@ -303,6 +304,12 @@ class TradingStrategy:
                     self.settings.max_position_allocation_percent
                 ),
                 "allowed_symbols": self._final_watchlist_symbols(snapshot),
+                "buy_eligible_symbols": buy_eligible_symbols,
+                "max_market_data_age_seconds": getattr(
+                    self.settings,
+                    "max_market_data_age_seconds",
+                    180,
+                ),
                 "static_allowed_symbols": self.settings.allowed_symbols,
                 "risk_manager_required": True,
             },
@@ -347,7 +354,94 @@ class TradingStrategy:
         enriched_decision = dict(decision)
         if self.settings.dynamic_watchlist_enabled:
             enriched_decision["cycle_allowed_symbols"] = self._final_watchlist_symbols(snapshot)
+        enriched_decision["cycle_buy_eligible_symbols"] = self._buy_eligible_symbols(snapshot)
+        market_intelligence = snapshot.market_data.get("market_intelligence", {})
+        symbol = str(decision.get("symbol", "")).upper()
+        indicators = market_intelligence.get(symbol, {}) if isinstance(market_intelligence, dict) else {}
+        data_age = self._number(indicators.get("data_age_seconds")) if isinstance(indicators, dict) else None
+        if data_age is not None:
+            enriched_decision["market_data_age_seconds"] = data_age
         return enriched_decision
+
+    def _buy_eligible_symbols(self, snapshot: BrokerSnapshot) -> list[str]:
+        """Return symbols with enough capacity for at least one whole-share BUY."""
+        portfolio_value = self._number(snapshot.account.get("portfolio_value"))
+        if portfolio_value is None or portfolio_value <= 0:
+            return []
+
+        position_values: dict[str, float] = {}
+        for position in snapshot.positions:
+            symbol = str(position.get("symbol", "")).upper()
+            quantity = self._number(position.get("quantity")) or 0
+            if not symbol or quantity <= 0:
+                continue
+            market_value = self._number(position.get("market_value"))
+            if market_value is None:
+                price = self._market_price(snapshot, symbol)
+                if price is None:
+                    continue
+                market_value = quantity * price
+            position_values[symbol] = position_values.get(symbol, 0.0) + abs(market_value)
+
+        invested_value = sum(position_values.values())
+        total_capacity = max(
+            0.0,
+            portfolio_value * getattr(self.settings, "max_total_invested_percent", 100) / 100
+            - invested_value,
+        )
+        buying_power = self._number(snapshot.account.get("buying_power"))
+        if buying_power is not None:
+            total_capacity = min(total_capacity, max(0.0, buying_power))
+
+        eligible = []
+        held_symbols = set(position_values)
+        for symbol in self._final_watchlist_symbols(snapshot):
+            price = self._market_price(snapshot, symbol)
+            if price is None or price <= 0 or total_capacity + 1e-9 < price:
+                continue
+            if (
+                symbol not in held_symbols
+                and len(held_symbols) >= getattr(self.settings, "max_open_positions", 10)
+            ):
+                continue
+
+            target_value = (
+                portfolio_value
+                * getattr(self.settings, "max_position_allocation_percent", 5)
+                / 100
+            )
+            remaining_symbol_capacity = max(0.0, target_value - position_values.get(symbol, 0.0))
+            if remaining_symbol_capacity + 1e-9 >= price:
+                eligible.append(symbol)
+        return eligible
+
+    def _price_from_snapshot(self, prices: Any, symbol: str) -> float | None:
+        if not isinstance(prices, dict):
+            return None
+        value = prices.get(symbol)
+        if isinstance(value, dict):
+            value = value.get("last_price") or value.get("price") or value.get("close")
+        return self._number(value)
+
+    def _market_price(self, snapshot: BrokerSnapshot, symbol: str) -> float | None:
+        price = self._price_from_snapshot(snapshot.market_data.get("prices", {}), symbol)
+        if price is not None:
+            return price
+        market_intelligence = snapshot.market_data.get("market_intelligence", {})
+        if not isinstance(market_intelligence, dict):
+            return None
+        indicators = market_intelligence.get(symbol)
+        if not isinstance(indicators, dict):
+            return None
+        return self._number(indicators.get("current_price"))
+
+    def _number(self, value: Any) -> float | None:
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _fallback_hold_symbol(self) -> str:
         """Return a watchlist-backed symbol for HOLD fallbacks."""

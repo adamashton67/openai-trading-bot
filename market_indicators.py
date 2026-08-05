@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import time
 from typing import Any
 
 import pandas as pd
@@ -26,7 +27,15 @@ INDICATOR_FIELDS = (
     "EMA50",
     "RSI14",
     "VWAP",
+    "latest_bar_timestamp",
+    "data_age_seconds",
+    "session_bar_count",
 )
+
+REGULAR_SESSION_OPEN = time(9, 30)
+REGULAR_SESSION_CLOSE = time(16, 0)
+REGULAR_SESSION_MINUTES = 390
+US_MARKET_TIMEZONE = "America/New_York"
 
 
 def calculate_market_indicators(
@@ -49,14 +58,19 @@ def calculate_market_indicators(
         logger.debug("No bars available for %s; indicators are null.", symbol)
         return indicators
 
+    session_df = _latest_regular_session(minute_df)
     close_source = minute_df if not minute_df.empty else daily_df
-    indicators["current_price"] = _last_value(close_source, "close")
-    indicators["volume"] = _current_volume(minute_df, daily_df)
+    current_session_source = session_df if not session_df.empty else close_source
+    indicators["current_price"] = _last_value(current_session_source, "close")
+    indicators["volume"] = _current_volume(session_df, daily_df)
+    indicators["session_bar_count"] = len(session_df)
+    indicators["latest_bar_timestamp"] = _latest_bar_timestamp(session_df)
+    indicators["data_age_seconds"] = _data_age_seconds(session_df)
 
-    indicators["5m_change_percent"] = _period_change_percent(minute_df, 5, symbol, "5m")
-    indicators["15m_change_percent"] = _period_change_percent(minute_df, 15, symbol, "15m")
-    indicators["1h_change_percent"] = _period_change_percent(minute_df, 60, symbol, "1h")
-    indicators["day_change_percent"] = _day_change_percent(minute_df, daily_df, symbol)
+    indicators["5m_change_percent"] = _period_change_percent(session_df, 5, symbol, "5m")
+    indicators["15m_change_percent"] = _period_change_percent(session_df, 15, symbol, "15m")
+    indicators["1h_change_percent"] = _period_change_percent(session_df, 60, symbol, "1h")
+    indicators["day_change_percent"] = _day_change_percent(session_df, daily_df, symbol)
     indicators["5d_change_percent"] = _period_change_percent(daily_df, 5, symbol, "5d")
     indicators["20d_change_percent"] = _period_change_percent(daily_df, 20, symbol, "20d")
     indicators["average_20d_volume"] = _average_volume(daily_df, 20, symbol)
@@ -64,11 +78,12 @@ def calculate_market_indicators(
         indicators["volume"],
         indicators["average_20d_volume"],
         symbol,
+        session_progress=_session_progress(session_df),
     )
     indicators["EMA20"] = _ema(close_source, 20, symbol)
     indicators["EMA50"] = _ema(close_source, 50, symbol)
     indicators["RSI14"] = _rsi(close_source, 14, symbol)
-    indicators["VWAP"] = _vwap(minute_df if not minute_df.empty else daily_df, symbol)
+    indicators["VWAP"] = _vwap(session_df if not session_df.empty else daily_df, symbol)
 
     return indicators
 
@@ -91,7 +106,10 @@ def _normalize_bars(bars: Any) -> pd.DataFrame:
         return _empty_bars()
 
     df.columns = [str(column).lower() for column in df.columns]
+    if "timestamp" not in df.columns and isinstance(df.index, pd.DatetimeIndex):
+        df["timestamp"] = df.index
     if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
         df = df.sort_values("timestamp")
     elif not df.index.is_monotonic_increasing:
         df = df.sort_index()
@@ -102,6 +120,61 @@ def _normalize_bars(bars: Any) -> pd.DataFrame:
         df[column] = pd.to_numeric(df[column], errors="coerce")
 
     return df.dropna(subset=["close"]).reset_index(drop=True)
+
+
+def _latest_regular_session(minute_df: pd.DataFrame) -> pd.DataFrame:
+    """Return bars from the latest regular US session, preserving legacy test data."""
+    if minute_df.empty or "timestamp" not in minute_df.columns:
+        return minute_df
+
+    timestamps = pd.to_datetime(minute_df["timestamp"], errors="coerce", utc=True)
+    if not timestamps.notna().any():
+        return minute_df
+
+    local_timestamps = timestamps.dt.tz_convert(US_MARKET_TIMEZONE)
+    regular_mask = (
+        (local_timestamps.dt.time >= REGULAR_SESSION_OPEN)
+        & (local_timestamps.dt.time < REGULAR_SESSION_CLOSE)
+    )
+    regular_df = minute_df.loc[regular_mask].copy()
+    if regular_df.empty:
+        return regular_df
+
+    regular_local = local_timestamps.loc[regular_mask]
+    latest_session_date = regular_local.dt.date.max()
+    return regular_df.loc[regular_local.dt.date == latest_session_date].reset_index(drop=True)
+
+
+def _session_progress(session_df: pd.DataFrame) -> float | None:
+    """Return elapsed regular-session fraction for pace-adjusted relative volume."""
+    if session_df.empty:
+        return None
+    if "timestamp" not in session_df.columns or not session_df["timestamp"].notna().any():
+        return None
+
+    latest = pd.Timestamp(session_df["timestamp"].iloc[-1]).tz_convert(US_MARKET_TIMEZONE)
+    elapsed_minutes = (latest.hour * 60 + latest.minute) - (9 * 60 + 30) + 1
+    return min(1.0, max(1 / REGULAR_SESSION_MINUTES, elapsed_minutes / REGULAR_SESSION_MINUTES))
+
+
+def _latest_bar_timestamp(minute_df: pd.DataFrame) -> str | None:
+    if minute_df.empty or "timestamp" not in minute_df.columns:
+        return None
+    value = minute_df["timestamp"].iloc[-1]
+    if pd.isna(value):
+        return None
+    return pd.Timestamp(value).isoformat()
+
+
+def _data_age_seconds(minute_df: pd.DataFrame) -> float | None:
+    if minute_df.empty or "timestamp" not in minute_df.columns:
+        return None
+    value = minute_df["timestamp"].iloc[-1]
+    if pd.isna(value):
+        return None
+    timestamp = pd.Timestamp(value)
+    now = pd.Timestamp.now(tz="UTC")
+    return max(0.0, (now - timestamp).total_seconds())
 
 
 def _empty_bars() -> pd.DataFrame:
@@ -155,13 +228,26 @@ def _average_volume(df: pd.DataFrame, window: int, symbol: str) -> float | None:
     return _to_float(df["volume"].tail(window).mean())
 
 
-def _relative_volume(volume: Any, average_volume: Any, symbol: str) -> float | None:
+def _relative_volume(
+    volume: Any,
+    average_volume: Any,
+    symbol: str,
+    *,
+    session_progress: float | None = None,
+) -> float | None:
     volume_value = _to_float(volume)
     average_value = _to_float(average_volume)
     if volume_value is None or average_value is None or average_value <= 0:
         logger.debug("Insufficient volume data for %s relative volume.", symbol)
         return None
-    return volume_value / average_value
+    expected_volume = (
+        average_value * session_progress
+        if session_progress is not None
+        else average_value
+    )
+    if expected_volume <= 0:
+        return None
+    return volume_value / expected_volume
 
 
 def _ema(df: pd.DataFrame, span: int, symbol: str) -> float | None:
