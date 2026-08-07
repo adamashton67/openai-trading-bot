@@ -20,7 +20,7 @@ TRAILING_STOP_PERCENT = Decimal("2.0")
 STOP_LOSS_PERCENT = Decimal("2.0")
 TIME_STOP_HOURS = 2
 TIME_STOP_BAND_PERCENT = Decimal("1.0")
-EOD_FLATTEN_BUFFER_MINUTES = 15
+EOD_FLATTEN_BUFFER_MINUTES = 30
 FRACTIONAL_QUANTUM = Decimal("0.000001")
 OPEN_ORDER_STATUSES = {"new", "accepted", "pending_new", "partially_filled", "partial_fill", "held", "open"}
 

@@ -404,10 +404,19 @@ def test_eod_flatten_overrides_stop_loss_time_stop_and_trailing_states():
 
 def test_eod_flatten_does_not_fire_before_the_deadline():
     broker = FakeBroker([position()], {"AAPL": 100.5})
-    scheduler = FakeScheduler(close_offset_minutes=30)
+    scheduler = FakeScheduler(close_offset_minutes=31)
     make_manager(broker, scheduler).run_once()
     assert broker.submissions == []
     assert state()["status"] == "open"
+
+
+def test_eod_flatten_fires_thirty_minutes_before_close():
+    broker = FakeBroker([position()], {"AAPL": 100.5})
+    scheduler = FakeScheduler(close_offset_minutes=30)
+    make_manager(broker, scheduler).run_once()
+    assert len(broker.submissions) == 1
+    assert broker.submissions[0]["exit_source"] == "eod_flatten"
+    assert state()["status"] == "eod_flatten_submitted"
 
 
 def test_eod_flatten_skips_safely_when_no_market_session_today():

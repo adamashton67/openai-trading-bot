@@ -262,7 +262,7 @@ Before a position ever reaches the 3% partial-profit target, three additional de
 
 - **Hard stop-loss (`STOP_LOSS_PERCENT`, 2%)**: closes the entire position immediately if it is down 2% or more, independent of the AI's discretionary SELL judgement.
 - **Time-stop / dead-zone (`TIME_STOP_HOURS`, 2 hours; `TIME_STOP_BAND_PERCENT`, ±1%)**: closes the entire position if it has been open 2 hours or more and is sitting within ±1% of cost basis, so capital is not left idle in a trade that is not clearly heading toward the stop-loss or the profit target.
-- **EOD flatten (`EOD_FLATTEN_BUFFER_MINUTES`, 15 minutes)**: force-closes every open position 15 minutes before today's actual NYSE close (using the market calendar, so early-close days are respected), regardless of gain, loss, or trailing state. This check runs first and overrides every other exit path.
+- **EOD flatten (`EOD_FLATTEN_BUFFER_MINUTES`, 30 minutes)**: force-closes every open position 30 minutes before today's actual NYSE close (using the market calendar, so early-close days are respected), regardless of gain, loss, or trailing state. This check runs first and overrides every other exit path.
 
 Once the partial profit is taken and trailing management activates, the 2% trailing stop owns loss control for the remaining shares; the stop-loss and time-stop checks no longer apply. Each exit path records its own `status` (`stop_loss_submitted`, `time_stop_submitted`, `eod_flatten_submitted`) and `exit_source`/`exit_reason` pair, consistent with the existing `partial_profit` and `trailing_stop` conventions.
 
