@@ -1,6 +1,9 @@
 """Logging setup for console and file output."""
 
+import json
 import logging
+import sys
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -10,6 +13,33 @@ LOG_DIR = Path("logs")
 LOG_FILE = LOG_DIR / "bot.log"
 _UNSUPPORTED_LOG_KWARGS = {"color"}
 _LOGGER_PATCHED = False
+
+
+class RailwayJsonFormatter(logging.Formatter):
+    """Format console logs as Railway-compatible structured JSON."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        if record.levelno >= logging.ERROR:
+            level = "error"
+        elif record.levelno >= logging.WARNING:
+            level = "warn"
+        elif record.levelno >= logging.INFO:
+            level = "info"
+        else:
+            level = "debug"
+
+        payload: dict[str, Any] = {
+            "timestamp": datetime.fromtimestamp(
+                record.created, tz=timezone.utc
+            ).isoformat(timespec="milliseconds"),
+            "level": level,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+
+        return json.dumps(payload, default=str, separators=(",", ":"))
 
 
 def install_logging_compatibility_shim() -> None:
@@ -58,8 +88,8 @@ def configure_logging() -> None:
         "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
     )
 
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(RailwayJsonFormatter())
 
     file_handler = RotatingFileHandler(
         LOG_FILE,

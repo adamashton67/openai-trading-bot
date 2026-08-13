@@ -15,6 +15,7 @@ import pandas as pd
 import config
 import context_history
 import database
+import logger_config
 import main
 from config import Settings, load_settings
 from broker import BrokerClient, BrokerSnapshot
@@ -115,6 +116,25 @@ def test_normal_logging_still_works(caplog):
         logger.info("normal log %s", "works")
 
     assert "normal log works" in caplog.text
+
+
+def test_configure_logging_emits_structured_railway_logs_to_stdout(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setattr(logger_config, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(logger_config, "LOG_FILE", tmp_path / "bot.log")
+
+    logger_config.configure_logging()
+    logging.getLogger("railway.test").warning("market data unavailable")
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert captured.err == ""
+    assert payload["level"] == "warn"
+    assert payload["logger"] == "railway.test"
+    assert payload["message"] == "market data unavailable"
+    assert payload["timestamp"].endswith("+00:00")
 
 
 def test_config_loading_uses_safe_defaults(monkeypatch):
