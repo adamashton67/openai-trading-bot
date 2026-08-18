@@ -214,6 +214,13 @@ def test_mechanical_trailing_or_partial_exit_bypasses_buy_limits():
         positions=[_position("AAPL", 70_000)],
         settings=settings,
     )
+    client.get_current_quote = lambda symbol: types.SimpleNamespace(
+        price=110,
+        timestamp=datetime.now(ZoneInfo("UTC")),
+        observed_at=datetime.now(ZoneInfo("UTC")),
+        bid_price=109.99,
+        ask_price=110.01,
+    )
     for source in ("partial_profit", "trailing_stop"):
         result = client.execute_position_management_sell(
             "AAPL",
@@ -225,6 +232,44 @@ def test_mechanical_trailing_or_partial_exit_bypasses_buy_limits():
         )
         assert result["executed"] is True
     assert len(broker.submitted_orders) == 2
+
+
+def test_mechanical_exit_rejects_inconsistent_native_quote():
+    client, broker, _ = _client(positions=[_position("AAPL", 10_000)])
+    client.get_current_quote = lambda symbol: types.SimpleNamespace(
+        price=100,
+        timestamp=datetime.now(ZoneInfo("UTC")),
+        observed_at=datetime.now(ZoneInfo("UTC")),
+        bid_price=99.99,
+        ask_price=100.01,
+    )
+
+    result = client.execute_position_management_sell(
+        "AAPL",
+        1,
+        observed_price=110,
+        cost_basis_per_share=100,
+        exit_source="stop_loss",
+        exit_reason="STOP_LOSS_2_PERCENT",
+    )
+
+    assert result["executed"] is False
+    assert "Exit quote mismatch" in result["reason"]
+    assert broker.submitted_orders == []
+
+
+def test_confirmed_paper_fill_records_reporting_only_cost_estimate():
+    client, _, _ = _client()
+    result = {
+        "broker_status": "filled",
+        "filled_quantity": 10,
+        "average_fill_price": 100,
+    }
+
+    client._add_paper_fill_penalty(result)
+
+    assert result["paper_fill_penalty_bps"] == 5
+    assert result["estimated_transaction_cost"] == pytest.approx(0.5)
 
 
 def test_pending_buys_count_towards_projected_exposure():
@@ -296,6 +341,7 @@ def test_portfolio_rejection_is_persisted_and_counted_for_daily_reporting(tmp_pa
         risk_manager=types.SimpleNamespace(validate=lambda decision: (True, "approved")),
         journal=journal,
     )
+    strategy._entry_safety_rejection = lambda decision, snapshot, current_time: None
     strategy.ai_client = types.SimpleNamespace(
         last_raw_response='{"symbol":"PLTR","action":"BUY"}',
         get_decision=lambda context: types.SimpleNamespace(

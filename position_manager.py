@@ -57,6 +57,7 @@ class PositionManager:
             symbol = str(state["symbol"]).upper()
             if symbol not in positions_by_symbol:
                 database.close_position_management(symbol, closed_at=now)
+                database.record_full_position_exit(symbol, closed_at=now)
                 logger.info("Position management closed stale state for %s; broker quantity is zero.", symbol)
                 counts["closed"] += 1
 

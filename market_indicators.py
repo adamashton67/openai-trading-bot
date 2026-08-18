@@ -27,6 +27,7 @@ INDICATOR_FIELDS = (
     "EMA50",
     "RSI14",
     "VWAP",
+    "vwap_confirmation_bars",
     "latest_bar_timestamp",
     "data_age_seconds",
     "session_bar_count",
@@ -84,6 +85,10 @@ def calculate_market_indicators(
     indicators["EMA50"] = _ema(close_source, 50, symbol)
     indicators["RSI14"] = _rsi(close_source, 14, symbol)
     indicators["VWAP"] = _vwap(session_df if not session_df.empty else daily_df, symbol)
+    indicators["vwap_confirmation_bars"] = _consecutive_closes_above_vwap(
+        session_df,
+        indicators["VWAP"],
+    )
 
     return indicators
 
@@ -185,6 +190,21 @@ def _last_value(df: pd.DataFrame, column: str) -> float | None:
     if df.empty or column not in df.columns:
         return None
     return _to_float(df[column].iloc[-1])
+
+
+def _consecutive_closes_above_vwap(minute_df: pd.DataFrame, vwap: Any) -> int | None:
+    """Return the current run of regular-session closes above VWAP."""
+    vwap_value = _to_float(vwap)
+    if minute_df.empty or vwap_value is None or "close" not in minute_df.columns:
+        return None
+
+    count = 0
+    for close in reversed(minute_df["close"].tolist()):
+        close_value = _to_float(close)
+        if close_value is None or close_value <= vwap_value:
+            break
+        count += 1
+    return count
 
 
 def _current_volume(minute_df: pd.DataFrame, daily_df: pd.DataFrame) -> float | None:

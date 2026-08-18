@@ -57,6 +57,15 @@ def make_settings(**overrides):
         "max_scanner_candidates_after_filters": 1000,
         "alpaca_data_feed": "iex",
         "max_market_data_age_seconds": 180,
+        "max_exit_quote_age_seconds": 15,
+        "max_exit_quote_deviation_percent": 0.5,
+        "reentry_cooldown_minutes": 45,
+        "max_entries_per_symbol_per_day": 2,
+        "max_entry_rsi": 70,
+        "max_entry_intraday_move_percent": 5,
+        "min_entry_reward_risk_ratio": 2,
+        "market_regime_filter_enabled": True,
+        "paper_fill_penalty_bps": 5,
         "broad_scan_data_batch_size": 200,
         "min_stock_price": 5,
         "min_average_volume": 500000,
@@ -196,7 +205,7 @@ def test_config_loading_uses_safe_defaults(monkeypatch):
     assert settings.decision_history_limit == 20
     assert settings.bot_version == "local"
     assert settings.position_management_enabled is False
-    assert settings.position_management_interval_minutes == 5
+    assert settings.position_management_interval_minutes == 1
 
 
 def test_config_loading_reads_environment(monkeypatch):
@@ -2072,6 +2081,7 @@ def test_broad_market_scan_logs_major_stages(caplog):
             min_average_volume=10000,
             watchlist_size=2,
             allowed_symbols=["AAPL", "MSFT", "NVDA"],
+            market_regime_filter_enabled=False,
         ),
         broker_factory=lambda config: MockDataBroker(
             assets=[
@@ -2398,6 +2408,7 @@ def test_broad_market_scan_uses_native_alpaca_data_not_lumibot_prices():
             min_average_volume=10000,
             watchlist_size=2,
             allowed_symbols=["AAPL", "MSFT", "NVDA"],
+            market_regime_filter_enabled=False,
         ),
         broker_factory=lambda config: fake_broker,
     )
@@ -2471,6 +2482,7 @@ def test_broad_market_scan_caches_daily_data_but_refreshes_intraday_data():
             min_average_volume=10_000,
             watchlist_size=2,
             allowed_symbols=["AAPL", "MSFT"],
+            market_regime_filter_enabled=False,
         ),
         broker_factory=lambda config: MockDataBroker(
             assets=[
@@ -2513,6 +2525,7 @@ def test_broad_market_scan_native_data_batching_works():
             min_average_volume=10000,
             watchlist_size=2,
             allowed_symbols=["AAPL", "MSFT", "NVDA", "AMD"],
+            market_regime_filter_enabled=False,
         ),
         broker_factory=lambda config: fake_broker,
     )
@@ -3186,6 +3199,8 @@ def test_strategy_allows_dynamic_symbol_in_final_watchlist(tmp_path):
                             "EMA20": 24,
                             "EMA50": 23,
                             "VWAP": 24.2,
+                            "vwap_confirmation_bars": 3,
+                            "day_change_percent": 1,
                         }
                     },
                 },
@@ -3200,6 +3215,7 @@ def test_strategy_allows_dynamic_symbol_in_final_watchlist(tmp_path):
         dry_run=False,
         allowed_symbols=["AAPL", "MSFT"],
         dynamic_watchlist_enabled=True,
+        market_regime_filter_enabled=False,
     )
     strategy = TradingStrategy(
         settings=settings,
@@ -3215,6 +3231,8 @@ def test_strategy_allows_dynamic_symbol_in_final_watchlist(tmp_path):
                 "confidence": 0.95,
                 "suggested_allocation_percent": 1,
                 "reason": "In final generated watchlist.",
+                "stop_loss_percent": 2,
+                "take_profit_percent": 4,
             }
         ),
     )
@@ -3224,6 +3242,92 @@ def test_strategy_allows_dynamic_symbol_in_final_watchlist(tmp_path):
     assert broker.executed_decision is not None
     assert broker.executed_decision["symbol"] == "PLTR"
     assert broker.executed_decision["cycle_allowed_symbols"] == ["PLTR"]
+
+
+def test_entry_safety_blocks_cooldown_and_daily_reentry_cap(tmp_path):
+    database.init_database(tmp_path / "trading_bot.db")
+    settings = make_settings(market_regime_filter_enabled=False)
+    strategy = TradingStrategy(
+        settings=settings,
+        broker=types.SimpleNamespace(),
+        risk_manager=RiskManager(settings),
+    )
+    now = datetime.now(ZoneInfo("America/New_York"))
+    snapshot = BrokerSnapshot(
+        account={"portfolio_value": 100_000},
+        positions=[],
+        market_data={
+            "market_intelligence": {
+                "AAPL": {
+                    "current_price": 101,
+                    "VWAP": 100,
+                    "RSI14": 55,
+                    "vwap_confirmation_bars": 3,
+                    "day_change_percent": 1,
+                }
+            }
+        },
+    )
+    decision = {
+        "symbol": "AAPL",
+        "action": "BUY",
+        "stop_loss_percent": 2,
+        "take_profit_percent": 4,
+    }
+
+    database.record_full_position_exit("AAPL", closed_at=now)
+    assert "post-exit cooldown" in strategy._entry_safety_rejection(decision, snapshot, now)
+
+    database.record_full_position_exit("AAPL", closed_at=now - timedelta(hours=2))
+    for index in range(2):
+        database.insert_execution(
+            {
+                "symbol": "AAPL",
+                "action": "BUY",
+                "quantity": 1,
+                "broker_status": "accepted",
+                "broker_order_id": f"entry-{index}",
+            },
+            timestamp=now,
+        )
+    assert "daily limit" in strategy._entry_safety_rejection(decision, snapshot, now)
+
+
+def test_entry_safety_blocks_weak_market_regime(tmp_path):
+    database.init_database(tmp_path / "trading_bot.db")
+    settings = make_settings(market_regime_filter_enabled=True)
+    strategy = TradingStrategy(
+        settings=settings,
+        broker=types.SimpleNamespace(),
+        risk_manager=RiskManager(settings),
+    )
+    snapshot = BrokerSnapshot(
+        account={"portfolio_value": 100_000},
+        positions=[],
+        market_data={
+            "market_intelligence": {
+                "AAPL": {
+                    "current_price": 101,
+                    "VWAP": 100,
+                    "RSI14": 55,
+                    "vwap_confirmation_bars": 3,
+                    "day_change_percent": 1,
+                }
+            },
+            "market_regime": {
+                "SPY": {"current_price": 499, "VWAP": 500, "15m_change_percent": -0.1},
+                "QQQ": {"current_price": 500, "VWAP": 499, "15m_change_percent": 0.1},
+            },
+        },
+    )
+
+    rejection = strategy._entry_safety_rejection(
+        {"symbol": "AAPL", "action": "BUY", "stop_loss_percent": 2, "take_profit_percent": 4},
+        snapshot,
+        datetime.now(ZoneInfo("America/New_York")),
+    )
+
+    assert rejection == "Market regime is weak: SPY is not above VWAP with positive 15-minute momentum."
 
 
 def test_no_scanner_candidates_returns_hold_without_openai_call():

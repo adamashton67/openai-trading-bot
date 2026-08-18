@@ -129,7 +129,7 @@ DATABASE_PATH=/data/trading_bot.db
 | `BOT_VERSION` | `local` | Optional label shown in Discord summaries, useful for Railway build or commit identifiers. |
 | `TRADING_INTERVAL_MINUTES` | `10` | How often to run a cycle during regular US market hours. |
 | `POSITION_MANAGEMENT_ENABLED` | `false` | Enables broker-only deterministic management of existing positions. |
-| `POSITION_MANAGEMENT_INTERVAL_MINUTES` | `5` | How often to manage open positions without scanning or calling OpenAI. |
+| `POSITION_MANAGEMENT_INTERVAL_MINUTES` | `1` | How often to manage open positions without scanning or calling OpenAI. |
 | `MARKET_TIMEZONE` | `America/New_York` | Timezone used for market checks. |
 | `OPENAI_API_KEY` | empty | OpenAI API key. |
 | `OPENAI_MODEL` | `gpt-5-mini` | Model used for each AI trading decision. |
@@ -139,6 +139,15 @@ DATABASE_PATH=/data/trading_bot.db
 | `MAX_OPEN_POSITIONS` | `10` | Maximum distinct held or pending-entry symbols after a new BUY. |
 | `MAX_TOTAL_INVESTED_PERCENT` | `60` | Maximum portfolio percentage invested after held positions, pending BUYs, and a new BUY. |
 | `MAX_MARKET_DATA_AGE_SECONDS` | `180` | Maximum age of intraday data allowed for a new BUY. |
+| `MAX_EXIT_QUOTE_AGE_SECONDS` | `15` | Maximum age of a native Alpaca quote that can trigger a mechanical exit. |
+| `MAX_EXIT_QUOTE_DEVIATION_PERCENT` | `0.5` | Maximum difference between a stop trigger quote and the final native validation quote. |
+| `REENTRY_COOLDOWN_MINUTES` | `45` | Block a new BUY of a symbol for this long after its broker position reaches zero. |
+| `MAX_ENTRIES_PER_SYMBOL_PER_DAY` | `2` | Maximum accepted BUY entries for one symbol in a trading day. |
+| `MAX_ENTRY_RSI` | `70` | Reject new BUYs with an extended RSI reading. |
+| `MAX_ENTRY_INTRADAY_MOVE_PERCENT` | `5` | Reject new BUYs after an excessive intraday move. |
+| `MIN_ENTRY_REWARD_RISK_RATIO` | `2` | Minimum take-profit to stop-loss ratio required for an AI BUY. |
+| `MARKET_REGIME_FILTER_ENABLED` | `true` | Require SPY and QQQ to be above VWAP with positive 15-minute momentum before new BUYs. |
+| `PAPER_FILL_PENALTY_BPS` | `5` | Reporting-only per-fill friction estimate used in paper P&L summaries. |
 | `MIN_CONFIDENCE` | `0.70` | Minimum AI confidence before a trade can pass risk checks. |
 | `ALLOWED_SYMBOLS` | sample symbols | Optional comma-separated symbol allowlist. |
 | `DYNAMIC_WATCHLIST_ENABLED` | `false` | Enables the scanner-built analysis watchlist during each trading cycle. |
@@ -254,7 +263,7 @@ This initialises the normal settings, database, broker, risk manager, and strate
 
 ## Deterministic Position Management
 
-When enabled, `position_manager.py` refreshes broker holdings and current Alpaca prices every five minutes without running the broad scanner or invoking OpenAI. `PositionManager` takes a `MarketScheduler` instance (constructed once in `main.py` and shared with the AI trading cycle) so it can read today's actual NYSE close from the market calendar for the EOD-flatten check below, rather than duplicating calendar logic. At a 3% gain it sells half of the original position once. After that order is broker-confirmed as filled, it retains the post-sale high and exits the remaining broker-held quantity at an exact 2% pullback. OpenAI SELL orders remain valid, and both paths inspect broker-current holdings and covering open SELL orders before submission.
+When enabled, `position_manager.py` refreshes broker holdings and current Alpaca prices every minute by default without running the broad scanner or invoking OpenAI. It uses timestamped native Alpaca trade and quote data, then validates the quote again immediately before a mechanical SELL. A stale quote or material price mismatch blocks that exit rather than submitting a potentially false stop. `PositionManager` takes a `MarketScheduler` instance (constructed once in `main.py` and shared with the AI trading cycle) so it can read today's actual NYSE close from the market calendar for the EOD-flatten check below, rather than duplicating calendar logic. At a 3% gain it sells half of the original position once. After that order is broker-confirmed as filled, it retains the post-sale high and exits the remaining broker-held quantity at an exact 2% pullback. OpenAI SELL orders remain valid, and both paths inspect broker-current holdings and covering open SELL orders before submission.
 
 For whole-share positions, half is rounded down to a whole share (for example, 3 shares sells 1). Fractional positions round down to six decimal places. The sale is capped to current holdings, and if the result would be zero or consume the entire position, no partial sale is made; the full position enters trailing management instead. Legacy holdings record whether their original quantity was recovered from confirmed executions or adopted as a conservative current-quantity baseline.
 
@@ -276,7 +285,7 @@ Once the partial profit is taken and trailing management activates, the 2% trail
 **Every exit path guards against resubmitting while its own order is still pending
 reconciliation.** Trailing, stop-loss/time-stop, and EOD flatten each check
 `state.get("final_exit_order_id")` and return immediately if it's already set, instead of
-calling the broker again on the next 5-minute cycle before the previous order has filled. This
+calling the broker again on the next management cycle before the previous order has filled. This
 was added after the original stop-loss/time-stop implementation was found to be missing this
 guard (broker-side `_covering_open_sell_order` duplicate-prevention in `broker.py` stopped it
 from ever placing a real duplicate order, but it was still calling the broker and logging

@@ -144,9 +144,11 @@ def insert_execution(
                     duplicate_prevented,
                     exit_source,
                     exit_reason,
+                    estimated_transaction_cost,
+                    paper_fill_penalty_bps,
                     raw_response
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     decision_id,
@@ -170,6 +172,8 @@ def insert_execution(
                     1 if result.get("duplicate_prevented") else 0,
                     _text_or_none(result.get("exit_source")),
                     _text_or_none(result.get("exit_reason")),
+                    _to_float(result.get("estimated_transaction_cost")),
+                    _to_float(result.get("paper_fill_penalty_bps")),
                     _json_text(result),
                 ),
             )
@@ -868,6 +872,68 @@ def close_position_management(symbol: str, *, closed_at: datetime | None = None)
     )
 
 
+def record_full_position_exit(
+    symbol: str,
+    *,
+    closed_at: datetime | None = None,
+) -> bool:
+    """Persist the time a broker-confirmed position reached zero quantity.
+
+    Entry guards use this state to prevent an AI cycle from immediately
+    re-entering a volatile name after a full exit.
+    """
+    if not _ensure_database_available():
+        return False
+    timestamp = (closed_at or datetime.now()).isoformat()
+    try:
+        with _connect(_database_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO symbol_entry_guards (symbol, last_full_exit_at)
+                VALUES (?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET last_full_exit_at = excluded.last_full_exit_at
+                """,
+                (symbol.upper(), timestamp),
+            )
+        return True
+    except Exception as exc:
+        logger.error("Full-exit guard update failed safely: %s.", exc.__class__.__name__)
+        return False
+
+
+def load_symbol_entry_guard(symbol: str, trading_date: date | str) -> dict[str, Any]:
+    """Return persistent cooldown state and accepted BUY attempts for one symbol."""
+    if not _ensure_database_available():
+        return {"last_full_exit_at": None, "entries_today": 0}
+    try:
+        date_text = _date_text(trading_date)
+        with _connect(_database_path) as connection:
+            guard = connection.execute(
+                "SELECT last_full_exit_at FROM symbol_entry_guards WHERE symbol = ?",
+                (symbol.upper(),),
+            ).fetchone()
+            entries = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM executions
+                WHERE symbol = ?
+                  AND upper(COALESCE(side, '')) = 'BUY'
+                  AND substr(timestamp, 1, 10) = ?
+                  AND COALESCE(duplicate_prevented, 0) = 0
+                  AND lower(COALESCE(broker_status, status, '')) NOT IN
+                      ('rejected', 'error', 'cancelled', 'canceled', 'expired')
+                """,
+                (symbol.upper(), date_text),
+            ).fetchone()
+        return {
+            "last_full_exit_at": guard[0] if guard else None,
+            "entries_today": int(entries[0] or 0) if entries else 0,
+        }
+    except Exception as exc:
+        logger.error("Entry guard lookup failed safely: %s.", exc.__class__.__name__)
+        return {"last_full_exit_at": None, "entries_today": 0}
+
+
 def load_execution_by_order_id(order_id: str | None) -> dict[str, Any] | None:
     """Load a persisted execution used to drive management-order state."""
     if not order_id or not _ensure_database_available():
@@ -1000,6 +1066,8 @@ def _create_tables(connection: sqlite3.Connection) -> None:
             broker_status TEXT,
             cost_basis_per_share REAL,
             realised_pl REAL,
+            estimated_transaction_cost REAL,
+            paper_fill_penalty_bps REAL,
             error_reason TEXT,
             reconciled_at TEXT,
             reconciliation_status TEXT DEFAULT 'pending',
@@ -1063,6 +1131,8 @@ def _create_tables(connection: sqlite3.Connection) -> None:
             openai_failures INTEGER DEFAULT 0,
             api_errors INTEGER DEFAULT 0,
             realised_pl REAL DEFAULT 0,
+            estimated_trading_cost REAL DEFAULT 0,
+            estimated_net_realised_pl REAL DEFAULT 0,
             largest_win REAL,
             largest_loss REAL,
             winning_trades INTEGER DEFAULT 0,
@@ -1102,6 +1172,11 @@ def _create_tables(connection: sqlite3.Connection) -> None:
             last_checked_at TEXT,
             raw_metadata TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS symbol_entry_guards (
+            symbol TEXT PRIMARY KEY,
+            last_full_exit_at TEXT
+        );
         """
     )
     _migrate_schema(connection)
@@ -1127,10 +1202,14 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
         "duplicate_prevented": "INTEGER DEFAULT 0",
         "exit_source": "TEXT",
         "exit_reason": "TEXT",
+        "estimated_transaction_cost": "REAL",
+        "paper_fill_penalty_bps": "REAL",
     }
     daily_columns = {
         "winning_trades": "INTEGER DEFAULT 0",
         "losing_trades": "INTEGER DEFAULT 0",
+        "estimated_trading_cost": "REAL DEFAULT 0",
+        "estimated_net_realised_pl": "REAL DEFAULT 0",
     }
     position_management_columns = {
         "opened_at": "TEXT",
@@ -1169,6 +1248,14 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_position_management_active_symbol "
         "ON position_management(symbol) WHERE lower(status) != 'closed'"
     )
+    execution_column_names = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(executions)").fetchall()
+    }
+    if {"symbol", "timestamp"}.issubset(execution_column_names):
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_executions_symbol_timestamp "
+            "ON executions(symbol, timestamp)"
+        )
 
 
 def _add_missing_columns(
@@ -1205,6 +1292,8 @@ def _update_execution_row(
         "error_reason": _text_or_none(result.get("error_reason")),
         "reconciled_at": result.get("reconciled_at"),
         "reconciliation_status": _text_or_none(result.get("reconciliation_status")),
+        "estimated_transaction_cost": _to_float(result.get("estimated_transaction_cost")),
+        "paper_fill_penalty_bps": _to_float(result.get("paper_fill_penalty_bps")),
     }
     assignments = []
     parameters: list[Any] = []
@@ -1289,7 +1378,8 @@ def _refresh_daily_realised_stats(connection: sqlite3.Connection, date_text: str
                MAX(CASE WHEN realised_pl > 0 THEN realised_pl END),
                MIN(CASE WHEN realised_pl < 0 THEN realised_pl END),
                SUM(CASE WHEN realised_pl > 0 THEN 1 ELSE 0 END),
-               SUM(CASE WHEN realised_pl < 0 THEN 1 ELSE 0 END)
+               SUM(CASE WHEN realised_pl < 0 THEN 1 ELSE 0 END),
+               COALESCE(SUM(estimated_transaction_cost), 0)
         FROM executions
         WHERE substr(timestamp, 1, 10) = ? AND realised_pl_recorded = 1
         """,
@@ -1299,10 +1389,11 @@ def _refresh_daily_realised_stats(connection: sqlite3.Connection, date_text: str
         """
         UPDATE daily_statistics
         SET realised_pl = ?, largest_win = ?, largest_loss = ?,
-            winning_trades = ?, losing_trades = ?, updated_at = ?
+            winning_trades = ?, losing_trades = ?, estimated_trading_cost = ?,
+            estimated_net_realised_pl = ?, updated_at = ?
         WHERE date = ?
         """,
-        (*aggregate, datetime.now().isoformat(), date_text),
+        (*aggregate, aggregate[0] - aggregate[5], datetime.now().isoformat(), date_text),
     )
 
 

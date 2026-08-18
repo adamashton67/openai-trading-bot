@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import types
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 import pytest
 
@@ -231,6 +231,13 @@ def _client(api, rejection=None, allocation=5):
         account={"portfolio_value": 1000},
         positions=[{"symbol": "TTD", "quantity": api.quantity, "average_price": api.average_price}],
         market_data={"prices": {"TTD": {"last_price": 10}}},
+    )
+    client.get_current_quote = lambda symbol: types.SimpleNamespace(
+        price=110,
+        timestamp=datetime.now(timezone.utc),
+        observed_at=datetime.now(timezone.utc),
+        bid_price=109.99,
+        ask_price=110.01,
     )
     decision = {
         "symbol": "TTD", "action": "SELL", "confidence": 0.9,
