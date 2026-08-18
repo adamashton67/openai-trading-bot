@@ -1,0 +1,15 @@
+# Railway deployment configuration for the OpenAI Trading Bot.
+#
+# The following service resources remain deliberately outside version control:
+# - A persistent Railway volume mounted at /data
+# - DATABASE_PATH=/data/trading_bot.db
+# - All runtime environment variables and secrets from .env.example
+
+[build]
+builder = "RAILPACK"
+
+[deploy]
+startCommand = "python main.py"
+
+[deploy.multiRegionConfig.sfo]
+numReplicas = 1
