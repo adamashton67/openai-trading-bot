@@ -290,6 +290,8 @@ def test_closed_broker_position_closes_stale_state():
     broker.positions = []
     manager.run_once()
     assert database.load_active_position_management("AAPL") == []
+    guard = database.load_symbol_entry_guard("AAPL", datetime.now().date())
+    assert guard["last_full_exit_at"] is not None
 
 
 def test_execution_records_source_reason_and_mechanical_realised_pl():

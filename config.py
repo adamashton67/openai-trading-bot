@@ -60,6 +60,15 @@ class Settings:
     max_scanner_candidates_after_filters: int
     alpaca_data_feed: str
     max_market_data_age_seconds: int
+    max_exit_quote_age_seconds: int
+    max_exit_quote_deviation_percent: float
+    reentry_cooldown_minutes: int
+    max_entries_per_symbol_per_day: int
+    max_entry_rsi: float
+    max_entry_intraday_move_percent: float
+    min_entry_reward_risk_ratio: float
+    market_regime_filter_enabled: bool
+    paper_fill_penalty_bps: float
     broad_scan_data_batch_size: int
     min_stock_price: float
     min_average_volume: float
@@ -86,6 +95,22 @@ class Settings:
             )
         if self.max_market_data_age_seconds < 1:
             raise ValueError("MAX_MARKET_DATA_AGE_SECONDS must be at least 1.")
+        if self.max_exit_quote_age_seconds < 1:
+            raise ValueError("MAX_EXIT_QUOTE_AGE_SECONDS must be at least 1.")
+        if self.max_exit_quote_deviation_percent <= 0:
+            raise ValueError("MAX_EXIT_QUOTE_DEVIATION_PERCENT must be greater than 0.")
+        if self.reentry_cooldown_minutes < 0:
+            raise ValueError("REENTRY_COOLDOWN_MINUTES cannot be negative.")
+        if self.max_entries_per_symbol_per_day < 1:
+            raise ValueError("MAX_ENTRIES_PER_SYMBOL_PER_DAY must be at least 1.")
+        if not 0 < self.max_entry_rsi <= 100:
+            raise ValueError("MAX_ENTRY_RSI must be greater than 0 and no more than 100.")
+        if self.max_entry_intraday_move_percent <= 0:
+            raise ValueError("MAX_ENTRY_INTRADAY_MOVE_PERCENT must be greater than 0.")
+        if self.min_entry_reward_risk_ratio <= 0:
+            raise ValueError("MIN_ENTRY_REWARD_RISK_RATIO must be greater than 0.")
+        if self.paper_fill_penalty_bps < 0:
+            raise ValueError("PAPER_FILL_PENALTY_BPS cannot be negative.")
 
     @property
     def trading_interval_seconds(self) -> int:
@@ -111,7 +136,7 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
             os.getenv("POSITION_MANAGEMENT_ENABLED"), default=False
         ),
         position_management_interval_minutes=max(
-            1, int(os.getenv("POSITION_MANAGEMENT_INTERVAL_MINUTES", "5"))
+            1, int(os.getenv("POSITION_MANAGEMENT_INTERVAL_MINUTES", "1"))
         ),
         market_timezone=os.getenv("MARKET_TIMEZONE", "America/New_York"),
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
@@ -144,6 +169,32 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
             1,
             int(os.getenv("MAX_MARKET_DATA_AGE_SECONDS", "180")),
         ),
+        max_exit_quote_age_seconds=max(
+            1,
+            int(os.getenv("MAX_EXIT_QUOTE_AGE_SECONDS", "15")),
+        ),
+        max_exit_quote_deviation_percent=float(
+            os.getenv("MAX_EXIT_QUOTE_DEVIATION_PERCENT", "0.5")
+        ),
+        reentry_cooldown_minutes=max(
+            0,
+            int(os.getenv("REENTRY_COOLDOWN_MINUTES", "45")),
+        ),
+        max_entries_per_symbol_per_day=max(
+            1,
+            int(os.getenv("MAX_ENTRIES_PER_SYMBOL_PER_DAY", "2")),
+        ),
+        max_entry_rsi=float(os.getenv("MAX_ENTRY_RSI", "70")),
+        max_entry_intraday_move_percent=float(
+            os.getenv("MAX_ENTRY_INTRADAY_MOVE_PERCENT", "5")
+        ),
+        min_entry_reward_risk_ratio=float(
+            os.getenv("MIN_ENTRY_REWARD_RISK_RATIO", "2")),
+        market_regime_filter_enabled=_parse_bool(
+            os.getenv("MARKET_REGIME_FILTER_ENABLED"),
+            default=True,
+        ),
+        paper_fill_penalty_bps=float(os.getenv("PAPER_FILL_PENALTY_BPS", "5")),
         broad_scan_data_batch_size=int(os.getenv("BROAD_SCAN_DATA_BATCH_SIZE", "200")),
         min_stock_price=float(os.getenv("MIN_STOCK_PRICE", "5")),
         min_average_volume=float(os.getenv("MIN_AVERAGE_VOLUME", "500000")),

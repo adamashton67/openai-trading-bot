@@ -220,6 +220,8 @@ class DailySummaryNotifier:
             "",
             "**Performance**",
             f"- Realised P/L: {self._format_signed_money(self._to_float(stats.get('realised_pl')))}",
+            f"- Estimated paper-fill costs: {self._format_signed_money(-abs(self._to_float(stats.get('estimated_trading_cost')) or 0))}",
+            f"- Estimated P/L after paper-fill costs: {self._format_signed_money(self._to_float(stats.get('estimated_net_realised_pl')))}",
             f"- Win Rate: {self._format_percent(performance['win_rate'])}",
             f"- Average Winner: {self._format_signed_money(performance['average_winner'])}",
             f"- Average Loser: {self._format_signed_money(performance['average_loser'])}",

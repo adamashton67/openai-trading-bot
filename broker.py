@@ -30,6 +30,19 @@ class BrokerSnapshot:
     market_data: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class MarketQuote:
+    """A native Alpaca trade/quote observation used for mechanical exits."""
+
+    symbol: str
+    price: float
+    timestamp: datetime
+    observed_at: datetime
+    bid_price: float | None = None
+    ask_price: float | None = None
+    source: str = "alpaca_latest_trade"
+
+
 class LumibotExecutionStrategyAdapter:
     """Minimal strategy-owned order submission adapter for Lumibot brokers."""
 
@@ -192,10 +205,53 @@ class BrokerClient:
         ]
 
     def get_current_price(self, symbol: str) -> float | None:
-        """Fetch a current broker/data price without collecting scanner indicators."""
+        """Return the current native quote price used by position management."""
+        quote = self.get_current_quote(symbol)
+        return quote.price if quote is not None else None
+
+    def get_current_quote(self, symbol: str) -> MarketQuote | None:
+        """Fetch a timestamped native Alpaca trade and quote for a mechanical exit.
+
+        Position management must not rely on Lumibot's cached last-price path.
+        The timestamp and bid/ask are retained so a stop trigger can be audited
+        against the order fill and rejected if the market-data view is stale.
+        """
         if self._broker is None:
             return None
-        return self._get_last_price(symbol.upper())
+        normalized_symbol = symbol.upper()
+        try:
+            from alpaca.data.enums import DataFeed
+            from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest
+
+            client = self._get_alpaca_data_client()
+            feed = DataFeed(self.settings.alpaca_data_feed)
+            trades = client.get_stock_latest_trade(
+                StockLatestTradeRequest(symbol_or_symbols=normalized_symbol, feed=feed)
+            )
+            quotes = client.get_stock_latest_quote(
+                StockLatestQuoteRequest(symbol_or_symbols=normalized_symbol, feed=feed)
+            )
+            trade = self._symbol_response_value(trades, normalized_symbol)
+            quote = self._symbol_response_value(quotes, normalized_symbol)
+            price = self._to_float(getattr(trade, "price", None))
+            timestamp = self._quote_timestamp(getattr(trade, "timestamp", None))
+            if price is None or price <= 0 or timestamp is None:
+                return None
+            return MarketQuote(
+                symbol=normalized_symbol,
+                price=price,
+                timestamp=timestamp,
+                observed_at=datetime.now(timezone.utc),
+                bid_price=self._to_float(getattr(quote, "bid_price", None)),
+                ask_price=self._to_float(getattr(quote, "ask_price", None)),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Native exit quote unavailable for %s: %s.",
+                normalized_symbol,
+                exc.__class__.__name__,
+            )
+            return None
 
     def find_covering_open_sell(self, symbol: str, quantity: float) -> dict[str, Any] | None:
         """Return concise metadata for an open SELL covering the intended quantity."""
@@ -297,6 +353,21 @@ class BrokerClient:
                 **details,
             )
 
+        quote, quote_failure = self._validated_exit_quote(symbol.upper(), observed_price)
+        if quote_failure:
+            return self._build_execution_result(
+                decision,
+                False,
+                quote_failure,
+                quantity=capped_quantity,
+                currently_held_quantity=held_quantity,
+                submitted_price=observed_price,
+                cost_basis_per_share=broker_cost_basis or cost_basis_per_share,
+                exit_source=exit_source,
+                exit_reason=exit_reason,
+                error_reason=quote_failure,
+            )
+
         try:
             broker = self._get_broker()
             execution_strategy = self._get_execution_strategy(broker)
@@ -344,6 +415,11 @@ class BrokerClient:
             filled_quantity=self._broker_filled_quantity(broker_order),
             average_fill_price=self._broker_average_fill_price(broker_order),
             cost_basis_per_share=broker_cost_basis or cost_basis_per_share,
+            exit_quote_price=quote.price if quote else None,
+            exit_quote_timestamp=quote.timestamp.isoformat() if quote else None,
+            exit_quote_observed_at=quote.observed_at.isoformat() if quote else None,
+            exit_quote_bid=quote.bid_price if quote else None,
+            exit_quote_ask=quote.ask_price if quote else None,
             error_reason=self._broker_rejection_message(broker_order),
             **details,
         )
@@ -417,11 +493,14 @@ class BrokerClient:
 
         if not self.settings.dynamic_watchlist_enabled:
             self._collect_market_data_for_symbols(symbols, market_data)
+            self._collect_market_regime_data(market_data)
             return market_data
 
         if self.settings.broad_market_scan_enabled:
             try:
-                return self._collect_broad_watchlist_market_data(market_data)
+                market_data = self._collect_broad_watchlist_market_data(market_data)
+                self._collect_market_regime_data(market_data)
+                return market_data
             except Exception as exc:
                 stage = getattr(exc, "broad_scanner_stage", "unknown stage")
                 logger.warning("Broad market scanner failed safely during %s.", stage)
@@ -430,13 +509,36 @@ class BrokerClient:
                 market_data["broad_scan_failed"] = True
 
         try:
-            return self._collect_configured_watchlist_market_data(market_data)
+            market_data = self._collect_configured_watchlist_market_data(market_data)
+            self._collect_market_regime_data(market_data)
+            return market_data
         except Exception as exc:
             logger.warning("Dynamic watchlist scanner failed safely: %s.", exc.__class__.__name__)
             market_data["scanner_status"] = "fallback_static"
             market_data["scanner_mode"] = "static"
             self._collect_market_data_for_symbols(symbols, market_data)
+            self._collect_market_regime_data(market_data)
             return market_data
+
+    def _collect_market_regime_data(self, market_data: dict[str, Any]) -> None:
+        """Keep SPY and QQQ indicators available without adding them to the trade universe."""
+        if not getattr(self.settings, "market_regime_filter_enabled", True):
+            return
+        symbols = ["SPY", "QQQ"]
+        try:
+            minute_bars = self._fetch_native_stock_bars(symbols, timeframe="minute", limit=120)["bars"]
+            daily_bars = self._fetch_native_stock_bars(symbols, timeframe="day", limit=60)["bars"]
+            market_data["market_regime"] = {
+                symbol: calculate_market_indicators(
+                    symbol,
+                    minute_bars.get(symbol),
+                    daily_bars.get(symbol),
+                )
+                for symbol in symbols
+            }
+        except Exception as exc:
+            logger.warning("Market-regime data collection failed safely: %s.", exc.__class__.__name__)
+            market_data["market_regime"] = {}
 
     def _collect_configured_watchlist_market_data(self, market_data: dict[str, Any]) -> dict[str, Any]:
         market_data["scanner_status"] = "enabled"
@@ -1024,6 +1126,56 @@ class BrokerClient:
         from lumibot.entities import Asset
 
         return self._to_float(self._broker.get_last_price(Asset(symbol=symbol, asset_type="stock")))
+
+    @staticmethod
+    def _symbol_response_value(response: Any, symbol: str) -> Any | None:
+        """Return one symbol's value from Alpaca's mapping-like latest-data response."""
+        if not isinstance(response, dict):
+            return None
+        return response.get(symbol) or response.get(symbol.upper()) or response.get(symbol.lower())
+
+    @staticmethod
+    def _quote_timestamp(value: Any) -> datetime | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            timestamp = value
+        else:
+            try:
+                timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        return timestamp if timestamp.tzinfo else timestamp.replace(tzinfo=timezone.utc)
+
+    def _validated_exit_quote(
+        self,
+        symbol: str,
+        observed_price: float,
+    ) -> tuple[MarketQuote | None, str | None]:
+        """Require a fresh native quote that agrees with the trigger observation."""
+        quote = self.get_current_quote(symbol)
+        if quote is None:
+            return None, "Native Alpaca exit quote is unavailable. Mechanical SELL was not submitted."
+
+        quote_age_seconds = max(0.0, (datetime.now(timezone.utc) - quote.timestamp).total_seconds())
+        max_age = float(getattr(self.settings, "max_exit_quote_age_seconds", 15))
+        if quote_age_seconds > max_age:
+            return None, (
+                f"Native Alpaca exit quote for {symbol} is {quote_age_seconds:.1f}s old, "
+                f"above the {max_age:.1f}s limit. Mechanical SELL was not submitted."
+            )
+
+        if observed_price <= 0:
+            return None, "Exit trigger price is invalid. Mechanical SELL was not submitted."
+        deviation_percent = abs(quote.price - observed_price) / observed_price * 100
+        max_deviation = float(getattr(self.settings, "max_exit_quote_deviation_percent", 0.5))
+        if deviation_percent > max_deviation:
+            return None, (
+                f"Exit quote mismatch for {symbol}: trigger={observed_price:.4f}, "
+                f"native={quote.price:.4f}, deviation={deviation_percent:.2f}% exceeds "
+                f"the {max_deviation:.2f}% limit. Mechanical SELL was not submitted."
+            )
+        return quote, None
 
     def _get_historical_bars(self, symbol: str, length: int, timestep: str) -> Any:
         from lumibot.entities import Asset
@@ -1797,6 +1949,7 @@ class BrokerClient:
                     "average_fill_price": self._broker_average_fill_price(order),
                     "error_reason": self._broker_rejection_message(order),
                 }
+                self._add_paper_fill_penalty(broker_result)
                 if database.reconcile_execution(int(execution["id"]), broker_result):
                     counts["reconciled"] += 1
                 else:
@@ -2035,7 +2188,23 @@ class BrokerClient:
             "decision": decision,
         }
         result.update({key: value for key, value in details.items() if value is not None})
+        self._add_paper_fill_penalty(result)
         return result
+
+    def _add_paper_fill_penalty(self, result: dict[str, Any]) -> None:
+        """Attach a transparent reporting-only friction estimate to confirmed paper fills."""
+        if not self.settings.paper_trading:
+            return
+        status = str(result.get("broker_status") or result.get("raw_status") or "").lower()
+        if status not in {"filled", "partially_filled", "partial_fill"}:
+            return
+        quantity = self._to_float(result.get("filled_quantity") or result.get("quantity"))
+        fill_price = self._to_float(result.get("average_fill_price") or result.get("fill_price"))
+        if quantity is None or quantity <= 0 or fill_price is None or fill_price <= 0:
+            return
+        penalty_bps = max(0.0, float(getattr(self.settings, "paper_fill_penalty_bps", 5)))
+        result["paper_fill_penalty_bps"] = penalty_bps
+        result["estimated_transaction_cost"] = quantity * fill_price * penalty_bps / 10_000
 
     def _broker_order_id(self, broker_order: Any) -> str | None:
         if isinstance(broker_order, dict):

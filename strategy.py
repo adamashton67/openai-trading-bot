@@ -2,7 +2,7 @@
 
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -79,6 +79,13 @@ class TradingStrategy:
             final_watchlist_reason = self._final_watchlist_rejection(decision_for_cycle, snapshot)
             if final_watchlist_reason:
                 approved, reason = False, final_watchlist_reason
+            entry_safety_reason = self._entry_safety_rejection(
+                decision_for_cycle,
+                snapshot,
+                current_time,
+            )
+            if entry_safety_reason:
+                approved, reason = False, entry_safety_reason
             database.increment_daily_stat(
                 current_time.date(),
                 "risk_approved_count" if approved else "risk_rejected_count",
@@ -310,6 +317,22 @@ class TradingStrategy:
                     "max_market_data_age_seconds",
                     180,
                 ),
+                "max_entry_rsi": getattr(self.settings, "max_entry_rsi", 70),
+                "max_entry_intraday_move_percent": getattr(
+                    self.settings,
+                    "max_entry_intraday_move_percent",
+                    5,
+                ),
+                "min_entry_reward_risk_ratio": getattr(
+                    self.settings,
+                    "min_entry_reward_risk_ratio",
+                    2,
+                ),
+                "market_regime_filter_enabled": getattr(
+                    self.settings,
+                    "market_regime_filter_enabled",
+                    True,
+                ),
                 "static_allowed_symbols": self.settings.allowed_symbols,
                 "risk_manager_required": True,
             },
@@ -348,6 +371,105 @@ class TradingStrategy:
         symbol = str(decision.get("symbol", "")).upper()
         if final_watchlist and symbol not in final_watchlist:
             return f"{symbol or 'Missing symbol'} is not in the final watchlist."
+        return None
+
+    def _entry_safety_rejection(
+        self,
+        decision: dict[str, Any],
+        snapshot: BrokerSnapshot,
+        current_time: datetime,
+    ) -> str | None:
+        """Apply deterministic anti-churn, quality, and market-regime checks to BUYs."""
+        if str(decision.get("action", "")).upper() != "BUY":
+            return None
+
+        symbol = str(decision.get("symbol", "")).upper()
+        guard = database.load_symbol_entry_guard(symbol, current_time.date())
+        max_entries = int(getattr(self.settings, "max_entries_per_symbol_per_day", 2))
+        if int(guard.get("entries_today") or 0) >= max_entries:
+            return f"{symbol} has reached the {max_entries}-entry daily limit."
+
+        cooldown_minutes = int(getattr(self.settings, "reentry_cooldown_minutes", 45))
+        last_exit = self._parse_timestamp(guard.get("last_full_exit_at"))
+        if cooldown_minutes and last_exit is not None:
+            if last_exit.tzinfo is None:
+                last_exit = last_exit.replace(tzinfo=current_time.tzinfo)
+            cooldown_ends = last_exit + timedelta(minutes=cooldown_minutes)
+            if current_time < cooldown_ends:
+                return (
+                    f"{symbol} is in its {cooldown_minutes}-minute post-exit cooldown "
+                    f"until {cooldown_ends.isoformat()}."
+                )
+
+        indicators = self._symbol_indicators(snapshot, symbol)
+        if not indicators:
+            return f"Market Intelligence is unavailable for {symbol}."
+        price = self._number(indicators.get("current_price"))
+        vwap = self._number(indicators.get("VWAP"))
+        rsi = self._number(indicators.get("RSI14"))
+        vwap_bars = self._number(indicators.get("vwap_confirmation_bars"))
+        intraday_move = self._number(indicators.get("day_change_percent"))
+        if None in {price, vwap, rsi, vwap_bars, intraday_move}:
+            return f"Market Intelligence is incomplete for {symbol}; BUY rejected."
+        if price <= vwap or vwap_bars < 3:
+            return f"{symbol} lacks three consecutive closes above VWAP."
+        max_rsi = float(getattr(self.settings, "max_entry_rsi", 70))
+        if rsi > max_rsi:
+            return f"{symbol} RSI {rsi:.1f} exceeds the {max_rsi:.1f} entry limit."
+        max_move = float(getattr(self.settings, "max_entry_intraday_move_percent", 5))
+        if intraday_move > max_move:
+            return f"{symbol} is already up {intraday_move:.2f}% intraday, above the {max_move:.2f}% chase limit."
+
+        stop_loss = self._number(decision.get("stop_loss_percent"))
+        take_profit = self._number(decision.get("take_profit_percent"))
+        min_ratio = float(getattr(self.settings, "min_entry_reward_risk_ratio", 2))
+        if stop_loss is None or take_profit is None or stop_loss <= 0:
+            return f"{symbol} BUY lacks valid stop-loss and take-profit values."
+        if take_profit / stop_loss < min_ratio:
+            return (
+                f"{symbol} reward-to-risk ratio {take_profit / stop_loss:.2f} is below "
+                f"the {min_ratio:.2f} minimum."
+            )
+
+        if getattr(self.settings, "market_regime_filter_enabled", True):
+            regime_reason = self._market_regime_rejection(snapshot)
+            if regime_reason:
+                return regime_reason
+        return None
+
+    @staticmethod
+    def _parse_timestamp(value: Any) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _symbol_indicators(snapshot: BrokerSnapshot, symbol: str) -> dict[str, Any]:
+        market_data = snapshot.market_data if isinstance(snapshot.market_data, dict) else {}
+        intelligence = market_data.get("market_intelligence", {})
+        if not isinstance(intelligence, dict):
+            return {}
+        indicators = intelligence.get(symbol)
+        return indicators if isinstance(indicators, dict) else {}
+
+    def _market_regime_rejection(self, snapshot: BrokerSnapshot) -> str | None:
+        """Block new longs when either broad-market benchmark confirms weakness."""
+        for symbol in ("SPY", "QQQ"):
+            market_data = snapshot.market_data if isinstance(snapshot.market_data, dict) else {}
+            regime_data = market_data.get("market_regime", {})
+            indicators = regime_data.get(symbol, {}) if isinstance(regime_data, dict) else {}
+            price = self._number(indicators.get("current_price"))
+            vwap = self._number(indicators.get("VWAP"))
+            change_15m = self._number(indicators.get("15m_change_percent"))
+            if None in {price, vwap, change_15m}:
+                return f"Market-regime data is unavailable for {symbol}; BUY rejected."
+            if price <= vwap or change_15m <= 0:
+                return (
+                    f"Market regime is weak: {symbol} is not above VWAP with positive 15-minute momentum."
+                )
         return None
 
     def _decision_with_cycle_universe(self, decision: dict[str, Any], snapshot: BrokerSnapshot) -> dict[str, Any]:
